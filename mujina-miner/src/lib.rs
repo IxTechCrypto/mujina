@@ -7,6 +7,7 @@ pub mod config;
 pub mod cpu_miner;
 pub mod daemon;
 pub mod error;
+pub mod fpga_miner;
 pub mod hw_trait;
 pub mod job_source;
 pub mod mgmt_protocol;

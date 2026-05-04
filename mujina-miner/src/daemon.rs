@@ -16,6 +16,7 @@ use crate::{
     asic::hash_thread::HashThread,
     backplane::Backplane,
     cpu_miner::CpuMinerConfig,
+    fpga_miner::{TangNano9kConfig, TangNano9kHashThread},
     job_source::{
         SourceCommand, SourceEvent,
         dummy::DummySource,
@@ -75,6 +76,20 @@ impl Daemon {
             ));
             if let Err(e) = transport_tx.send(event).await {
                 error!("Failed to send CPU miner event: {}", e);
+            }
+        }
+
+        // Inject Tang Nano 9K FPGA miner virtual thread if configured.
+        if let Some(config) = TangNano9kConfig::from_env() {
+            info!(
+                port = %config.port,
+                baud = config.baud,
+                "Tang Nano 9K FPGA miner enabled"
+            );
+
+            let thread = TangNano9kHashThread::new("Tang Nano 9K FPGA".into(), config);
+            if let Err(e) = thread_tx.send(Box::new(thread)).await {
+                error!("Failed to register Tang Nano 9K FPGA thread: {}", e);
             }
         }
 
