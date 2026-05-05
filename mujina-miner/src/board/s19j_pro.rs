@@ -30,7 +30,7 @@ use crate::{
     error::Error,
     hw_trait::gpio::{GpioPin, PinValue},
     mgmt_protocol::{
-        ControlChannel, Apw12Psu,
+        Apw12Psu, ControlChannel,
         bitcrane::{
             display::BitcraneDisplay,
             fan::{self, BitcraneFan},
@@ -192,7 +192,10 @@ impl Board for S19jPro {
 
     async fn shutdown(&mut self) -> Result<(), BoardError> {
         // Set all fans to 0%
-        for (i, fan) in fan::all_fans(self.control_channel.clone()).into_iter().enumerate() {
+        for (i, fan) in fan::all_fans(self.control_channel.clone())
+            .into_iter()
+            .enumerate()
+        {
             if let Err(e) = fan.set_speed(0).await {
                 warn!(fan = i, "Failed to set fan to 0% on shutdown: {}", e);
             }
@@ -248,10 +251,10 @@ impl Board for S19jPro {
 
         // Build chain configuration for S19j Pro: 42 series domains × 3 chips = 126 BM1362 chips
         // Use APW12 PSU for voltage regulation
-        let voltage_regulator: Option<Arc<Mutex<dyn VoltageRegulator + Send>>> =
-            self.psu.as_ref().map(|psu| {
-                Arc::clone(psu) as Arc<Mutex<dyn VoltageRegulator + Send>>
-            });
+        let voltage_regulator: Option<Arc<Mutex<dyn VoltageRegulator + Send>>> = self
+            .psu
+            .as_ref()
+            .map(|psu| Arc::clone(psu) as Arc<Mutex<dyn VoltageRegulator + Send>>);
 
         let config = ChainConfig {
             name: thread_name,
@@ -337,7 +340,7 @@ async fn telemetry_task(
                 rpm: rpm_result
                     .inspect_err(|e| debug!(fan = %fan.name(), error = %e, "Fan RPM read failed"))
                     .ok(),
-                percent: None, // We don't track current duty cycle yet
+                percent: None,            // We don't track current duty cycle yet
                 target_percent: Some(50), // We set 50% at init
             });
         }

@@ -583,7 +583,10 @@ where
             drained += 1;
         }
         if drained > 0 {
-            debug!(count = drained, "Drained stale responses before enumeration");
+            debug!(
+                count = drained,
+                "Drained stale responses before enumeration"
+            );
         }
 
         // 2. Execute enumeration sequence (assigns addresses)
@@ -775,13 +778,13 @@ where
         if responding < chip_count {
             warn!(
                 expected = chip_count,
-                responding,
-                "Chips lost during frequency ramp"
+                responding, "Chips lost during frequency ramp"
             );
         }
 
         if has_regulator {
-            let final_v = voltage_for_frequency_stacked(steps.last().unwrap().0, domain_count, max_v);
+            let final_v =
+                voltage_for_frequency_stacked(steps.last().unwrap().0, domain_count, max_v);
             info!(
                 target_mhz = target.mhz(),
                 voltage = format!("{:.2}V", final_v),

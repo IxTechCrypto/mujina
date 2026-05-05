@@ -6,7 +6,7 @@ resolver = "2"
 edition = "2024"
 license = "GPL-3.0-or-later"
 authors = ["Ryan Kuester <rkuester@insymbols.com>"]
-repository = "https://github.com/256-Foundation/Mujina-Mining-Firmware"
+repository = "https://github.com/256-Foundation/tangminer"
 
 [workspace.dependencies]
 anyhow = "1.0"

@@ -1,6 +1,6 @@
-//! Tang Nano 9K FPGA miner backend.
+//! Tang Nano FPGA miner backend.
 //!
-//! This backend speaks the tiny UART protocol used by the open Tang Nano 9K
+//! This backend speaks the tiny UART protocol used by the open Tang Nano
 //! bitstream: `TNJ || midstate || tail || target`, then waits
 //! for `F || nonce || hash`.
 

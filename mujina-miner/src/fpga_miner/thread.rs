@@ -1,4 +1,4 @@
-//! Scheduler-facing Tang Nano 9K hash thread.
+//! Scheduler-facing Tang Nano hash thread.
 
 use std::sync::{
     Arc, RwLock,
@@ -26,6 +26,7 @@ use crate::{
 };
 
 const TNJ_RESPONSE_LEN: usize = 37;
+const TNJ_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Commands sent to the FPGA worker thread.
 #[derive(Debug)]
@@ -44,7 +45,7 @@ enum FpgaCommand {
     Shutdown,
 }
 
-/// One Tang Nano 9K FPGA bitstream instance as a Mujina `HashThread`.
+/// One Tang Nano FPGA bitstream instance as a Mujina `HashThread`.
 pub struct TangNano9kHashThread {
     name: String,
     command_tx: mpsc::Sender<FpgaCommand>,
@@ -70,9 +71,9 @@ impl TangNano9kHashThread {
         let thread_name = name.clone();
 
         let handle = std::thread::Builder::new()
-            .name(format!("tang-nano-9k-{}", name))
+            .name(format!("tang-nano-fpga-{}", name))
             .spawn(move || run_fpga_loop(thread_name, config, cmd_rx, status_clone, shutdown_clone))
-            .expect("failed to spawn Tang Nano 9K FPGA thread");
+            .expect("failed to spawn Tang Nano FPGA thread");
 
         Self {
             name,
@@ -123,9 +124,9 @@ impl HashThread for TangNano9kHashThread {
             })
             .map_err(|_| HashThreadError::ChannelClosed("fpga command channel closed".into()))?;
 
-        response_rx
-            .await
-            .map_err(|_| HashThreadError::WorkAssignmentFailed("no response from FPGA thread".into()))?
+        response_rx.await.map_err(|_| {
+            HashThreadError::WorkAssignmentFailed("no response from FPGA thread".into())
+        })?
     }
 
     async fn replace_task(
@@ -140,9 +141,9 @@ impl HashThread for TangNano9kHashThread {
             })
             .map_err(|_| HashThreadError::ChannelClosed("fpga command channel closed".into()))?;
 
-        response_rx
-            .await
-            .map_err(|_| HashThreadError::WorkAssignmentFailed("no response from FPGA thread".into()))?
+        response_rx.await.map_err(|_| {
+            HashThreadError::WorkAssignmentFailed("no response from FPGA thread".into())
+        })?
     }
 
     async fn go_idle(&mut self) -> Result<Option<HashTask>, HashThreadError> {
@@ -151,13 +152,12 @@ impl HashThread for TangNano9kHashThread {
             .send(FpgaCommand::GoIdle { response_tx })
             .map_err(|_| HashThreadError::ChannelClosed("fpga command channel closed".into()))?;
 
-        response_rx
-            .await
-            .map_err(|_| HashThreadError::WorkAssignmentFailed("no response from FPGA thread".into()))?
+        response_rx.await.map_err(|_| {
+            HashThreadError::WorkAssignmentFailed("no response from FPGA thread".into())
+        })?
     }
 
     async fn shutdown(&mut self) -> Result<(), HashThreadError> {
-        let _ = self.go_idle().await;
         self.request_shutdown();
         Ok(())
     }
@@ -217,7 +217,7 @@ fn run_fpga_loop(
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        warn!(%error, "Tang Nano 9K FPGA job failed");
+                        warn!(%error, "Tang Nano FPGA job failed");
                         let mut s = status.write().unwrap();
                         s.hardware_errors += 1;
                     }
@@ -260,7 +260,10 @@ async fn run_one_fpga_job(
 
     let mut header_bytes = Vec::with_capacity(80);
     header.consensus_encode(&mut header_bytes)?;
-    anyhow::ensure!(header_bytes.len() == 80, "block header serialized to non-80-byte length");
+    anyhow::ensure!(
+        header_bytes.len() == 80,
+        "block header serialized to non-80-byte length"
+    );
 
     let packet = make_tnj_packet(&header_bytes, task.share_target.to_be_bytes());
 
@@ -268,17 +271,31 @@ async fn run_one_fpga_job(
         thread = %thread_name,
         port = %config.port,
         header_hex = %hex::encode(&header_bytes),
-        "sending Tang Nano 9K work"
+        "sending Tang Nano FPGA work"
     );
 
-    let serial = SerialStream::new(&config.port, config.baud)?;
-    let (mut reader, mut writer, _control) = serial.split();
-    writer.write_all(&packet).await?;
-    writer.flush().await?;
+    let response = tokio::time::timeout(TNJ_RESPONSE_TIMEOUT, async {
+        let serial = SerialStream::new(&config.port, config.baud)?;
+        let (mut reader, mut writer, _control) = serial.split();
+        writer.write_all(&packet).await?;
+        writer.flush().await?;
 
-    let mut response = [0u8; TNJ_RESPONSE_LEN];
-    reader.read_exact(&mut response).await?;
-    anyhow::ensure!(response[0] == b'F', "unexpected FPGA response tag 0x{:02x}", response[0]);
+        let mut response = [0u8; TNJ_RESPONSE_LEN];
+        reader.read_exact(&mut response).await?;
+        anyhow::Ok(response)
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "timed out waiting for Tang Nano FPGA response after {:?}",
+            TNJ_RESPONSE_TIMEOUT
+        )
+    })??;
+    anyhow::ensure!(
+        response[0] == b'F',
+        "unexpected FPGA response tag 0x{:02x}",
+        response[0]
+    );
 
     let fpga_nonce_bytes: [u8; 4] = response[1..5].try_into()?;
     // The bitstream appends current_nonce as a SHA big-endian word. Bitcoin
@@ -341,21 +358,18 @@ fn sha256_midstate(block: &[u8]) -> [u8; 32] {
 }
 
 const SHA256_IV: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-    0x5be0cd19,
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
 const K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-    0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-    0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-    0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-    0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-    0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-    0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-    0xc67178f2,
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
 fn sha256_compress(mut state: [u32; 8], block: [u8; 64]) -> [u32; 8] {
@@ -419,7 +433,8 @@ fn small_sigma1(x: u32) -> u32 {
 mod tests {
     use super::*;
     use bitcoin::block::Version;
-    use bitcoin::hashes::Hash;
+    use bitcoin::hashes::sha256d;
+    use bitcoin::hashes::{Hash, HashEngine};
     use bitcoin::pow::{CompactTarget, Target};
 
     #[test]
@@ -428,9 +443,9 @@ mod tests {
             version: Version::from_consensus(1),
             prev_blockhash: bitcoin::BlockHash::all_zeros(),
             merkle_root: bitcoin::TxMerkleNode::from_byte_array([
-                0x3b, 0xa3, 0xed, 0xfd, 0x7a, 0x7b, 0x12, 0xb2, 0x7a, 0xc7, 0x2c, 0x3e, 0x67,
-                0x76, 0x8f, 0x61, 0x7f, 0xc8, 0x1b, 0xc3, 0x88, 0x8a, 0x51, 0x32, 0x3a, 0x9f,
-                0xb8, 0xaa, 0x4b, 0x1e, 0x5e, 0x4a,
+                0x3b, 0xa3, 0xed, 0xfd, 0x7a, 0x7b, 0x12, 0xb2, 0x7a, 0xc7, 0x2c, 0x3e, 0x67, 0x76,
+                0x8f, 0x61, 0x7f, 0xc8, 0x1b, 0xc3, 0x88, 0x8a, 0x51, 0x32, 0x3a, 0x9f, 0xb8, 0xaa,
+                0x4b, 0x1e, 0x5e, 0x4a,
             ]),
             time: 0x495fab29,
             bits: CompactTarget::from_consensus(0x1d00ffff),
@@ -448,5 +463,40 @@ mod tests {
             "bc909a336358bff090ccac7d1e59caa8c3c8d8e94f0103c896b187364719f91b"
         );
         assert_eq!(hex::encode(&packet[35..47]), "4b1e5e4a29ab5f49ffff001d");
+    }
+
+    #[test]
+    fn target_bytes_for_fpga_are_pow_integer_big_endian() {
+        let target = Target::from(CompactTarget::from_consensus(0x1d00ffff));
+        assert_eq!(
+            hex::encode(target.to_be_bytes()),
+            "00000000ffff0000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(
+            hex::encode(target.to_le_bytes()),
+            "0000000000000000000000000000000000000000000000000000ffff00000000"
+        );
+    }
+
+    #[test]
+    fn fpga_log_response_matches_reconstructed_header_hash() {
+        let mut header = hex::decode(
+            "0000002009f9caa3f91506e721ef19894ccecf472a0d5f1064ad01000000000000000000d33f1e89c29931c8f6daf3eafe9c28e798666c772acf8fd723fb2c42ba8a518bc30dfa69f01f021700000000",
+        )
+        .unwrap();
+        let fpga_nonce_bytes = [0x00, 0x04, 0x26, 0x88];
+        header[76..80].copy_from_slice(&fpga_nonce_bytes);
+
+        let mut engine = sha256d::Hash::engine();
+        engine.input(&header);
+        let digest = sha256d::Hash::from_engine(engine);
+
+        assert_eq!(
+            hex::encode(digest.as_byte_array()),
+            "0000508d9c92ab5788bf90f7356914f1b73030f0e0523d6b50474ae2eb486d52"
+        );
+
+        let parsed_nonce = u32::from_le_bytes(fpga_nonce_bytes);
+        assert_eq!(parsed_nonce, 0x88260400);
     }
 }

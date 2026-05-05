@@ -79,17 +79,17 @@ impl Daemon {
             }
         }
 
-        // Inject Tang Nano 9K FPGA miner virtual thread if configured.
+        // Inject Tang Nano FPGA miner virtual thread if configured.
         if let Some(config) = TangNano9kConfig::from_env() {
             info!(
                 port = %config.port,
                 baud = config.baud,
-                "Tang Nano 9K FPGA miner enabled"
+                "Tang Nano FPGA miner enabled"
             );
 
-            let thread = TangNano9kHashThread::new("Tang Nano 9K FPGA".into(), config);
+            let thread = TangNano9kHashThread::new("Tang Nano FPGA".into(), config);
             if let Err(e) = thread_tx.send(Box::new(thread)).await {
-                error!("Failed to register Tang Nano 9K FPGA thread: {}", e);
+                error!("Failed to register Tang Nano FPGA thread: {}", e);
             }
         }
 
@@ -102,7 +102,12 @@ impl Daemon {
         let (miner_state_tx, miner_state_rx) = watch::channel(MinerState::default());
 
         // Create and start backplane
-        let mut backplane = Backplane::new(transport_rx, thread_tx, board_reg_tx, miner_state_rx.clone());
+        let mut backplane = Backplane::new(
+            transport_rx,
+            thread_tx,
+            board_reg_tx,
+            miner_state_rx.clone(),
+        );
         self.tracker.spawn({
             let shutdown = self.shutdown.clone();
             async move {
