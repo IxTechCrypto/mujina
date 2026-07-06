@@ -10,6 +10,34 @@
 //! The decision logic ([`AutoTuner::evaluate`]) is a pure function of the
 //! current [`Metrics`] and tuner state, so it is unit-tested without any
 //! hardware. The [`run`] task wires it to live telemetry and commands.
+//!
+//! # Prior art / acknowledgements
+//!
+//! The approach here is informed by the open-source Bitaxe auto-tuning
+//! community. Unlike those tools — external scripts that drive the AxeOS
+//! HTTP API — this runs inside the miner, but it borrows their proven
+//! ideas. With thanks to:
+//!
+//! - **BitaxePID** by kha1n3vol3 — dual PID control, per-model profiles,
+//!   snapshot persistence, and the tuning activity log.
+//!   <https://github.com/kha1n3vol3/BitaxePID>
+//! - **bitaxe-gamma-oc-script** by terminally-challenged — the sweep +
+//!   coefficient-of-variation stability check.
+//!   <https://github.com/terminally-challenged/bitaxe-gamma-oc-script>
+//! - **bitaxe_frequency_sweeper** by andelorean — stepwise climb with
+//!   temperature/VR/power thresholds and a values lookup table.
+//!   <https://github.com/andelorean/bitaxe_frequency_sweeper>
+//! - **bitaxe-temp-monitor** by Hurllz and **Bitaxe-Hashrate-Benchmark** /
+//!   **Bitaxe-Temperature-Control** by WhiteyCookie — thermal-governor
+//!   tuning and hashrate benchmarking.
+//!   <https://github.com/Hurllz/bitaxe-temp-monitor>,
+//!   <https://github.com/WhiteyCookie/Bitaxe-Hashrate-Benchmark>
+//! - **AxeBench** — the Quiet / Efficient / Balanced / Max-Hash profile
+//!   framing.
+//! - **D-Central's** Bitaxe overclocking and auto-tuning guides — safe
+//!   frequency/voltage ranges, 24/7 temperature targets, and the
+//!   ~15 W / 25 W power limits used for the profile caps.
+//!   <https://d-central.tech/bitaxe-auto-tuning-scripts-guide/>
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
