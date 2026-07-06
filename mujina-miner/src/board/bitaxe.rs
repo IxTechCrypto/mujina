@@ -24,7 +24,11 @@ use crate::{
     api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
     asic::{
         ChipInfo,
-        bm13xx::{self, BM13xxProtocol, protocol::Command, thread::BM13xxThread},
+        bm13xx::{
+            self, BM13xxProtocol,
+            protocol::Command,
+            thread::{BM13xxThread, FrequencyControl},
+        },
         hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
     },
     hw_trait::{
@@ -206,6 +210,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         peripherals,
         thread_shutdown_rx,
     );
+    let freq_control = thread.frequency_control();
     let threads: Vec<Box<dyn HashThread>> = vec![Box::new(thread)];
 
     debug!("Bitaxe board initialized with {} chips", chip_infos.len());
@@ -237,6 +242,8 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         board_model: "Bitaxe Gamma",
         board_serial: serial,
         fan_control: FanControl::default(),
+        freq_control,
+        current_freq_mhz: bm13xx::thread::TARGET_FREQUENCY_MHZ,
         over_temp_count: 0,
         sensor_fault_count: 0,
         asic_enable: asic_enable_monitor,
@@ -263,10 +270,24 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     })
 }
 
+/// Lowest core voltage accepted from a runtime tuning request, in mV.
+const MIN_CORE_VOLTAGE_MV: u16 = 1000;
+/// Highest core voltage accepted from a runtime tuning request, in mV.
+/// The BM1370 should not run above ~1300 mV sustained.
+const MAX_CORE_VOLTAGE_MV: u16 = 1300;
+
 /// Default automatic-mode target ASIC die temperature, in Celsius.
 const DEFAULT_FAN_TARGET_C: f32 = 60.0;
 /// Default automatic-mode minimum fan duty cycle, in percent.
 const DEFAULT_FAN_MIN_PERCENT: u8 = 25;
+/// Accepted range for an automatic-mode target temperature. The ceiling
+/// stays clear of the 80 C emergency threshold so auto control actually
+/// engages before the emergency shutdown would.
+const MIN_FAN_TARGET_C: f32 = 40.0;
+const MAX_FAN_TARGET_C: f32 = 75.0;
+/// Never let the automatic minimum drop to zero: a running ASIC always
+/// needs some airflow, and the emergency path is a backstop, not a plan.
+const MIN_FAN_FLOOR_PERCENT: u8 = 10;
 /// Temperature span above the target over which the automatic curve
 /// ramps the fan from `min_percent` up to 100%.
 const FAN_RAMP_SPAN_C: f32 = 15.0;
@@ -306,8 +327,14 @@ impl FanControl {
         };
         if update.auto {
             FanControl::Auto {
-                target_c: update.target_c.unwrap_or(cur_target),
-                min_percent: update.min_percent.unwrap_or(cur_min),
+                target_c: update
+                    .target_c
+                    .unwrap_or(cur_target)
+                    .clamp(MIN_FAN_TARGET_C, MAX_FAN_TARGET_C),
+                min_percent: update
+                    .min_percent
+                    .unwrap_or(cur_min)
+                    .clamp(MIN_FAN_FLOOR_PERCENT, 100),
             }
         } else {
             let cur_manual = match self {
@@ -349,6 +376,10 @@ struct Bitaxe {
     board_serial: Option<String>,
     /// Fan control policy applied each monitor cycle.
     fan_control: FanControl,
+    /// Handle for retuning the ASIC hash clock at runtime.
+    freq_control: FrequencyControl,
+    /// Last hash clock commanded to the ASIC, in MHz. Reported in telemetry.
+    current_freq_mhz: f32,
     /// Consecutive readings at or above the emergency temperature.
     /// Triggers a fast thermal shutdown.
     over_temp_count: u32,
@@ -381,7 +412,7 @@ impl Bitaxe {
                     }
                 }
                 Some(cmd) = command_rx.recv() => {
-                    self.handle_command(cmd);
+                    self.handle_command(cmd).await;
                 }
                 _ = cancel.cancelled() => {
                     self.shutdown().await;
@@ -394,15 +425,46 @@ impl Bitaxe {
         }
     }
 
-    /// Apply a runtime command. The new policy takes effect on the next
-    /// monitor tick (within the ~2s cadence), which owns actually driving
-    /// the fan hardware.
-    fn handle_command(&mut self, cmd: BoardCommand) {
+    /// Apply a runtime command.
+    ///
+    /// Fan changes take effect on the next monitor tick; voltage and
+    /// frequency are applied immediately to the hardware here.
+    async fn handle_command(&mut self, cmd: BoardCommand) {
         match cmd {
             BoardCommand::SetFanControl { update, reply } => {
                 self.fan_control = self.fan_control.with_update(update);
                 info!(policy = ?self.fan_control, "Fan control updated");
                 let _ = reply.send(Ok(()));
+            }
+            BoardCommand::SetCoreVoltage { millivolts, reply } => {
+                let clamped = millivolts.clamp(MIN_CORE_VOLTAGE_MV, MAX_CORE_VOLTAGE_MV);
+                let volts = clamped as f32 / 1000.0;
+                let result = self.regulator.lock().await.set_vout(volts).await;
+                match &result {
+                    Ok(()) => info!(millivolts = clamped, "Core voltage set"),
+                    Err(e) => warn!(error = %e, "Failed to set core voltage"),
+                }
+                let _ = reply.send(result);
+            }
+            BoardCommand::SetFrequency { mhz, reply } => {
+                // A live PLL ramp takes seconds. Run it in a detached task so
+                // the monitor loop keeps calling monitor_tick — the thermal
+                // watchdog must not be starved while the clock is changing.
+                // Reflect the requested (clamped) clock in telemetry now; the
+                // thread owns the actual ramp.
+                self.current_freq_mhz = mhz.clamp(
+                    bm13xx::thread::MIN_FREQUENCY_MHZ,
+                    bm13xx::thread::MAX_FREQUENCY_MHZ,
+                );
+                let freq_control = self.freq_control.clone();
+                tokio::spawn(async move {
+                    let result = freq_control.set(mhz).await;
+                    match &result {
+                        Ok(()) => info!(mhz, "Hash clock retune complete"),
+                        Err(e) => warn!(error = %e, "Failed to set hash clock"),
+                    }
+                    let _ = reply.send(result);
+                });
             }
         }
     }
@@ -571,7 +633,7 @@ impl Bitaxe {
             name: self.board_name.clone(),
             model: self.board_model.into(),
             serial: self.board_serial.clone(),
-            frequency_mhz: Some(bm13xx::thread::TARGET_FREQUENCY_MHZ),
+            frequency_mhz: Some(self.current_freq_mhz),
             fans: vec![Fan {
                 name: "fan".into(),
                 rpm: fan_rpm,
@@ -935,6 +997,25 @@ mod tests {
             FanControl::Auto {
                 target_c: 55.0,
                 min_percent: 25
+            }
+        );
+    }
+
+    #[test]
+    fn update_clamps_unsafe_auto_params() {
+        // A target above the emergency threshold and a zero floor are both
+        // pulled back into safe bounds so auto control still cools the chip.
+        let updated = FanControl::default().with_update(FanControlUpdate {
+            auto: true,
+            target_c: Some(119.0),
+            min_percent: Some(0),
+            percent: None,
+        });
+        assert_eq!(
+            updated,
+            FanControl::Auto {
+                target_c: super::MAX_FAN_TARGET_C,
+                min_percent: super::MIN_FAN_FLOOR_PERCENT,
             }
         );
     }

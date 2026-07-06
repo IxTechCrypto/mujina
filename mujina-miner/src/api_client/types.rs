@@ -120,6 +120,21 @@ pub struct FanControlRequest {
     pub percent: Option<u8>,
 }
 
+/// Request body for `PATCH /boards/{name}/tuning`.
+///
+/// Only the fields present are applied; the board clamps each to a safe
+/// range. Setting these is a manual override; an auto-tuner (future) will
+/// drive the same knobs.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct TuningRequest {
+    /// Target ASIC hash clock, in MHz.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_mhz: Option<f32>,
+    /// Target ASIC core voltage, in millivolts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_voltage_mv: Option<u16>,
+}
+
 /// Job source telemetry.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct SourceTelemetry {

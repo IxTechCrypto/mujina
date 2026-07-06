@@ -39,4 +39,18 @@ pub enum BoardCommand {
         update: FanControlUpdate,
         reply: oneshot::Sender<Result<()>>,
     },
+
+    /// Set the ASIC core voltage, in millivolts. The board clamps to a
+    /// safe range before applying.
+    SetCoreVoltage {
+        millivolts: u16,
+        reply: oneshot::Sender<Result<()>>,
+    },
+
+    /// Set the ASIC hash clock, in MHz. The board clamps to a safe range
+    /// and ramps to the new value.
+    SetFrequency {
+        mhz: f32,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }

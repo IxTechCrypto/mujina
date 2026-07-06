@@ -10,13 +10,14 @@ use axum::{
 };
 use std::time::Duration;
 
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::commands::{BoardCommand, FanControlUpdate, SchedulerCommand};
 use super::server::SharedState;
 use crate::api_client::types::{
     BoardTelemetry, FanControlRequest, MinerPatchRequest, MinerTelemetry, SourceTelemetry,
+    TuningRequest,
 };
 
 /// Build the v0 API routes with OpenAPI metadata.
@@ -27,6 +28,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_boards))
         .routes(routes!(get_board))
         .routes(routes!(patch_board_fan))
+        .routes(routes!(patch_board_tuning))
         .routes(routes!(get_sources))
         .routes(routes!(get_source))
 }
@@ -185,6 +187,97 @@ async fn patch_board_fan(
     let Ok(Ok(Ok(()))) = tokio::time::timeout(Duration::from_secs(5), rx).await else {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
+
+    state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .boards()
+        .into_iter()
+        .find(|b| b.name == name)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Send one board command and await its reply, mapping failures to 500.
+async fn dispatch_board_command(
+    sender: &mpsc::Sender<BoardCommand>,
+    make: impl FnOnce(oneshot::Sender<anyhow::Result<()>>) -> BoardCommand,
+) -> Result<(), StatusCode> {
+    let (tx, rx) = oneshot::channel();
+    // Bound the enqueue too: if the board's command buffer is full and its
+    // monitor is wedged, we must not await the send forever.
+    let Ok(Ok(())) = tokio::time::timeout(Duration::from_secs(5), sender.send(make(tx))).await
+    else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    // A live frequency ramp can take a couple of seconds; allow headroom.
+    let Ok(Ok(Ok(()))) = tokio::time::timeout(Duration::from_secs(15), rx).await else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    Ok(())
+}
+
+/// Set a board's ASIC frequency and/or core voltage (manual tuning).
+#[utoipa::path(
+    patch,
+    path = "/boards/{name}/tuning",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    request_body = TuningRequest,
+    responses(
+        (status = OK, description = "Updated board details", body = BoardTelemetry),
+        (status = NOT_FOUND, description = "Board not found or accepts no commands"),
+        (status = INTERNAL_SERVER_ERROR, description = "Command channel error"),
+    ),
+)]
+async fn patch_board_tuning(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<TuningRequest>,
+) -> Result<Json<BoardTelemetry>, StatusCode> {
+    let (sender, current_freq) = {
+        let mut registry = state
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sender = registry
+            .command_sender(&name)
+            .ok_or(StatusCode::NOT_FOUND)?;
+        let current_freq = registry
+            .boards()
+            .into_iter()
+            .find(|b| b.name == name)
+            .and_then(|b| b.frequency_mhz);
+        (sender, current_freq)
+    };
+
+    // Order the two changes by frequency direction so the chip is never
+    // under-volted at a high clock during the multi-second transition:
+    // when raising the clock, raise voltage first; when lowering, drop the
+    // clock first, then the voltage. Default to voltage-first when the
+    // current clock is unknown (the safer assumption).
+    let raising = match (current_freq, req.frequency_mhz) {
+        (Some(cur), Some(target)) => target > cur,
+        _ => true,
+    };
+
+    for step_is_voltage in [raising, !raising] {
+        if step_is_voltage {
+            if let Some(mv) = req.core_voltage_mv {
+                dispatch_board_command(&sender, |reply| BoardCommand::SetCoreVoltage {
+                    millivolts: mv,
+                    reply,
+                })
+                .await?;
+            }
+        } else if let Some(mhz) = req.frequency_mhz {
+            dispatch_board_command(&sender, |reply| BoardCommand::SetFrequency { mhz, reply })
+                .await?;
+        }
+    }
 
     state
         .board_registry

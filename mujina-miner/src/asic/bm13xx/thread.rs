@@ -31,6 +31,14 @@ use crate::{
 /// Boards report this as their operating frequency in telemetry.
 pub const TARGET_FREQUENCY_MHZ: f32 = 525.0;
 
+/// Lowest hash clock accepted from a runtime tuning request, in MHz.
+/// Below this the chip does not usefully hash.
+pub const MIN_FREQUENCY_MHZ: f32 = 400.0;
+/// Highest hash clock accepted from a runtime tuning request, in MHz.
+/// A conservative BM1370 ceiling; exceptional chips go higher but that is
+/// not safe as an unattended default.
+pub const MAX_FREQUENCY_MHZ: f32 = 650.0;
+
 /// Tracks tasks sent to chip hardware, indexed by chip_job_id.
 ///
 /// BM13xx chips use 4-bit job IDs. This tracker maintains snapshots of
@@ -90,9 +98,39 @@ enum ThreadCommand {
         response_tx: oneshot::Sender<Result<Option<HashTask>>>,
     },
 
+    /// Set the hash clock, in MHz. Ramps from the current frequency and
+    /// updates the target used on (re)initialization.
+    SetFrequency {
+        mhz: f32,
+        response_tx: oneshot::Sender<Result<()>>,
+    },
+
     /// Shutdown the thread
     #[expect(unused)]
     Shutdown,
+}
+
+/// Cloneable handle for adjusting a running thread's hash clock.
+///
+/// Lets the board monitor retune frequency without owning the boxed
+/// [`HashThread`], keeping [`ThreadCommand`] private to this module.
+#[derive(Clone)]
+pub struct FrequencyControl {
+    command_tx: mpsc::Sender<ThreadCommand>,
+}
+
+impl FrequencyControl {
+    /// Request a new hash clock, in MHz. The actor clamps and ramps.
+    pub async fn set(&self, mhz: f32) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::SetFrequency { mhz, response_tx })
+            .await
+            .map_err(|_| anyhow!("thread command channel closed"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow!("no response from thread"))?
+    }
 }
 
 /// BM13xx HashThread implementation.
@@ -167,6 +205,13 @@ impl BM13xxThread {
             event_rx: Some(evt_rx),
             capabilities: HashThreadCapabilities::default(),
             status,
+        }
+    }
+
+    /// A cloneable handle for retuning this thread's hash clock at runtime.
+    pub fn frequency_control(&self) -> FrequencyControl {
+        FrequencyControl {
+            command_tx: self.command_tx.clone(),
         }
     }
 }
@@ -249,6 +294,7 @@ async fn initialize_chip<W>(
     chip_commands: &mut W,
     peripherals: &mut BoardPeripherals,
     asic_difficulty: Log2Difficulty,
+    target_mhz: f32,
 ) -> Result<()>
 where
     W: Sink<protocol::Command> + Unpin,
@@ -440,8 +486,8 @@ where
     .await?;
 
     // Frequency ramping (56.25 MHz -> target)
-    debug!("Ramping frequency from 56.25 MHz to {TARGET_FREQUENCY_MHZ} MHz");
-    let frequency_steps = generate_frequency_ramp_steps(56.25, TARGET_FREQUENCY_MHZ, 6.25);
+    debug!("Ramping frequency from 56.25 MHz to {target_mhz} MHz");
+    let frequency_steps = generate_frequency_ramp_steps(56.25, target_mhz, 6.25);
 
     for (i, pll_config) in frequency_steps.iter().enumerate() {
         send_reg(chip_commands, true, Register::PllDivider(*pll_config))
@@ -473,6 +519,60 @@ where
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
+    Ok(())
+}
+
+/// Ramp the hash clock from `*current_mhz` to `to_mhz` in small PLL steps,
+/// in either direction, pausing between steps so the clock settles.
+///
+/// `*current_mhz` is advanced to each setpoint only *after* its PLL write
+/// is acknowledged, so on error it reflects where the chip actually is —
+/// the caller (and telemetry) never believe the clock is somewhere it
+/// isn't, and a subsequent ramp resumes from the true value instead of
+/// slamming the PLL in one large step.
+///
+/// Used for runtime retuning of a chip that is already hashing (chip
+/// bring-up uses the ascending ramp in `initialize_chip` directly).
+async fn ramp_frequency<W>(chip_commands: &mut W, current_mhz: &mut f32, to_mhz: f32) -> Result<()>
+where
+    W: Sink<protocol::Command> + Unpin,
+    W::Error: std::fmt::Debug,
+{
+    const STEP_MHZ: f32 = 6.25;
+
+    // Build the intermediate setpoints, walking up or down toward the goal.
+    let mut steps = Vec::new();
+    if to_mhz >= *current_mhz {
+        let mut c = *current_mhz + STEP_MHZ;
+        while c < to_mhz {
+            steps.push(c);
+            c += STEP_MHZ;
+        }
+    } else {
+        let mut c = *current_mhz - STEP_MHZ;
+        while c > to_mhz {
+            steps.push(c);
+            c -= STEP_MHZ;
+        }
+    }
+    steps.push(to_mhz);
+
+    for f in steps {
+        if let Some(cfg) = calculate_pll_for_frequency(f) {
+            chip_commands
+                .send(protocol::Command::WriteRegister {
+                    broadcast: true,
+                    chip_address: 0x00,
+                    register: protocol::Register::PllDivider(cfg),
+                })
+                .await
+                .map_err(|e| anyhow!("{e:?}"))
+                .context("live PLL retune failed")?;
+            // Only advance the tracked clock once the write is acknowledged.
+            *current_mhz = f;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
     Ok(())
 }
 
@@ -632,6 +732,10 @@ async fn bm13xx_thread_actor<R, W>(
     );
 
     let mut chip_initialized = false;
+    // Desired hash clock used on (re)initialization, and the clock the chip
+    // is currently ramped to (0.0 until the chip is first initialized).
+    let mut target_freq = TARGET_FREQUENCY_MHZ;
+    let mut current_freq = 0.0f32;
     let mut current_task: Option<HashTask> = None;
     let mut chip_jobs = ChipJobTracker::new();
     let mut ntime_ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
@@ -684,12 +788,13 @@ async fn bm13xx_thread_actor<R, W>(
 
                         if !chip_initialized {
                             trace!("Initializing chip on first assignment.");
-                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals, asic_difficulty).await {
+                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals, asic_difficulty, target_freq).await {
                                 error!(error = %e, "Chip initialization failed");
                                 response_tx.send(Err(e)).ok();
                                 continue;
                             }
                             chip_initialized = true;
+                            current_freq = target_freq;
                         }
 
                         // Send initial job to chip
@@ -734,12 +839,13 @@ async fn bm13xx_thread_actor<R, W>(
 
                         if !chip_initialized {
                             trace!("Initializing chip on first assignment.");
-                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals, asic_difficulty).await {
+                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals, asic_difficulty, target_freq).await {
                                 error!(error = %e, "Chip initialization failed");
                                 response_tx.send(Err(e)).ok();
                                 continue;
                             }
                             chip_initialized = true;
+                            current_freq = target_freq;
                         }
 
                         // Clear old jobs (old shares invalid)
@@ -785,6 +891,31 @@ async fn bm13xx_thread_actor<R, W>(
                         }
 
                         response_tx.send(Ok(old_task)).ok();
+                    }
+
+                    ThreadCommand::SetFrequency { mhz, response_tx } => {
+                        let target = mhz.clamp(MIN_FREQUENCY_MHZ, MAX_FREQUENCY_MHZ);
+                        target_freq = target;
+                        // Retune live only if the chip is already ramped; if it
+                        // has not been initialized yet, the new target is picked
+                        // up by the bring-up ramp on first work assignment.
+                        if chip_initialized {
+                            let from = current_freq;
+                            // ramp_frequency advances current_freq per acked step,
+                            // so it stays accurate even if the ramp fails partway.
+                            match ramp_frequency(&mut chip_commands, &mut current_freq, target).await {
+                                Ok(()) => {
+                                    info!(from_mhz = from, to_mhz = current_freq, "Retuned hash clock");
+                                    response_tx.send(Ok(())).ok();
+                                }
+                                Err(e) => {
+                                    error!(error = %e, stopped_at_mhz = current_freq, "Live frequency retune failed");
+                                    response_tx.send(Err(e)).ok();
+                                }
+                            }
+                        } else {
+                            response_tx.send(Ok(())).ok();
+                        }
                     }
 
                     ThreadCommand::Shutdown => {
