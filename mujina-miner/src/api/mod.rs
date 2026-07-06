@@ -4,6 +4,7 @@
 //! miner. Built on Axum, binds to localhost only by default and does not
 //! require authentication for local access.
 
+pub mod autotune;
 pub mod commands;
 mod registry;
 mod server;

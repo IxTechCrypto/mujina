@@ -135,6 +135,17 @@ pub struct TuningRequest {
     pub core_voltage_mv: Option<u16>,
 }
 
+/// Request body for `PATCH /boards/{name}/autotune`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct AutoTuneRequest {
+    /// Turn the auto-tuner on or off.
+    pub enabled: bool,
+    /// Profile to tune toward: `quiet`, `efficient`, `balanced`, or
+    /// `max_hash`. Ignored when disabling; defaults to `balanced`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
 /// Job source telemetry.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct SourceTelemetry {

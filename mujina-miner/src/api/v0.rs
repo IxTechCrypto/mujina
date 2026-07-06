@@ -13,11 +13,12 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
+use super::autotune::{AutoTuneStatus, TuneProfile, TuneSetpoint};
 use super::commands::{BoardCommand, FanControlUpdate, SchedulerCommand};
 use super::server::SharedState;
 use crate::api_client::types::{
-    BoardTelemetry, FanControlRequest, MinerPatchRequest, MinerTelemetry, SourceTelemetry,
-    TuningRequest,
+    AutoTuneRequest, BoardTelemetry, FanControlRequest, MinerPatchRequest, MinerTelemetry,
+    SourceTelemetry, TuningRequest,
 };
 
 /// Build the v0 API routes with OpenAPI metadata.
@@ -29,6 +30,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_board))
         .routes(routes!(patch_board_fan))
         .routes(routes!(patch_board_tuning))
+        .routes(routes!(get_board_autotune, patch_board_autotune))
         .routes(routes!(get_sources))
         .routes(routes!(get_source))
 }
@@ -288,6 +290,89 @@ async fn patch_board_tuning(
         .find(|b| b.name == name)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Current frequency/voltage operating point of a board, from telemetry.
+fn board_setpoint(state: &SharedState, name: &str) -> Option<TuneSetpoint> {
+    let board = state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .boards()
+        .into_iter()
+        .find(|b| b.name == name)?;
+    let frequency_mhz = board.frequency_mhz?;
+    let core_voltage_mv = board
+        .powers
+        .iter()
+        .find(|p| p.name == "core")
+        .and_then(|p| p.voltage_v)
+        .map(|v| (v * 1000.0).round() as u16)?;
+    Some(TuneSetpoint {
+        frequency_mhz,
+        core_voltage_mv,
+    })
+}
+
+fn parse_profile(s: Option<&str>) -> TuneProfile {
+    match s {
+        Some("quiet") => TuneProfile::Quiet,
+        Some("efficient") => TuneProfile::Efficient,
+        Some("max_hash") => TuneProfile::MaxHash,
+        _ => TuneProfile::Balanced,
+    }
+}
+
+/// Get a board's auto-tuning status and recent activity log.
+#[utoipa::path(
+    get,
+    path = "/boards/{name}/autotune",
+    tag = "boards",
+    params(("name" = String, Path, description = "Board name")),
+    responses((status = OK, description = "Auto-tuning status", body = AutoTuneStatus)),
+)]
+async fn get_board_autotune(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Json<AutoTuneStatus> {
+    let setpoint = board_setpoint(&state, &name);
+    let status = state
+        .autotuner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .status(setpoint);
+    Json(status)
+}
+
+/// Enable or disable auto-tuning for a board and choose its profile.
+#[utoipa::path(
+    patch,
+    path = "/boards/{name}/autotune",
+    tag = "boards",
+    params(("name" = String, Path, description = "Board name")),
+    request_body = AutoTuneRequest,
+    responses((status = OK, description = "Updated auto-tuning status", body = AutoTuneStatus)),
+)]
+async fn patch_board_autotune(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<AutoTuneRequest>,
+) -> Json<AutoTuneStatus> {
+    let setpoint = board_setpoint(&state, &name);
+    {
+        let mut tuner = state.autotuner.lock().unwrap_or_else(|e| e.into_inner());
+        if req.enabled {
+            tuner.enable(parse_profile(req.profile.as_deref()));
+        } else {
+            tuner.disable();
+        }
+    }
+    let status = state
+        .autotuner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .status(setpoint);
+    Json(status)
 }
 
 /// Return all registered job sources.

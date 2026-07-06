@@ -15,6 +15,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_swagger_ui::SwaggerUi;
 
 use super::{
+    autotune::{self, SharedAutoTuner},
     commands::SchedulerCommand,
     registry::{BoardRegistration, BoardRegistry},
     v0,
@@ -34,6 +35,7 @@ pub(crate) struct SharedState {
     pub miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     pub board_registry: Arc<Mutex<BoardRegistry>>,
     pub scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
+    pub autotuner: SharedAutoTuner,
 }
 
 impl SharedState {
@@ -79,7 +81,21 @@ pub async fn serve(
         }
     });
 
-    let app = build_router(miner_telemetry_rx, board_registry, scheduler_cmd_tx);
+    // Auto-tuning supervisor, sharing its state with the API handlers.
+    let autotuner: SharedAutoTuner = Default::default();
+    tokio::spawn(autotune::run(
+        autotuner.clone(),
+        board_registry.clone(),
+        miner_telemetry_rx.clone(),
+        shutdown.clone(),
+    ));
+
+    let app = build_router(
+        miner_telemetry_rx,
+        board_registry,
+        scheduler_cmd_tx,
+        autotuner,
+    );
 
     let listener = TcpListener::bind(&config.bind_addr).await?;
     let actual_addr = listener.local_addr()?;
@@ -110,11 +126,13 @@ pub(crate) fn build_router(
     miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     board_registry: Arc<Mutex<BoardRegistry>>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
+    autotuner: SharedAutoTuner,
 ) -> Router {
     let state = SharedState {
         miner_telemetry_rx,
         board_registry,
         scheduler_cmd_tx,
+        autotuner,
     };
 
     let (router, api) = OpenApiRouter::new()
@@ -174,7 +192,12 @@ mod tests {
         }
 
         TestFixtures {
-            router: build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx),
+            router: build_router(
+                miner_rx,
+                Arc::new(Mutex::new(registry)),
+                cmd_tx,
+                Default::default(),
+            ),
             _board_senders: board_senders,
             _miner_tx: miner_tx,
             _cmd_rx: cmd_rx,
