@@ -166,7 +166,10 @@ mod tests {
         let mut board_senders = Vec::new();
         for state in board_states {
             let (tx, rx) = watch::channel(state);
-            registry.push(BoardRegistration { telemetry_rx: rx });
+            registry.push(BoardRegistration {
+                telemetry_rx: rx,
+                command_tx: None,
+            });
             board_senders.push(tx);
         }
 

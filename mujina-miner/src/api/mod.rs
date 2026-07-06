@@ -9,5 +9,6 @@ mod registry;
 mod server;
 mod v0;
 
+pub use commands::{BoardCommand, FanControlUpdate};
 pub use registry::BoardRegistration;
 pub use server::{ApiConfig, serve};

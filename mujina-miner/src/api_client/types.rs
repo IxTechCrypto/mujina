@@ -46,8 +46,20 @@ pub struct Fan {
     pub rpm: Option<u32>,
     /// Measured duty cycle, or null if the read failed.
     pub percent: Option<u8>,
-    /// Target duty cycle, or null if the fan is in automatic mode.
+    /// Commanded duty cycle the controller is currently driving toward
+    /// (the manual setpoint, or the value the automatic curve chose), or
+    /// null if no command has been issued yet.
     pub target_percent: Option<u8>,
+    /// Whether automatic temperature-tracking control is active, or null
+    /// if the board does not expose a controllable fan policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto: Option<bool>,
+    /// Automatic-mode target temperature in Celsius, when in auto mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_c: Option<f32>,
+    /// Automatic-mode minimum duty cycle, when in auto mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_percent: Option<u8>,
 }
 
 /// Temperature sensor reading.
@@ -88,11 +100,24 @@ pub struct MinerPatchRequest {
     pub paused: Option<bool>,
 }
 
-/// Request body for setting a fan's target duty cycle.
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct SetFanTargetRequest {
-    /// Target duty cycle percentage (0--100), or null for automatic control.
-    pub target_percent: Option<u8>,
+/// Request body for `PATCH /boards/{name}/fan`.
+///
+/// `auto` selects the mode; the remaining fields refine it and any left
+/// unset keep their current value.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct FanControlRequest {
+    /// `true` = automatic temperature-tracking curve, `false` = fixed
+    /// manual duty cycle.
+    pub auto: bool,
+    /// Automatic-mode target ASIC temperature in Celsius.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_c: Option<f32>,
+    /// Automatic-mode minimum duty cycle (0--100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_percent: Option<u8>,
+    /// Manual-mode fixed duty cycle (0--100), used when `auto` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u8>,
 }
 
 /// Job source telemetry.

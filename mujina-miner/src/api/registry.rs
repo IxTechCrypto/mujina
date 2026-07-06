@@ -1,7 +1,8 @@
 //! Dynamic board registration tracking.
 
+use crate::api::commands::BoardCommand;
 use crate::api_client::types::BoardTelemetry;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 /// Dynamic collection of board registrations.
 ///
@@ -35,11 +36,23 @@ impl BoardRegistry {
             .map(|reg| reg.telemetry_rx.borrow().clone())
             .collect()
     }
+
+    /// Command sender for the board with the given telemetry name, if it
+    /// is connected and accepts commands.
+    pub fn command_sender(&self, name: &str) -> Option<mpsc::Sender<BoardCommand>> {
+        self.boards
+            .iter()
+            .find(|reg| reg.telemetry_rx.borrow().name == name)
+            .and_then(|reg| reg.command_tx.clone())
+    }
 }
 
 /// A board's registration with the API server.
 pub struct BoardRegistration {
     pub telemetry_rx: watch::Receiver<BoardTelemetry>,
+    /// Runtime command sender for this board, or `None` if it accepts
+    /// no commands.
+    pub command_tx: Option<mpsc::Sender<BoardCommand>>,
 }
 
 #[cfg(test)]
@@ -57,7 +70,13 @@ mod tests {
             ..Default::default()
         };
         let (tx, rx) = watch::channel(telemetry);
-        (tx, BoardRegistration { telemetry_rx: rx })
+        (
+            tx,
+            BoardRegistration {
+                telemetry_rx: rx,
+                command_tx: None,
+            },
+        )
     }
 
     #[test]

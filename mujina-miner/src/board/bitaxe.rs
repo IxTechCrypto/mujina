@@ -9,7 +9,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, ReadBuf},
-    sync::{Mutex, watch},
+    sync::{Mutex, mpsc, watch},
     time::{self, Instant, MissedTickBehavior},
 };
 use tokio_serial::SerialPortBuilderExt;
@@ -20,6 +20,7 @@ use tokio_util::{
 };
 
 use crate::{
+    api::{BoardCommand, FanControlUpdate},
     api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
     asic::{
         ChipInfo,
@@ -235,13 +236,18 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         board_name,
         board_model: "Bitaxe Gamma",
         board_serial: serial,
+        fan_control: FanControl::default(),
         over_temp_count: 0,
         sensor_fault_count: 0,
         asic_enable: asic_enable_monitor,
     };
 
+    // Runtime command channel (fan control, etc.). Small buffer: commands
+    // are rare, human-driven API calls.
+    let (command_tx, command_rx) = mpsc::channel::<BoardCommand>(8);
+
     let cancel = CancellationToken::new();
-    let monitor_handle = tokio::spawn(bitaxe.run_monitor(telemetry_tx, cancel.clone()));
+    let monitor_handle = tokio::spawn(bitaxe.run_monitor(telemetry_tx, command_rx, cancel.clone()));
 
     let shutdown = Box::pin(async move {
         cancel.cancel();
@@ -252,8 +258,83 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         info,
         threads,
         telemetry_rx,
+        command_tx: Some(command_tx),
         shutdown: Some(shutdown),
     })
+}
+
+/// Default automatic-mode target ASIC die temperature, in Celsius.
+const DEFAULT_FAN_TARGET_C: f32 = 60.0;
+/// Default automatic-mode minimum fan duty cycle, in percent.
+const DEFAULT_FAN_MIN_PERCENT: u8 = 25;
+/// Temperature span above the target over which the automatic curve
+/// ramps the fan from `min_percent` up to 100%.
+const FAN_RAMP_SPAN_C: f32 = 15.0;
+
+/// Fan control policy for a board.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FanControl {
+    /// Hold the ASIC die temperature near `target_c`, driving the fan
+    /// between `min_percent` and 100% as temperature rises.
+    Auto { target_c: f32, min_percent: u8 },
+    /// Fixed duty cycle set by the operator; no temperature feedback.
+    Manual { percent: u8 },
+}
+
+impl Default for FanControl {
+    fn default() -> Self {
+        FanControl::Auto {
+            target_c: DEFAULT_FAN_TARGET_C,
+            min_percent: DEFAULT_FAN_MIN_PERCENT,
+        }
+    }
+}
+
+impl FanControl {
+    /// Apply a partial update from the API, carrying forward any value the
+    /// caller left unset from the current policy (or the defaults when
+    /// switching into a mode that has no prior value to inherit).
+    fn with_update(self, update: FanControlUpdate) -> Self {
+        // Current auto parameters, falling back to defaults if we are
+        // switching over from manual mode.
+        let (cur_target, cur_min) = match self {
+            FanControl::Auto {
+                target_c,
+                min_percent,
+            } => (target_c, min_percent),
+            FanControl::Manual { .. } => (DEFAULT_FAN_TARGET_C, DEFAULT_FAN_MIN_PERCENT),
+        };
+        if update.auto {
+            FanControl::Auto {
+                target_c: update.target_c.unwrap_or(cur_target),
+                min_percent: update.min_percent.unwrap_or(cur_min),
+            }
+        } else {
+            let cur_manual = match self {
+                FanControl::Manual { percent } => percent,
+                // No prior manual value: fall back to full speed, the safe
+                // default, rather than something arbitrary.
+                FanControl::Auto { .. } => 100,
+            };
+            FanControl::Manual {
+                percent: update.percent.unwrap_or(cur_manual),
+            }
+        }
+    }
+}
+
+/// Automatic fan curve: hold `min_percent` at or below `target_c`, then
+/// ramp linearly to 100% by `target_c + FAN_RAMP_SPAN_C`. This is a
+/// deliberately simple, easy-to-reason-about clamped-proportional curve;
+/// a PID loop can replace it later without changing the call site.
+fn auto_fan_duty(temp_c: f32, target_c: f32, min_percent: u8) -> u8 {
+    let min_percent = min_percent.min(100);
+    if temp_c <= target_c {
+        return min_percent;
+    }
+    let frac = ((temp_c - target_c) / FAN_RAMP_SPAN_C).clamp(0.0, 1.0);
+    let span = (100 - min_percent) as f32;
+    (min_percent as f32 + frac * span).round() as u8
 }
 
 /// Internal state owned by the board monitor task.
@@ -266,6 +347,8 @@ struct Bitaxe {
     board_name: String,
     board_model: &'static str,
     board_serial: Option<String>,
+    /// Fan control policy applied each monitor cycle.
+    fan_control: FanControl,
     /// Consecutive readings at or above the emergency temperature.
     /// Triggers a fast thermal shutdown.
     over_temp_count: u32,
@@ -281,6 +364,7 @@ impl Bitaxe {
     async fn run_monitor(
         mut self,
         telemetry_tx: watch::Sender<BoardTelemetry>,
+        mut command_rx: mpsc::Receiver<BoardCommand>,
         cancel: CancellationToken,
     ) {
         let mut tick = time::interval(Duration::from_secs(2));
@@ -296,6 +380,9 @@ impl Bitaxe {
                         return;
                     }
                 }
+                Some(cmd) = command_rx.recv() => {
+                    self.handle_command(cmd);
+                }
                 _ = cancel.cancelled() => {
                     self.shutdown().await;
                     if let Err(e) = self.emc2101.set_fan_speed(Percent::new_clamped(25)).await {
@@ -303,6 +390,19 @@ impl Bitaxe {
                     }
                     return;
                 }
+            }
+        }
+    }
+
+    /// Apply a runtime command. The new policy takes effect on the next
+    /// monitor tick (within the ~2s cadence), which owns actually driving
+    /// the fan hardware.
+    fn handle_command(&mut self, cmd: BoardCommand) {
+        match cmd {
+            BoardCommand::SetFanControl { update, reply } => {
+                self.fan_control = self.fan_control.with_update(update);
+                info!(policy = ?self.fan_control, "Fan control updated");
+                let _ = reply.send(Ok(()));
             }
         }
     }
@@ -445,6 +545,27 @@ impl Bitaxe {
             );
         }
 
+        // Apply the fan control policy. In manual mode the operator's
+        // duty cycle is held. In automatic mode the curve reacts to the
+        // ASIC die temperature; when the temperature is unreadable we
+        // leave the fan where it is rather than guess (the emergency and
+        // sensor-fault paths above own the sustained-failure cases).
+        let commanded_percent = match self.fan_control {
+            FanControl::Manual { percent } => Some(percent),
+            FanControl::Auto {
+                target_c,
+                min_percent,
+            } => asic_temp.map(|t| auto_fan_duty(t, target_c, min_percent)),
+        };
+        if let Some(percent) = commanded_percent
+            && let Err(e) = self
+                .emc2101
+                .set_fan_speed(Percent::new_clamped(percent))
+                .await
+        {
+            warn!("Failed to set fan speed: {}", e);
+        }
+
         // Publish telemetry
         let _ = tx.send(BoardTelemetry {
             name: self.board_name.clone(),
@@ -455,7 +576,16 @@ impl Bitaxe {
                 name: "fan".into(),
                 rpm: fan_rpm,
                 percent: fan_percent,
-                target_percent: None,
+                target_percent: commanded_percent,
+                auto: Some(matches!(self.fan_control, FanControl::Auto { .. })),
+                target_c: match self.fan_control {
+                    FanControl::Auto { target_c, .. } => Some(target_c),
+                    FanControl::Manual { .. } => None,
+                },
+                min_percent: match self.fan_control {
+                    FanControl::Auto { min_percent, .. } => Some(min_percent),
+                    FanControl::Manual { .. } => None,
+                },
             }],
             temperatures: vec![
                 TemperatureSensor {
@@ -493,6 +623,7 @@ impl Bitaxe {
                 serial = ?self.board_serial,
                 asic_temp_c = ?asic_temp,
                 fan_percent = ?fan_percent,
+                fan_target_percent = ?commanded_percent,
                 fan_rpm = ?fan_rpm,
                 vr_temp_c = ?vr_temp,
                 power_w = ?power_mw.map(|mw| mw as f32 / 1000.0),
@@ -742,5 +873,99 @@ impl<R: AsyncRead + Unpin> AsyncRead for TracingReader<R> {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_FAN_MIN_PERCENT, DEFAULT_FAN_TARGET_C, FAN_RAMP_SPAN_C, FanControl, auto_fan_duty,
+    };
+    use crate::api::FanControlUpdate;
+
+    #[test]
+    fn holds_minimum_at_or_below_target() {
+        let min = DEFAULT_FAN_MIN_PERCENT;
+        let target = DEFAULT_FAN_TARGET_C;
+        assert_eq!(auto_fan_duty(target - 10.0, target, min), min);
+        assert_eq!(auto_fan_duty(target, target, min), min);
+    }
+
+    #[test]
+    fn reaches_full_at_top_of_ramp() {
+        let min = DEFAULT_FAN_MIN_PERCENT;
+        let target = DEFAULT_FAN_TARGET_C;
+        assert_eq!(auto_fan_duty(target + FAN_RAMP_SPAN_C, target, min), 100);
+        // Beyond the ramp span the fan stays clamped at 100%.
+        assert_eq!(auto_fan_duty(target + 50.0, target, min), 100);
+    }
+
+    #[test]
+    fn ramps_linearly_between_target_and_full() {
+        let min = 25;
+        let target = 60.0;
+        // Halfway up the 15 C span: 25% + 0.5 * (100 - 25) = 62.5 -> 63.
+        assert_eq!(
+            auto_fan_duty(target + FAN_RAMP_SPAN_C / 2.0, target, min),
+            63
+        );
+    }
+
+    #[test]
+    fn clamps_minimum_above_one_hundred() {
+        // A nonsensical minimum never drives the fan past 100%.
+        assert_eq!(auto_fan_duty(200.0, 60.0, 250), 100);
+    }
+
+    #[test]
+    fn update_changes_only_specified_auto_fields() {
+        let start = FanControl::Auto {
+            target_c: 60.0,
+            min_percent: 25,
+        };
+        // Change only the target; minimum is carried forward.
+        let updated = start.with_update(FanControlUpdate {
+            auto: true,
+            target_c: Some(55.0),
+            min_percent: None,
+            percent: None,
+        });
+        assert_eq!(
+            updated,
+            FanControl::Auto {
+                target_c: 55.0,
+                min_percent: 25
+            }
+        );
+    }
+
+    #[test]
+    fn update_switches_auto_to_manual() {
+        let start = FanControl::default();
+        let updated = start.with_update(FanControlUpdate {
+            auto: false,
+            target_c: None,
+            min_percent: None,
+            percent: Some(70),
+        });
+        assert_eq!(updated, FanControl::Manual { percent: 70 });
+    }
+
+    #[test]
+    fn update_switching_to_auto_from_manual_uses_defaults() {
+        let start = FanControl::Manual { percent: 80 };
+        let updated = start.with_update(FanControlUpdate {
+            auto: true,
+            target_c: None,
+            min_percent: None,
+            percent: None,
+        });
+        assert_eq!(
+            updated,
+            FanControl::Auto {
+                target_c: DEFAULT_FAN_TARGET_C,
+                min_percent: DEFAULT_FAN_MIN_PERCENT
+            }
+        );
     }
 }

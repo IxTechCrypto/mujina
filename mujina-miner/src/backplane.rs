@@ -139,10 +139,14 @@ impl Backplane {
             info,
             threads,
             telemetry_rx,
+            command_tx,
             shutdown,
         } = conn;
 
-        let registration = BoardRegistration { telemetry_rx };
+        let registration = BoardRegistration {
+            telemetry_rx,
+            command_tx,
+        };
         if let Err(e) = self.board_reg_tx.send(registration).await {
             error!(
                 board = %info.model,

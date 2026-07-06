@@ -13,10 +13,10 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use super::commands::SchedulerCommand;
+use super::commands::{BoardCommand, FanControlUpdate, SchedulerCommand};
 use super::server::SharedState;
 use crate::api_client::types::{
-    BoardTelemetry, MinerPatchRequest, MinerTelemetry, SourceTelemetry,
+    BoardTelemetry, FanControlRequest, MinerPatchRequest, MinerTelemetry, SourceTelemetry,
 };
 
 /// Build the v0 API routes with OpenAPI metadata.
@@ -26,6 +26,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_miner, patch_miner))
         .routes(routes!(get_boards))
         .routes(routes!(get_board))
+        .routes(routes!(patch_board_fan))
         .routes(routes!(get_sources))
         .routes(routes!(get_source))
 }
@@ -128,6 +129,63 @@ async fn get_board(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> Result<Json<BoardTelemetry>, StatusCode> {
+    state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .boards()
+        .into_iter()
+        .find(|b| b.name == name)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Update a board's fan control policy.
+#[utoipa::path(
+    patch,
+    path = "/boards/{name}/fan",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    request_body = FanControlRequest,
+    responses(
+        (status = OK, description = "Updated board details", body = BoardTelemetry),
+        (status = NOT_FOUND, description = "Board not found or accepts no commands"),
+        (status = INTERNAL_SERVER_ERROR, description = "Command channel error"),
+    ),
+)]
+async fn patch_board_fan(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<FanControlRequest>,
+) -> Result<Json<BoardTelemetry>, StatusCode> {
+    let sender = state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .command_sender(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let (tx, rx) = oneshot::channel();
+    let cmd = BoardCommand::SetFanControl {
+        update: FanControlUpdate {
+            auto: req.auto,
+            target_c: req.target_c,
+            min_percent: req.min_percent,
+            percent: req.percent,
+        },
+        reply: tx,
+    };
+    sender
+        .send(cmd)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Result layers: timeout / channel-closed / command-error.
+    let Ok(Ok(Ok(()))) = tokio::time::timeout(Duration::from_secs(5), rx).await else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+
     state
         .board_registry
         .lock()
