@@ -305,6 +305,16 @@ impl Default for AutoTuner {
 
 impl AutoTuner {
     /// Enable tuning with a profile, resetting the search.
+    ///
+    /// Deliberately does NOT reset `fan_forced_full`: that flag tracks
+    /// whether the *board* is currently sitting in a forced-100% fan
+    /// override, not the tuning search, and switching profiles (or
+    /// disabling/re-enabling) does not touch the board's actual fan state.
+    /// Clearing it here previously left the flag reporting "not forced"
+    /// while the fan was still physically pinned at 100% from the prior
+    /// profile's breach, so `evaluate` could never issue the
+    /// `RestoreFanAuto` that would have handed it back — the fan stayed
+    /// stuck at 100% until a fresh breach happened to re-arm the flag.
     pub fn enable(&mut self, profile: TuneProfile) {
         self.enabled = true;
         self.profile = profile;
@@ -317,16 +327,16 @@ impl AutoTuner {
         self.pending_reject_mhz = None;
         self.probe_floor_mv = 0;
         self.last_commanded_voltage_mv = None;
-        self.fan_forced_full = false;
         self.log.clear();
     }
 
-    /// Disable tuning. The board keeps whatever setpoint it is at.
+    /// Disable tuning. The board keeps whatever setpoint it is at,
+    /// including the fan — see [`Self::enable`] for why `fan_forced_full`
+    /// is not reset here either.
     pub fn disable(&mut self) {
         self.enabled = false;
         self.phase = TunePhase::Disabled;
         self.last_commanded_voltage_mv = None;
-        self.fan_forced_full = false;
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -1008,6 +1018,37 @@ mod tests {
         // resuming normal tuning.
         assert_eq!(
             t.evaluate(&m(60.0, 15.0, 1.0, 550.0, 1150)),
+            Some(TuneAction::RestoreFanAuto)
+        );
+        assert!(!t.fan_forced_full);
+    }
+
+    #[test]
+    fn profile_switch_does_not_strand_a_forced_full_fan() {
+        // Regression test: switching profiles while the fan is forced to
+        // 100% from a prior breach must not lose track of that override.
+        // Losing it meant the fan stayed physically pinned at 100% forever
+        // (or until a fresh breach happened to re-arm the flag), even once
+        // temperature was comfortably under the new profile's cap.
+        let mut t = AutoTuner::default();
+        t.enable(TuneProfile::Balanced); // temp cap 62
+        assert_eq!(
+            t.evaluate(&m(70.0, 14.0, 1.3, 525.0, 1150)),
+            Some(TuneAction::SetFanFull)
+        );
+        assert!(t.fan_forced_full);
+
+        // Operator switches profile while the fan is still forced full.
+        t.enable(TuneProfile::Efficient); // temp cap 60
+        assert!(
+            t.fan_forced_full,
+            "switching profiles must not forget the board's fan is still forced full"
+        );
+
+        // Comfortably under Efficient's release threshold (60 - 2 = 58): the
+        // tuner must still be able to hand the fan back to the auto curve.
+        assert_eq!(
+            t.evaluate(&m(55.0, 10.0, 1.0, 400.0, 1100)),
             Some(TuneAction::RestoreFanAuto)
         );
         assert!(!t.fan_forced_full);
