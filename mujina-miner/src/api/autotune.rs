@@ -211,10 +211,12 @@ impl TuneMode {
     fn caps(self) -> Caps {
         match self {
             TuneMode::Profile(profile) => profile.caps(),
-            // No per-chip thermal max is known here, so reuse Balanced's
-            // conservative default rather than inventing one.
+            // No per-chip thermal max is known here, so reuse MaxHash's
+            // ceiling rather than inventing one: target mode shouldn't be
+            // more thermally restrictive than the existing highest-cap
+            // profile already validated on this hardware.
             TuneMode::Target(TuneTarget::Power(watts)) => Caps {
-                temp_c: 62.0,
+                temp_c: 68.0,
                 // Small headroom above the target so the breach branch
                 // doesn't fight the convergence branch right at setpoint.
                 power_w: watts * 1.05,
@@ -222,7 +224,7 @@ impl TuneMode {
                 seek_efficiency: false,
             },
             TuneMode::Target(TuneTarget::Hashrate(_)) => Caps {
-                temp_c: 62.0,
+                temp_c: 68.0,
                 // The target's power draw isn't known in advance; reuse
                 // MaxHash's ceiling as the outer safety bound.
                 power_w: 22.0,
@@ -994,9 +996,12 @@ pub async fn run(
 
     // Track what we last persisted so a lock only writes once.
     let mut saved_best: Option<TuneSetpoint> = None;
-    // Last enabled state we persisted, so an enable/disable is written through
-    // and a reboot resumes only what the user left running.
-    let mut last_enabled: Option<bool> = None;
+    // Last (enabled, mode) we persisted, so an enable/disable transition OR
+    // a mode switch (profile<->target, or a new target value) while staying
+    // enabled is written through -- a reboot must resume the mode the user
+    // actually left running, not just whatever was active the last time
+    // `enabled` itself flipped.
+    let mut last_persisted: Option<(bool, TuneMode)> = None;
     // Serials we have already considered for boot-time resume, so it happens
     // at most once per board per run.
     let mut resumed: HashSet<String> = Default::default();
@@ -1105,16 +1110,18 @@ pub async fn run(
             info!(board = %name, ?best, "Auto-tune converged; profile saved");
         }
 
-        // Persist enable/disable transitions so a reboot resumes only what the
-        // user left running (a board turned back to manual is not retuned).
+        // Persist enable/disable transitions AND mode switches (profile<->
+        // target, or a new target value/profile while staying enabled) so a
+        // reboot resumes the mode the user actually left running rather than
+        // whatever was active the last time `enabled` itself flipped.
         let (enabled_now, mode_now, best_now) = {
             let t = tuner.lock().unwrap_or_else(|e| e.into_inner());
             (t.enabled, t.mode, t.best.map(|(setpoint, ..)| setpoint))
         };
         if let Some(serial) = serial.as_ref()
-            && last_enabled != Some(enabled_now)
+            && last_persisted != Some((enabled_now, mode_now))
         {
-            last_enabled = Some(enabled_now);
+            last_persisted = Some((enabled_now, mode_now));
             let setpoint = best_now.unwrap_or(TuneSetpoint {
                 frequency_mhz: metrics.frequency_mhz,
                 core_voltage_mv: metrics.core_voltage_mv,
