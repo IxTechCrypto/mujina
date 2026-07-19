@@ -222,6 +222,8 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         name: board_name.clone(),
         model: "Bitaxe Gamma".into(),
         serial: serial.clone(),
+        chip_model: Some("BM1370".into()),
+        chip_count: Some(chip_infos.len() as u32),
         frequency_mhz: Some(bm13xx::thread::TARGET_FREQUENCY_MHZ),
         ..Default::default()
     };
@@ -241,6 +243,8 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         board_name,
         board_model: "Bitaxe Gamma",
         board_serial: serial,
+        chip_model: "BM1370",
+        chip_count: chip_infos.len() as u32,
         fan_control: FanControl::default(),
         fan_temp_ema: None,
         fan_integral: 0.0,
@@ -273,10 +277,12 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 }
 
 /// Lowest core voltage accepted from a runtime tuning request, in mV.
-const MIN_CORE_VOLTAGE_MV: u16 = 1000;
+/// Aliases the BM1370 entry in [`bm13xx::chip_profile`], the single
+/// source of truth for chip envelopes.
+const MIN_CORE_VOLTAGE_MV: u16 = bm13xx::chip_profile::BM1370.min_voltage_mv;
 /// Highest core voltage accepted from a runtime tuning request, in mV.
 /// The BM1370 should not run above ~1300 mV sustained.
-const MAX_CORE_VOLTAGE_MV: u16 = 1300;
+const MAX_CORE_VOLTAGE_MV: u16 = bm13xx::chip_profile::BM1370.max_voltage_mv;
 
 /// Default automatic-mode target ASIC die temperature, in Celsius.
 const DEFAULT_FAN_TARGET_C: f32 = 60.0;
@@ -420,6 +426,11 @@ struct Bitaxe {
     board_name: String,
     board_model: &'static str,
     board_serial: Option<String>,
+    /// ASIC chip model, for `chip_profile` lookups (tuning bounds, target
+    /// mode UI ranges). Bitaxe boards are single-chain BM1370.
+    chip_model: &'static str,
+    /// Number of ASIC chips discovered on this board's chain.
+    chip_count: u32,
     /// Fan control policy applied each monitor cycle.
     fan_control: FanControl,
     /// EMA-filtered ASIC die temperature fed to the fan PI controller.
@@ -702,6 +713,8 @@ impl Bitaxe {
             name: self.board_name.clone(),
             model: self.board_model.into(),
             serial: self.board_serial.clone(),
+            chip_model: Some(self.chip_model.into()),
+            chip_count: Some(self.chip_count),
             frequency_mhz: Some(self.current_freq_mhz),
             fans: vec![Fan {
                 name: "fan".into(),
@@ -846,7 +859,7 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
 
     time::sleep(Duration::from_millis(100)).await;
 
-    const DEFAULT_VOUT: f32 = 1.15;
+    const DEFAULT_VOUT: f32 = bm13xx::chip_profile::BM1370.default_voltage_mv as f32 / 1000.0;
     tps546
         .set_vout(DEFAULT_VOUT)
         .await

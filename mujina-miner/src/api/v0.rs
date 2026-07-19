@@ -13,7 +13,8 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use super::autotune::{AutoTuneStatus, TuneProfile, TuneSetpoint};
+use super::autotune::{self, AutoTuneStatus, TargetRange, TuneProfile, TuneSetpoint};
+use crate::asic::bm13xx::chip_profile;
 use super::commands::{BoardCommand, FanControlUpdate, SchedulerCommand};
 use super::server::SharedState;
 use crate::api_client::types::{
@@ -323,6 +324,21 @@ fn parse_profile(s: Option<&str>) -> TuneProfile {
     }
 }
 
+/// The board's hashrate-target slider bounds, from its reported chip
+/// model and count. `None` if the board isn't found or its chip model
+/// isn't recognized.
+fn board_hashrate_target_range(state: &SharedState, name: &str) -> Option<TargetRange> {
+    let board = state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .boards()
+        .into_iter()
+        .find(|b| b.name == name)?;
+    let chip = chip_profile::profile_for(board.chip_model.as_deref()?)?;
+    Some(autotune::hashrate_target_range(chip, board.chip_count?))
+}
+
 /// Get a board's auto-tuning status and recent activity log.
 #[utoipa::path(
     get,
@@ -336,15 +352,17 @@ async fn get_board_autotune(
     Path(name): Path<String>,
 ) -> Json<AutoTuneStatus> {
     let setpoint = board_setpoint(&state, &name);
+    let range = board_hashrate_target_range(&state, &name);
     let status = state
         .autotuner
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .status(setpoint);
+        .status(setpoint, range);
     Json(status)
 }
 
-/// Enable or disable auto-tuning for a board and choose its profile.
+/// Enable or disable auto-tuning for a board, choosing either a cap-based
+/// profile or a power/hashrate setpoint to converge to.
 #[utoipa::path(
     patch,
     path = "/boards/{name}/autotune",
@@ -359,10 +377,15 @@ async fn patch_board_autotune(
     Json(req): Json<AutoTuneRequest>,
 ) -> Json<AutoTuneStatus> {
     let setpoint = board_setpoint(&state, &name);
+    let range = board_hashrate_target_range(&state, &name);
     {
         let mut tuner = state.autotuner.lock().unwrap_or_else(|e| e.into_inner());
         if req.enabled {
-            tuner.enable(parse_profile(req.profile.as_deref()));
+            if let Some(target) = req.target {
+                tuner.enable_target(target);
+            } else {
+                tuner.enable_profile(parse_profile(req.profile.as_deref()));
+            }
         } else {
             tuner.disable();
         }
@@ -371,7 +394,7 @@ async fn patch_board_autotune(
         .autotuner
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .status(setpoint);
+        .status(setpoint, range);
     Json(status)
 }
 

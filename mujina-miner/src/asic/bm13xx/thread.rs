@@ -17,6 +17,7 @@ use futures::{SinkExt, sink::Sink, stream::Stream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::StreamExt;
 
+use super::chip_profile;
 use super::protocol::{self, Log2Difficulty, TicketMask};
 use crate::{
     asic::hash_thread::{
@@ -29,15 +30,22 @@ use crate::{
 
 /// Target hash clock the chip is ramped to during initialization, in MHz.
 /// Boards report this as their operating frequency in telemetry.
-pub const TARGET_FREQUENCY_MHZ: f32 = 525.0;
+///
+/// This module is shared across the BM13xx family (BM1362, BM1366,
+/// BM1370), but these three constants are only used by the BM1370-based
+/// Bitaxe boards today, so they alias the BM1370 entry in
+/// [`chip_profile`] -- the single source of truth for chip envelopes.
+/// A board carrying a different chip should look up its own model via
+/// `chip_profile::profile_for` instead of these constants.
+pub const TARGET_FREQUENCY_MHZ: f32 = chip_profile::BM1370.default_freq_mhz;
 
 /// Lowest hash clock accepted from a runtime tuning request, in MHz.
 /// Below this the chip does not usefully hash.
-pub const MIN_FREQUENCY_MHZ: f32 = 400.0;
+pub const MIN_FREQUENCY_MHZ: f32 = chip_profile::BM1370.min_freq_mhz;
 /// Highest hash clock accepted from a runtime tuning request, in MHz.
 /// A conservative BM1370 ceiling; exceptional chips go higher but that is
 /// not safe as an unattended default.
-pub const MAX_FREQUENCY_MHZ: f32 = 650.0;
+pub const MAX_FREQUENCY_MHZ: f32 = chip_profile::BM1370.max_freq_mhz;
 
 /// Tracks tasks sent to chip hardware, indexed by chip_job_id.
 ///

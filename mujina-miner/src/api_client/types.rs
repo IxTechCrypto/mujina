@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::api::autotune::TuneTarget;
 use crate::types::Temperature;
 
 /// Full miner telemetry snapshot.
@@ -29,6 +30,14 @@ pub struct BoardTelemetry {
     pub name: String,
     pub model: String,
     pub serial: Option<String>,
+    /// ASIC chip model on this board (e.g. "BM1370"), or null if unknown.
+    /// Looked up against `bm13xx::chip_profile` to get the safe tuning
+    /// envelope and hashrate-target UI bounds for this board's silicon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chip_model: Option<String>,
+    /// Number of ASIC chips on this board.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chip_count: Option<u32>,
     /// ASIC hash clock in MHz, or null if the board does not report one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_mhz: Option<f32>,
@@ -141,9 +150,14 @@ pub struct AutoTuneRequest {
     /// Turn the auto-tuner on or off.
     pub enabled: bool,
     /// Profile to tune toward: `quiet`, `efficient`, `balanced`, or
-    /// `max_hash`. Ignored when disabling; defaults to `balanced`.
+    /// `max_hash`. Ignored when disabling, or when `target` is set;
+    /// defaults to `balanced`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// A power/hashrate setpoint to converge to and hold, instead of a
+    /// cap-based profile. When set, takes priority over `profile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<TuneTarget>,
 }
 
 /// Job source telemetry.

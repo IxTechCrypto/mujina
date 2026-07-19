@@ -53,16 +53,21 @@ use utoipa::ToSchema;
 use super::commands::{BoardCommand, FanControlUpdate};
 use super::registry::BoardRegistry;
 use crate::api_client::types::MinerTelemetry;
+use crate::asic::bm13xx::chip_profile;
 use crate::tracing::prelude::*;
 
-// --- tuning envelope (shared with the manual clamps in board/bitaxe.rs
-// and asic/bm13xx/thread.rs; kept conservative on purpose) ---
-const MIN_FREQ_MHZ: f32 = 400.0;
-const MAX_FREQ_MHZ: f32 = 650.0;
-const MIN_VOLT_MV: u16 = 1000;
-/// Ceiling the tuner will raise voltage to on its own. Below the 1300 mV
-/// hard clamp: the tuner should never sit near the sustained-damage line.
-const AUTO_VOLT_CEIL_MV: u16 = 1250;
+// --- tuning envelope: aliases the BM1370 entry in `chip_profile`, the
+// single source of truth also used by the manual clamps in board/bitaxe.rs
+// and asic/bm13xx/thread.rs. Serves as the profile-mode safety-breach floor
+// (all profiles, regardless of which chip is attached) and as the
+// fallback bound in `evaluate_target` when a board's chip model isn't
+// recognized. ---
+const MIN_FREQ_MHZ: f32 = chip_profile::BM1370.min_freq_mhz;
+const MAX_FREQ_MHZ: f32 = chip_profile::BM1370.max_freq_mhz;
+const MIN_VOLT_MV: u16 = chip_profile::BM1370.min_voltage_mv;
+/// Ceiling the tuner will raise voltage to on its own. Below the hard
+/// clamp: the tuner should never sit near the sustained-damage line.
+const AUTO_VOLT_CEIL_MV: u16 = chip_profile::BM1370.auto_voltage_ceiling_mv;
 
 const FREQ_STEP_MHZ: f32 = 25.0;
 const VOLT_STEP_MV: u16 = 10;
@@ -100,6 +105,15 @@ const VOLT_TOLERANCE_MV: u16 = 5;
 /// fan episode is released. A hysteresis band so a die hovering at the cap
 /// (its natural attractor) does not flap the fan every cycle.
 const FAN_RELEASE_HYSTERESIS_C: f32 = 2.0;
+/// Target mode: fraction of the target value the live measurement must be
+/// within to count as "reached" and lock. A live power/hashrate reading
+/// jitters cycle to cycle, so an exact match would never latch.
+const TARGET_TOLERANCE_FRACTION: f32 = 0.02;
+/// Target mode: consecutive settled cycles pinned at a frequency limit
+/// (with the setpoint still unreached) before the target is declared
+/// unreachable. Matches the two-strikes pattern `pending_reject_mhz` uses
+/// elsewhere so a single noisy window doesn't trip it prematurely.
+const UNREACHABLE_STRIKES: u32 = 2;
 
 /// Most recent tuner events kept for the activity log.
 const LOG_CAPACITY: usize = 40;
@@ -160,6 +174,65 @@ impl TuneProfile {
     }
 }
 
+/// A Braiins-OS-style setpoint the tuner converges to and holds, rather
+/// than the profiles' "climb as far as the caps allow" search. Kept as a
+/// separate type from [`TuneProfile`] (not a variant of it) so the
+/// existing profile enum keeps deriving `Eq` and its persisted-file
+/// format is untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize, ToSchema)]
+#[serde(tag = "axis", content = "value", rename_all = "snake_case")]
+pub enum TuneTarget {
+    /// Target board power draw, in watts.
+    Power(f32),
+    /// Target aggregate hashrate, in TH/s.
+    Hashrate(f32),
+}
+
+/// What the tuner is currently driving toward: a cap-based profile, or a
+/// specific power/hashrate setpoint.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TuneMode {
+    Profile(TuneProfile),
+    Target(TuneTarget),
+}
+
+impl Default for TuneMode {
+    fn default() -> Self {
+        TuneMode::Profile(TuneProfile::default())
+    }
+}
+
+impl TuneMode {
+    /// Safety caps for this mode. For a profile these are the profile's
+    /// own caps (unchanged behavior). For a target these are synthesized
+    /// guardrails -- never the setpoint itself, which is handled by the
+    /// convergence logic in `evaluate_target`, not by treating the target
+    /// as a ceiling to climb toward.
+    fn caps(self) -> Caps {
+        match self {
+            TuneMode::Profile(profile) => profile.caps(),
+            // No per-chip thermal max is known here, so reuse Balanced's
+            // conservative default rather than inventing one.
+            TuneMode::Target(TuneTarget::Power(watts)) => Caps {
+                temp_c: 62.0,
+                // Small headroom above the target so the breach branch
+                // doesn't fight the convergence branch right at setpoint.
+                power_w: watts * 1.05,
+                seek_hash: false,
+                seek_efficiency: false,
+            },
+            TuneMode::Target(TuneTarget::Hashrate(_)) => Caps {
+                temp_c: 62.0,
+                // The target's power draw isn't known in advance; reuse
+                // MaxHash's ceiling as the outer safety bound.
+                power_w: 22.0,
+                seek_hash: false,
+                seek_efficiency: false,
+            },
+        }
+    }
+}
+
 /// A frequency/voltage operating point.
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize, ToSchema)]
 pub struct TuneSetpoint {
@@ -205,6 +278,12 @@ pub enum TunePhase {
     BackedOff,
     /// Converged; holding the best known-good point.
     Locked,
+    /// Target mode: stepping the clock toward the setpoint.
+    Converging,
+    /// Target mode: pinned at the chip's frequency limit and still not at
+    /// the setpoint. Holding rather than continuing to step -- the target
+    /// is not achievable on this hardware.
+    Unreachable,
 }
 
 /// One activity-log entry, surfaced in the dashboard.
@@ -221,13 +300,48 @@ pub struct TuneEvent {
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct AutoTuneStatus {
     pub enabled: bool,
-    pub profile: TuneProfile,
+    /// Set when `mode` is a cap-based profile; `None` in target mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<TuneProfile>,
+    /// Set when `mode` is a power/hashrate setpoint; `None` in profile mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<TuneTarget>,
+    /// The board's hashrate-target slider bounds (min/max/default/step, in
+    /// TH/s), computed from this board's chip model and count. `None` when
+    /// the board hasn't reported a recognized chip model yet. Populated
+    /// regardless of current mode so a client can render the control
+    /// before the user picks a target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hashrate_target_range: Option<TargetRange>,
     pub phase: TunePhase,
     pub frequency_mhz: Option<f32>,
     pub core_voltage_mv: Option<u16>,
     pub efficiency_j_th: Option<f32>,
     pub best: Option<TuneSetpoint>,
     pub log: Vec<TuneEvent>,
+}
+
+/// Slider bounds for a target-mode axis.
+#[derive(Clone, Copy, Debug, Serialize, ToSchema)]
+pub struct TargetRange {
+    pub min: f32,
+    pub max: f32,
+    pub default: f32,
+    pub step: f32,
+}
+
+/// Compute the hashrate-target slider bounds for a board carrying
+/// `chip_count` copies of `chip`. Only ever used for display/input-range
+/// purposes -- never as ground truth for tuning decisions, which always
+/// judge against live measured hashrate (see [`AutoTuner::evaluate_target`]).
+pub fn hashrate_target_range(chip: chip_profile::ChipProfile, chip_count: u32) -> TargetRange {
+    let scale = chip.nominal_gh_per_mhz * chip_count as f32 / 1000.0; // GH/s/MHz -> TH/s/MHz
+    TargetRange {
+        min: chip.min_freq_mhz * scale,
+        max: chip.max_freq_mhz * scale,
+        default: chip.default_freq_mhz * scale,
+        step: 1.0,
+    }
 }
 
 /// Efficiency in joules per terahash, or `None` when not hashing.
@@ -241,7 +355,11 @@ fn efficiency_j_th(power_w: f32, hashrate_ths: f32) -> Option<f32> {
 /// and `profile`) and the supervisor task (which calls [`Self::evaluate`]).
 pub struct AutoTuner {
     enabled: bool,
-    profile: TuneProfile,
+    mode: TuneMode,
+    /// Chip envelope for the board this tuner is driving, looked up from
+    /// telemetry each cycle by the supervisor. `None` clamps to the
+    /// conservative global `MIN/MAX_FREQ_MHZ` fallback.
+    chip: Option<chip_profile::ChipProfile>,
     phase: TunePhase,
     /// Cycles since the last applied change (settle gate).
     cycles_since_change: u32,
@@ -281,6 +399,11 @@ pub struct AutoTuner {
     /// cap.
     fan_forced_full: bool,
     last_efficiency: Option<f32>,
+    /// Target mode: consecutive settled cycles pinned at the chip's
+    /// frequency limit with the setpoint still unreached. Two consecutive
+    /// (mirroring `pending_reject_mhz`'s noise tolerance elsewhere in this
+    /// file) trips `TunePhase::Unreachable` rather than stepping forever.
+    stuck_at_limit_cycles: u32,
     log: VecDeque<TuneEvent>,
 }
 
@@ -288,7 +411,8 @@ impl Default for AutoTuner {
     fn default() -> Self {
         Self {
             enabled: false,
-            profile: TuneProfile::default(),
+            mode: TuneMode::default(),
+            chip: None,
             phase: TunePhase::Disabled,
             cycles_since_change: 0,
             best: None,
@@ -298,41 +422,63 @@ impl Default for AutoTuner {
             last_commanded_voltage_mv: None,
             fan_forced_full: false,
             last_efficiency: None,
+            stuck_at_limit_cycles: 0,
             log: VecDeque::with_capacity(LOG_CAPACITY),
         }
     }
 }
 
 impl AutoTuner {
-    /// Enable tuning with a profile, resetting the search.
+    /// Shared state reset for entering a fresh search, regardless of mode.
     ///
     /// Deliberately does NOT reset `fan_forced_full`: that flag tracks
     /// whether the *board* is currently sitting in a forced-100% fan
-    /// override, not the tuning search, and switching profiles (or
+    /// override, not the tuning search, and switching modes (or
     /// disabling/re-enabling) does not touch the board's actual fan state.
     /// Clearing it here previously left the flag reporting "not forced"
     /// while the fan was still physically pinned at 100% from the prior
     /// profile's breach, so `evaluate` could never issue the
     /// `RestoreFanAuto` that would have handed it back — the fan stayed
     /// stuck at 100% until a fresh breach happened to re-arm the flag.
-    pub fn enable(&mut self, profile: TuneProfile) {
+    fn reset_search(&mut self) {
         self.enabled = true;
-        self.profile = profile;
         self.phase = TunePhase::Warmup;
         self.cycles_since_change = 0;
-        // Fresh search: drop any best/log from a previous profile so we never
-        // persist a stale point under the newly-selected profile.
+        // Fresh search: drop any best/log from a previous mode so we never
+        // persist a stale point under the newly-selected mode.
         self.best = None;
         self.probe_ceiling_mhz = MAX_FREQ_MHZ + FREQ_STEP_MHZ;
         self.pending_reject_mhz = None;
         self.probe_floor_mv = 0;
         self.last_commanded_voltage_mv = None;
+        self.stuck_at_limit_cycles = 0;
         self.log.clear();
     }
 
+    /// Enable tuning with a cap-based profile, resetting the search.
+    pub fn enable_profile(&mut self, profile: TuneProfile) {
+        self.mode = TuneMode::Profile(profile);
+        self.reset_search();
+    }
+
+    /// Enable tuning toward a power/hashrate setpoint, resetting the search.
+    pub fn enable_target(&mut self, target: TuneTarget) {
+        self.mode = TuneMode::Target(target);
+        self.reset_search();
+    }
+
+    /// Update the chip envelope for the board this tuner is driving,
+    /// looked up by the supervisor from the board's reported chip model
+    /// each cycle. `None` when the model is unrecognized or not yet
+    /// reported; `evaluate` falls back to the conservative global
+    /// `MIN/MAX_FREQ_MHZ` in that case.
+    pub fn set_chip(&mut self, chip: Option<chip_profile::ChipProfile>) {
+        self.chip = chip;
+    }
+
     /// Disable tuning. The board keeps whatever setpoint it is at,
-    /// including the fan — see [`Self::enable`] for why `fan_forced_full`
-    /// is not reset here either.
+    /// including the fan — see [`Self::reset_search`] for why
+    /// `fan_forced_full` is not reset here either.
     pub fn disable(&mut self) {
         self.enabled = false;
         self.phase = TunePhase::Disabled;
@@ -343,10 +489,20 @@ impl AutoTuner {
         self.enabled
     }
 
-    pub fn status(&self, setpoint: Option<TuneSetpoint>) -> AutoTuneStatus {
+    pub fn status(
+        &self,
+        setpoint: Option<TuneSetpoint>,
+        hashrate_target_range: Option<TargetRange>,
+    ) -> AutoTuneStatus {
+        let (profile, target) = match self.mode {
+            TuneMode::Profile(profile) => (Some(profile), None),
+            TuneMode::Target(target) => (None, Some(target)),
+        };
         AutoTuneStatus {
             enabled: self.enabled,
-            profile: self.profile,
+            profile,
+            target,
+            hashrate_target_range,
             phase: self.phase,
             frequency_mhz: setpoint.map(|s| s.frequency_mhz),
             core_voltage_mv: setpoint.map(|s| s.core_voltage_mv),
@@ -389,7 +545,7 @@ impl AutoTuner {
         self.last_efficiency = efficiency_j_th(m.power_w, m.hashrate_ths);
         self.cycles_since_change += 1;
 
-        let caps = self.profile.caps();
+        let caps = self.mode.caps();
 
         // 1. Safety: over a hard cap -> back off on a fast cadence that does
         //    NOT wait for the long tuning settle (temperature and power are
@@ -469,6 +625,13 @@ impl AutoTuner {
             return None;
         }
         self.cycles_since_change = 0;
+
+        // Target mode converges to a fixed setpoint rather than climbing as
+        // far as the caps allow -- entirely different logic from the
+        // profile hill-climb below, so it's handled separately.
+        if let TuneMode::Target(target) = self.mode {
+            return self.evaluate_target(m, target);
+        }
 
         // Not usefully hashing: genuine first-time warmup holds. A collapse
         // after `best` was already established falls through instead — it is
@@ -628,6 +791,80 @@ impl AutoTuner {
         None
     }
 
+    /// Target-mode convergence: step frequency toward the setpoint and hold
+    /// once within tolerance. Unlike the profile hill-climb this never
+    /// records a "best" to climb past -- it always compares the live
+    /// measurement directly against the fixed target value, matching the
+    /// same principle the profile search uses (judge against reality, not
+    /// an extrapolated table): the target itself is the only reference
+    /// point, and convergence is driven purely by live `m.power_w` /
+    /// `m.hashrate_ths`.
+    fn evaluate_target(&mut self, m: &Metrics, target: TuneTarget) -> Option<TuneAction> {
+        let (target_value, current) = match target {
+            TuneTarget::Power(watts) => (watts, m.power_w),
+            TuneTarget::Hashrate(ths) => (ths, m.hashrate_ths),
+        };
+
+        // Not usefully hashing yet: hold rather than judge a target against
+        // a chip that hasn't spun up.
+        if m.hashrate_ths < MIN_HASHRATE_THS {
+            self.phase = TunePhase::Warmup;
+            return None;
+        }
+
+        let error = target_value - current;
+        let tolerance = (target_value.abs() * TARGET_TOLERANCE_FRACTION).max(f32::EPSILON);
+
+        if error.abs() <= tolerance {
+            self.stuck_at_limit_cycles = 0;
+            if self.phase != TunePhase::Locked {
+                self.phase = TunePhase::Locked;
+                self.log_event(
+                    format!("target reached: holding at {:.0} MHz", m.frequency_mhz),
+                    m,
+                );
+            }
+            return None;
+        }
+
+        let (min_freq, max_freq) = self
+            .chip
+            .map(|c| (c.min_freq_mhz, c.max_freq_mhz))
+            .unwrap_or((MIN_FREQ_MHZ, MAX_FREQ_MHZ));
+        let step = if error > 0.0 {
+            FREQ_STEP_MHZ
+        } else {
+            -FREQ_STEP_MHZ
+        };
+        let next = (m.frequency_mhz + step).clamp(min_freq, max_freq);
+
+        // Pinned at a limit (the clamp landed back where we started) with
+        // the setpoint still unreached: this is what "unreachable" means.
+        if (next - m.frequency_mhz).abs() <= FREQ_TOLERANCE_MHZ {
+            self.stuck_at_limit_cycles += 1;
+            if self.stuck_at_limit_cycles >= UNREACHABLE_STRIKES {
+                if self.phase != TunePhase::Unreachable {
+                    self.phase = TunePhase::Unreachable;
+                    self.log_event(
+                        format!(
+                            "target not reachable: holding at {:.0} MHz limit",
+                            m.frequency_mhz
+                        ),
+                        m,
+                    );
+                }
+            } else {
+                self.phase = TunePhase::Converging;
+            }
+            return None;
+        }
+
+        self.stuck_at_limit_cycles = 0;
+        self.phase = TunePhase::Converging;
+        self.log_event(format!("converging: stepping to {next:.0} MHz"), m);
+        Some(TuneAction::SetFrequency(next))
+    }
+
     /// Having just confirmed or improved on `best`, try to extend the search
     /// (trim voltage for efficiency profiles, climb the clock for
     /// hash-seeking ones); lock if there's nothing further to try.
@@ -672,7 +909,14 @@ struct SavedProfile {
     /// control is never silently retuned.
     #[serde(default)]
     enabled: bool,
+    /// Fallback/legacy field: the profile in effect, or `TuneProfile`'s
+    /// default when the tuner was actually in target mode (see `target`).
     profile: TuneProfile,
+    /// Set when the tuner was in target mode when saved. Older state files
+    /// predate this field and simply lack it (`#[serde(default)]`), which
+    /// resumes as profile mode -- the same behavior they always had.
+    #[serde(default)]
+    target: Option<TuneTarget>,
     setpoint: TuneSetpoint,
 }
 
@@ -696,6 +940,17 @@ fn load_saved() -> HashMap<String, SavedProfile> {
             }
         },
         Err(_) => Default::default(),
+    }
+}
+
+/// Split a [`TuneMode`] into the `(profile, target)` pair [`SavedProfile`]
+/// stores. `profile` is always populated (falling back to `TuneProfile`'s
+/// default in target mode) since the field predates target mode and other
+/// code may still read it; `target` is `Some` only in target mode.
+fn saved_profile_fields(mode: TuneMode) -> (TuneProfile, Option<TuneTarget>) {
+    match mode {
+        TuneMode::Profile(profile) => (profile, None),
+        TuneMode::Target(target) => (TuneProfile::default(), Some(target)),
     }
 }
 
@@ -756,7 +1011,7 @@ pub async fn run(
         // supports a single board: with more than one connected, the aggregate
         // hashrate can't be attributed, so hold off rather than mis-tune.
         let hashrate_ths = miner_telemetry_rx.borrow().hashrate as f32 / 1e12;
-        let (name, serial, metrics, sender) = {
+        let (name, serial, metrics, sender, chip) = {
             let mut reg = board_registry.lock().unwrap_or_else(|e| e.into_inner());
             let boards = reg.boards();
             if boards.len() != 1 {
@@ -789,8 +1044,16 @@ pub async fn run(
                 frequency_mhz: freq,
                 core_voltage_mv: (voltage_v * 1000.0).round() as u16,
             };
-            (board.name.clone(), board.serial.clone(), metrics, sender)
+            let chip = board
+                .chip_model
+                .as_deref()
+                .and_then(chip_profile::profile_for);
+            (board.name.clone(), board.serial.clone(), metrics, sender, chip)
         };
+        tuner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_chip(chip);
 
         // Boot-time resume: if this board was actively auto-tuning when it was
         // last saved, re-enable the tuner so it converges again. We do NOT
@@ -803,8 +1066,13 @@ pub async fn run(
         {
             let mut t = tuner.lock().unwrap_or_else(|e| e.into_inner());
             if !t.is_enabled() {
-                t.enable(saved.profile);
-                info!(board = %name, profile = ?saved.profile, "Resuming saved auto-tune profile");
+                if let Some(target) = saved.target {
+                    t.enable_target(target);
+                    info!(board = %name, ?target, "Resuming saved auto-tune target");
+                } else {
+                    t.enable_profile(saved.profile);
+                    info!(board = %name, profile = ?saved.profile, "Resuming saved auto-tune profile");
+                }
             }
         }
 
@@ -823,12 +1091,14 @@ pub async fn run(
             && saved_best != Some(best)
         {
             saved_best = Some(best);
-            let profile = tuner.lock().unwrap_or_else(|e| e.into_inner()).profile;
+            let mode = tuner.lock().unwrap_or_else(|e| e.into_inner()).mode;
+            let (profile, target) = saved_profile_fields(mode);
             save_profile(
                 serial,
                 SavedProfile {
                     enabled: true,
                     profile,
+                    target,
                     setpoint: best,
                 },
             );
@@ -837,9 +1107,9 @@ pub async fn run(
 
         // Persist enable/disable transitions so a reboot resumes only what the
         // user left running (a board turned back to manual is not retuned).
-        let (enabled_now, profile_now, best_now) = {
+        let (enabled_now, mode_now, best_now) = {
             let t = tuner.lock().unwrap_or_else(|e| e.into_inner());
-            (t.enabled, t.profile, t.best.map(|(setpoint, ..)| setpoint))
+            (t.enabled, t.mode, t.best.map(|(setpoint, ..)| setpoint))
         };
         if let Some(serial) = serial.as_ref()
             && last_enabled != Some(enabled_now)
@@ -849,11 +1119,13 @@ pub async fn run(
                 frequency_mhz: metrics.frequency_mhz,
                 core_voltage_mv: metrics.core_voltage_mv,
             });
+            let (profile, target) = saved_profile_fields(mode_now);
             save_profile(
                 serial,
                 SavedProfile {
                     enabled: enabled_now,
-                    profile: profile_now,
+                    profile,
+                    target,
                     setpoint,
                 },
             );
@@ -954,7 +1226,7 @@ mod tests {
     #[test]
     fn settles_before_acting() {
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::MaxHash);
+        t.enable_profile(TuneProfile::MaxHash);
         let metrics = m(50.0, 12.0, 1.2, 525.0, 1150);
         // No action until the settle gate elapses.
         for _ in 0..SETTLE_CYCLES - 1 {
@@ -979,7 +1251,7 @@ mod tests {
     #[test]
     fn temp_breach_forces_fan_before_dropping_clock() {
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::Balanced); // temp cap 62
+        t.enable_profile(TuneProfile::Balanced); // temp cap 62
         let hot = m(70.0, 14.0, 1.3, 550.0, 1150);
         // First reaction to a temperature breach is to max the fan, NOT to
         // give up clock while the fan curve may still have headroom.
@@ -998,7 +1270,7 @@ mod tests {
     #[test]
     fn power_breach_drops_clock_without_touching_fan() {
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::Quiet); // power cap 12
+        t.enable_profile(TuneProfile::Quiet); // power cap 12
         // Power breaches skip the fan (airflow doesn't cut watts) and drop
         // the clock directly.
         let action = safety_step(&mut t, &m(50.0, 15.0, 1.2, 525.0, 1150));
@@ -1009,7 +1281,7 @@ mod tests {
     #[test]
     fn restores_fan_when_temp_clears() {
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::MaxHash); // temp cap 68
+        t.enable_profile(TuneProfile::MaxHash); // temp cap 68
         assert_eq!(
             t.evaluate(&m(70.0, 15.0, 1.0, 550.0, 1150)),
             Some(TuneAction::SetFanFull)
@@ -1031,7 +1303,7 @@ mod tests {
         // (or until a fresh breach happened to re-arm the flag), even once
         // temperature was comfortably under the new profile's cap.
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::Balanced); // temp cap 62
+        t.enable_profile(TuneProfile::Balanced); // temp cap 62
         assert_eq!(
             t.evaluate(&m(70.0, 14.0, 1.3, 525.0, 1150)),
             Some(TuneAction::SetFanFull)
@@ -1039,7 +1311,7 @@ mod tests {
         assert!(t.fan_forced_full);
 
         // Operator switches profile while the fan is still forced full.
-        t.enable(TuneProfile::Efficient); // temp cap 60
+        t.enable_profile(TuneProfile::Efficient); // temp cap 60
         assert!(
             t.fan_forced_full,
             "switching profiles must not forget the board's fan is still forced full"
@@ -1061,7 +1333,7 @@ mod tests {
         // (which gates future climbing) stays wide open through a full
         // temperature back-off.
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::MaxHash); // temp cap 68
+        t.enable_profile(TuneProfile::MaxHash); // temp cap 68
         let hot = m(70.0, 15.0, 1.0, 550.0, 1150);
         assert_eq!(t.evaluate(&hot), Some(TuneAction::SetFanFull));
         let mut dropped = None;
@@ -1075,16 +1347,19 @@ mod tests {
     #[test]
     fn over_cap_at_clock_floor_trims_voltage() {
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::Quiet); // power cap 12
+        t.enable_profile(TuneProfile::Quiet); // power cap 12
         // Already at the clock floor and over the power cap: shed voltage.
-        let action = safety_step(&mut t, &m(50.0, 15.0, 1.0, MIN_FREQ_MHZ, 1150));
-        assert_eq!(action, Some(TuneAction::SetVoltage(1140)));
+        // Starts one step above the voltage floor so the trim has somewhere
+        // to land (the floor itself equals BM1370's nominal-stock voltage,
+        // so there is no headroom below it).
+        let action = safety_step(&mut t, &m(50.0, 15.0, 1.0, MIN_FREQ_MHZ, 1160));
+        assert_eq!(action, Some(TuneAction::SetVoltage(1150)));
     }
 
     #[test]
     fn maxhash_climbs_with_headroom() {
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::MaxHash);
+        t.enable_profile(TuneProfile::MaxHash);
         // Cool, low power, first solid point -> raise clock.
         let action = step_to_action(&mut t, &m(55.0, 13.0, 1.25, 550.0, 1150));
         assert_eq!(action, Some(TuneAction::SetFrequency(575.0)));
@@ -1095,7 +1370,7 @@ mod tests {
         // Judged on the measured hashrate directly (no nameplate table): a
         // solid point with thermal/power headroom pushes the clock up.
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::MaxHash);
+        t.enable_profile(TuneProfile::MaxHash);
         let action = step_to_action(&mut t, &m(55.0, 11.5, 1.0, 525.0, 1150));
         assert_eq!(action, Some(TuneAction::SetFrequency(550.0)));
     }
@@ -1103,7 +1378,7 @@ mod tests {
     #[test]
     fn reverts_to_best_when_higher_clock_does_not_improve() {
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::MaxHash);
+        t.enable_profile(TuneProfile::MaxHash);
         // Baseline 525 at the voltage ceiling, ~1.2 TH/s.
         step_to_action(&mut t, &m(55.0, 14.0, 1.2, 525.0, AUTO_VOLT_CEIL_MV));
         // A higher clock delivers no more hashrate and voltage is already
@@ -1122,7 +1397,7 @@ mod tests {
     #[test]
     fn converges_reapplies_best_then_locks() {
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::MaxHash);
+        t.enable_profile(TuneProfile::MaxHash);
         let v = AUTO_VOLT_CEIL_MV;
         // 525 solid -> climb to 550.
         let a1 = step_to_action(&mut t, &m(55.0, 14.0, 1.2, 525.0, v));
@@ -1147,7 +1422,7 @@ mod tests {
         // clock then measures well, it becomes the new best and climbing
         // continues — the original bug (permanent exclusion) cannot recur.
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::MaxHash);
+        t.enable_profile(TuneProfile::MaxHash);
         // Baseline 525 ~1.0 TH/s at the voltage ceiling (no recovery ladder).
         step_to_action(&mut t, &m(55.0, 14.0, 1.0, 525.0, AUTO_VOLT_CEIL_MV));
         // 550 reads low once (unlucky window): re-measure, ceiling untouched.
@@ -1169,7 +1444,7 @@ mod tests {
         // value, so a measured reading that droops below it still locks
         // instead of livelocking in a no-op revert.
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::MaxHash);
+        t.enable_profile(TuneProfile::MaxHash);
         // Baseline 525/1150 -> climb to 550.
         step_to_action(&mut t, &m(55.0, 13.0, 1.0, 525.0, 1150));
         // 550 no gain -> raise voltage to 1160 (commanded).
@@ -1192,7 +1467,7 @@ mod tests {
         // -full episode, the fan is NOT released (which would flap it every
         // cycle and stall the tuner). It stays forced until a clear margin.
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::MaxHash); // temp cap 68
+        t.enable_profile(TuneProfile::MaxHash); // temp cap 68
         assert_eq!(
             t.evaluate(&m(70.0, 15.0, 1.0, 550.0, 1150)),
             Some(TuneAction::SetFanFull)
@@ -1215,7 +1490,7 @@ mod tests {
         // computed from the tuner's own last-commanded value, not the
         // regulator's lagging measured vout.
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::MaxHash);
+        t.enable_profile(TuneProfile::MaxHash);
         // Baseline at 525/1150 -> climb to 550.
         step_to_action(&mut t, &m(55.0, 13.0, 1.0, 525.0, 1150));
         // 550 no hashrate gain -> first voltage raise to 1160.
@@ -1232,7 +1507,7 @@ mod tests {
         // Regression test for the warmup trap: once a good point exists, a
         // hashrate collapse must revert toward it, not sit in warmup forever.
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::MaxHash);
+        t.enable_profile(TuneProfile::MaxHash);
         step_to_action(&mut t, &m(55.0, 13.0, 1.0, 525.0, 1150));
         let action = step_to_action(&mut t, &m(55.0, 13.0, 0.1, 575.0, 1150));
         assert_eq!(action, Some(TuneAction::SetFrequency(525.0)));
@@ -1241,9 +1516,11 @@ mod tests {
     #[test]
     fn efficient_trims_voltage_when_stable() {
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::Efficient);
-        let action = step_to_action(&mut t, &m(55.0, 12.0, 1.2, 525.0, 1150));
-        assert_eq!(action, Some(TuneAction::SetVoltage(1140)));
+        t.enable_profile(TuneProfile::Efficient);
+        // Starts one step above the voltage floor so the trim has somewhere
+        // to land (the floor itself equals BM1370's nominal-stock voltage).
+        let action = step_to_action(&mut t, &m(55.0, 12.0, 1.2, 525.0, 1160));
+        assert_eq!(action, Some(TuneAction::SetVoltage(1150)));
     }
 
     #[test]
@@ -1251,19 +1528,19 @@ mod tests {
         // The efficiency walk must not oscillate: an undervolt that worsens
         // efficiency is reverted and its voltage marked as the probe floor.
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::Efficient); // temp cap 60, power cap 13
-        // 1150 solid -> trim to 1140.
-        let a1 = step_to_action(&mut t, &m(55.0, 12.0, 1.2, 525.0, 1150));
-        assert_eq!(a1, Some(TuneAction::SetVoltage(1140)));
-        // 1140 is worse (same hashrate, but we assert efficiency didn't beat
+        t.enable_profile(TuneProfile::Efficient); // temp cap 60, power cap 13
+        // 1160 solid -> trim to 1150 (the voltage floor, one step below).
+        let a1 = step_to_action(&mut t, &m(55.0, 12.0, 1.2, 525.0, 1160));
+        assert_eq!(a1, Some(TuneAction::SetVoltage(1150)));
+        // 1150 is worse (same hashrate, but we assert efficiency didn't beat
         // best: lower power at same hashrate WOULD be better, so make power
         // higher to model an undervolt that cost hashrate). Model the
         // undervolt hurting: hashrate drops so efficiency worsens.
-        let a2 = step_to_action(&mut t, &m(55.0, 12.0, 1.0, 525.0, 1140));
-        assert_eq!(a2, Some(TuneAction::SetVoltage(1150)));
-        assert_eq!(t.probe_floor_mv, 1140);
-        // Back at best; the floor blocks re-trimming to 1140, so it locks.
-        let a3 = step_to_action(&mut t, &m(55.0, 12.0, 1.2, 525.0, 1150));
+        let a2 = step_to_action(&mut t, &m(55.0, 12.0, 1.0, 525.0, 1150));
+        assert_eq!(a2, Some(TuneAction::SetVoltage(1160)));
+        assert_eq!(t.probe_floor_mv, 1150);
+        // Back at best; the floor blocks re-trimming to 1150, so it locks.
+        let a3 = step_to_action(&mut t, &m(55.0, 12.0, 1.2, 525.0, 1160));
         assert_eq!(a3, None);
         assert_eq!(t.phase, TunePhase::Locked);
     }
@@ -1271,9 +1548,102 @@ mod tests {
     #[test]
     fn quiet_locks_when_stable_and_no_headroom_sought() {
         let mut t = AutoTuner::default();
-        t.enable(TuneProfile::Quiet); // not seek_hash, not efficiency
+        t.enable_profile(TuneProfile::Quiet); // not seek_hash, not efficiency
         let action = step_to_action(&mut t, &m(50.0, 11.0, 1.2, 525.0, 1150));
         assert_eq!(action, None);
         assert_eq!(t.phase, TunePhase::Locked);
+    }
+
+    // --- target mode ---------------------------------------------------
+
+    #[test]
+    fn power_target_steps_toward_setpoint_then_locks() {
+        let mut t = AutoTuner::default();
+        t.enable_target(TuneTarget::Power(15.0));
+        // Below target: step up.
+        let a1 = step_to_action(&mut t, &m(50.0, 12.0, 1.2, 525.0, 1150));
+        assert_eq!(a1, Some(TuneAction::SetFrequency(550.0)));
+        assert_eq!(t.phase, TunePhase::Converging);
+        // Within 2% tolerance of 15.0 W: locks, no further action.
+        let a2 = step_to_action(&mut t, &m(50.0, 14.9, 1.3, 550.0, 1150));
+        assert_eq!(a2, None);
+        assert_eq!(t.phase, TunePhase::Locked);
+    }
+
+    #[test]
+    fn hashrate_target_steps_down_when_above_setpoint() {
+        let mut t = AutoTuner::default();
+        t.enable_target(TuneTarget::Hashrate(1.2));
+        // Above target: step down.
+        let action = step_to_action(&mut t, &m(50.0, 15.0, 1.4, 550.0, 1150));
+        assert_eq!(action, Some(TuneAction::SetFrequency(525.0)));
+        assert_eq!(t.phase, TunePhase::Converging);
+    }
+
+    #[test]
+    fn unreachable_hashrate_target_pins_at_chip_max_and_reports_unreachable() {
+        let mut t = AutoTuner::default();
+        t.set_chip(Some(chip_profile::BM1362));
+        t.enable_target(TuneTarget::Hashrate(999.0)); // far beyond any real chip
+        // First step: climbs toward max, pinned at the chip ceiling
+        // (400 MHz) but still far short -> Converging (first strike).
+        let a1 = step_to_action(&mut t, &m(50.0, 15.0, 1.0, 400.0, 340));
+        assert_eq!(a1, None);
+        assert_eq!(t.phase, TunePhase::Converging);
+        // Second consecutive settled cycle still pinned at the ceiling ->
+        // declared unreachable rather than looping forever.
+        let a2 = step_to_action(&mut t, &m(50.0, 15.0, 1.0, 400.0, 340));
+        assert_eq!(a2, None);
+        assert_eq!(t.phase, TunePhase::Unreachable);
+    }
+
+    #[test]
+    fn target_mode_safety_breach_overrides_convergence() {
+        // The breach branch runs before any mode dispatch, so a target
+        // setpoint must not prevent the same thermal back-off profiles get.
+        let mut t = AutoTuner::default();
+        t.enable_target(TuneTarget::Power(30.0)); // caps.power_w = 31.5
+        assert_eq!(
+            t.evaluate(&m(70.0, 15.0, 1.0, 550.0, 1150)), // over the 62C safety cap
+            Some(TuneAction::SetFanFull)
+        );
+        assert_eq!(t.phase, TunePhase::BackedOff);
+    }
+
+    #[test]
+    fn target_mode_persists_and_resumes_distinctly_from_profile() {
+        let saved_profile = SavedProfile {
+            enabled: true,
+            profile: TuneProfile::Balanced,
+            target: None,
+            setpoint: TuneSetpoint {
+                frequency_mhz: 525.0,
+                core_voltage_mv: 1150,
+            },
+        };
+        assert_eq!(saved_profile.target, None);
+
+        let saved_target = SavedProfile {
+            enabled: true,
+            profile: TuneProfile::default(),
+            target: Some(TuneTarget::Power(15.0)),
+            setpoint: TuneSetpoint {
+                frequency_mhz: 525.0,
+                core_voltage_mv: 1150,
+            },
+        };
+        assert_eq!(saved_target.target, Some(TuneTarget::Power(15.0)));
+
+        // Round-trips through the same JSON the state file uses.
+        let json = serde_json::to_string(&saved_target).unwrap();
+        let restored: SavedProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.target, Some(TuneTarget::Power(15.0)));
+
+        // Old state files predating `target` deserialize fine (defaults to
+        // profile-mode resume, matching pre-target-mode behavior).
+        let legacy_json = r#"{"enabled":true,"profile":"balanced","setpoint":{"frequency_mhz":525.0,"core_voltage_mv":1150}}"#;
+        let legacy: SavedProfile = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy.target, None);
+        assert_eq!(legacy.profile, TuneProfile::Balanced);
     }
 }
