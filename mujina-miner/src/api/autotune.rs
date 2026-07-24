@@ -1053,7 +1053,13 @@ pub async fn run(
                 .chip_model
                 .as_deref()
                 .and_then(chip_profile::profile_for);
-            (board.name.clone(), board.serial.clone(), metrics, sender, chip)
+            (
+                board.name.clone(),
+                board.serial.clone(),
+                metrics,
+                sender,
+                chip,
+            )
         };
         tuner
             .lock()

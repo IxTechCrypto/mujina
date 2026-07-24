@@ -14,13 +14,13 @@ use tokio::sync::{mpsc, oneshot};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::autotune::{self, AutoTuneStatus, TargetRange, TuneProfile, TuneSetpoint};
-use crate::asic::bm13xx::chip_profile;
 use super::commands::{BoardCommand, FanControlUpdate, SchedulerCommand};
 use super::server::SharedState;
 use crate::api_client::types::{
     AutoTuneRequest, BoardTelemetry, FanControlRequest, MinerPatchRequest, MinerTelemetry,
     SourceTelemetry, TuningRequest,
 };
+use crate::asic::bm13xx::chip_profile;
 
 /// Build the v0 API routes with OpenAPI metadata.
 pub fn routes() -> OpenApiRouter<SharedState> {
