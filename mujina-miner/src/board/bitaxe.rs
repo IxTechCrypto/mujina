@@ -880,7 +880,7 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
     Ok(tps546)
 }
 
-async fn discover_chips(
+pub(crate) async fn discover_chips(
     reader: &mut FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>,
     writer: &mut FramedWrite<SerialWriter, bm13xx::FrameCodec>,
 ) -> Result<Vec<ChipInfo>> {
@@ -982,13 +982,13 @@ impl AsicEnable for BitaxeAsicEnable {
 }
 
 /// A wrapper around AsyncRead that traces raw bytes as they're read.
-struct TracingReader<R> {
+pub(crate) struct TracingReader<R> {
     inner: R,
     name: &'static str,
 }
 
 impl<R: AsyncRead + Unpin> TracingReader<R> {
-    fn new(inner: R, name: &'static str) -> Self {
+    pub(crate) fn new(inner: R, name: &'static str) -> Self {
         Self { inner, name }
     }
 }
