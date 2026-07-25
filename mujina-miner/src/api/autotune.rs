@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{self, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
@@ -923,11 +923,7 @@ struct SavedProfile {
 }
 
 fn state_path() -> PathBuf {
-    // Next to the daemon by default; overridable for tests/deployments.
-    std::env::var_os("MUJINA_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("mujina-autotune.json")
+    crate::config::state_dir().join("mujina-autotune.json")
 }
 
 fn load_saved() -> HashMap<String, SavedProfile> {
@@ -977,16 +973,143 @@ fn save_profile(serial: &str, saved: SavedProfile) {
 
 // --- supervisor task -------------------------------------------------------
 
-/// Shared handle: the API reads/writes the manager, the task drives it.
-pub type SharedAutoTuner = Arc<Mutex<AutoTuner>>;
+/// One independent [`AutoTuner`] per board, keyed by board name.
+///
+/// Every board tunes on its own: its own phase, its own sweep history, its
+/// own enable state. That is only sound because each board now measures its
+/// own hashrate (`BoardTelemetry::threads`); when the tuner could see only
+/// the miner-wide aggregate it had to refuse to run at all with more than
+/// one board connected, since it could not tell whose hashrate had moved.
+///
+/// Boards are keyed by name rather than serial because that is what the API
+/// path uses and what the registry's command channels are keyed by. Serial
+/// remains the persistence key -- it survives a rename or a different USB
+/// port, which is what a saved profile needs to follow.
+#[derive(Default)]
+pub struct AutoTuners {
+    by_board: HashMap<String, AutoTuner>,
+}
+
+impl AutoTuners {
+    /// The tuner for `board`, created on first use.
+    ///
+    /// Creating on read is deliberate: a `GET` for a board that has never
+    /// been tuned should report a disabled tuner, not 404, and the caller
+    /// should not have to care which came first.
+    pub fn get_mut(&mut self, board: &str) -> &mut AutoTuner {
+        self.by_board.entry(board.to_string()).or_default()
+    }
+
+    /// Drop tuners for boards that are no longer connected, so an unplugged
+    /// board does not keep its state and silently resume mid-sweep if a
+    /// different board later takes its name.
+    fn retain_connected(&mut self, connected: &HashSet<String>) {
+        self.by_board.retain(|name, _| connected.contains(name));
+    }
+}
+
+/// Shared handle: the API reads/writes the tuners, the task drives them.
+pub type SharedAutoTuner = Arc<Mutex<AutoTuners>>;
+
+/// Everything the supervisor needs to evaluate one board this tick.
+struct BoardSnapshot {
+    name: String,
+    serial: Option<String>,
+    metrics: Metrics,
+    sender: mpsc::Sender<BoardCommand>,
+    chip: Option<chip_profile::ChipProfile>,
+}
+
+/// Per-board bookkeeping the supervisor carries between ticks.
+///
+/// Was loop-local scalars back when only one board could ever be tuned;
+/// now one of these per board, or two boards would overwrite each other's
+/// "have I already persisted this?" answers and thrash the state file.
+#[derive(Default)]
+struct Bookkeeping {
+    /// Last locked setpoint persisted, so a lock only writes once.
+    saved_best: Option<TuneSetpoint>,
+    /// Last (enabled, mode) persisted, so an enable/disable transition OR a
+    /// mode switch (profile<->target, or a new target value) while staying
+    /// enabled is written through -- a reboot must resume the mode the user
+    /// actually left running, not just whatever was active the last time
+    /// `enabled` itself flipped.
+    last_persisted: Option<(bool, TuneMode)>,
+}
+
+/// Sum of a board's own per-thread hashrate, in TH/s.
+///
+/// The board's measurement, never the miner-wide aggregate: with several
+/// boards hashing, the aggregate cannot be attributed and tuning against it
+/// would make each board react to its neighbours' changes.
+fn board_hashrate_ths(board: &crate::api_client::types::BoardTelemetry) -> f32 {
+    board.threads.iter().map(|t| t.hashrate).sum::<u64>() as f32 / 1e12
+}
+
+/// Collect a complete snapshot for every board that has one.
+///
+/// A board missing any reading is skipped for this tick rather than
+/// defaulted: a missing temperature must never read as a value that
+/// disables a cap, and a missing voltage must never underflow a step.
+fn snapshot_boards(
+    board_registry: &Arc<Mutex<BoardRegistry>>,
+    threads: &[crate::api_client::types::ThreadTelemetry],
+) -> (Vec<BoardSnapshot>, HashSet<String>) {
+    let mut reg = board_registry.lock().unwrap_or_else(|e| e.into_inner());
+    let boards = reg.boards(threads);
+    let connected: HashSet<String> = boards.iter().map(|b| b.name.clone()).collect();
+
+    let mut snapshots = Vec::new();
+    for board in boards {
+        let Some(sender) = reg.command_sender(&board.name) else {
+            continue;
+        };
+        let temp = board
+            .temperatures
+            .iter()
+            .find(|t| t.name == "asic")
+            .and_then(|t| t.temperature)
+            .map(|t| t.as_degrees_c());
+        let core = board.powers.iter().find(|p| p.name == "core");
+        let (Some(temp), Some(freq), Some(core)) = (temp, board.frequency_mhz, core) else {
+            continue;
+        };
+        let (Some(power_w), Some(voltage_v)) = (core.power_w, core.voltage_v) else {
+            continue;
+        };
+        snapshots.push(BoardSnapshot {
+            metrics: Metrics {
+                asic_temp_c: temp,
+                power_w,
+                hashrate_ths: board_hashrate_ths(&board),
+                frequency_mhz: freq,
+                core_voltage_mv: (voltage_v * 1000.0).round() as u16,
+            },
+            chip: board
+                .chip_model
+                .as_deref()
+                .and_then(chip_profile::profile_for),
+            name: board.name.clone(),
+            serial: board.serial.clone(),
+            sender,
+        });
+    }
+    (snapshots, connected)
+}
 
 /// Run the auto-tuning supervisor until cancelled.
 ///
-/// Reads the first connected board's telemetry and the aggregate hashrate,
-/// evaluates the tuner, and applies any action through the board command
-/// channel. Persists the best point when the tuner locks.
+/// Each cycle it evaluates **every** connected board against its own tuner,
+/// using that board's own measured hashrate, and applies any action through
+/// that board's command channel. Persists each board's best point when its
+/// tuner locks.
+///
+/// One task drives all boards rather than one task per board. The work per
+/// tick is a few microseconds of arithmetic and a `try_send`, so there is
+/// nothing to gain from parallelism, and a single loop keeps the ordering of
+/// state-file writes obvious.
 pub async fn run(
-    tuner: SharedAutoTuner,
+    tuners: SharedAutoTuner,
     board_registry: Arc<Mutex<BoardRegistry>>,
     miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     cancel: CancellationToken,
@@ -994,14 +1117,7 @@ pub async fn run(
     let mut tick = time::interval(Duration::from_secs(2));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    // Track what we last persisted so a lock only writes once.
-    let mut saved_best: Option<TuneSetpoint> = None;
-    // Last (enabled, mode) we persisted, so an enable/disable transition OR
-    // a mode switch (profile<->target, or a new target value) while staying
-    // enabled is written through -- a reboot must resume the mode the user
-    // actually left running, not just whatever was active the last time
-    // `enabled` itself flipped.
-    let mut last_persisted: Option<(bool, TuneMode)> = None;
+    let mut bookkeeping: HashMap<String, Bookkeeping> = Default::default();
     // Serials we have already considered for boot-time resume, so it happens
     // at most once per board per run.
     let mut resumed: HashSet<String> = Default::default();
@@ -1012,201 +1128,185 @@ pub async fn run(
             _ = tick.tick() => {}
         }
 
-        // Gather the board's telemetry plus the aggregate hashrate. The tuner
-        // supports a single board: with more than one connected, the aggregate
-        // hashrate can't be attributed, so hold off rather than mis-tune.
-        // TODO: boards now carry their own per-thread hashrate, so the
-        // single-board restriction below could be lifted by tuning against
-        // `board.threads` instead of the aggregate. Left alone here because
-        // changing what the tuner optimizes deserves its own testing.
         let telemetry = miner_telemetry_rx.borrow().clone();
-        let hashrate_ths = telemetry.hashrate as f32 / 1e12;
-        let (name, serial, metrics, sender, chip) = {
-            let mut reg = board_registry.lock().unwrap_or_else(|e| e.into_inner());
-            let boards = reg.boards(&telemetry.threads);
-            if boards.len() != 1 {
-                continue;
+        let (snapshots, connected) = snapshot_boards(&board_registry, &telemetry.threads);
+        {
+            let mut t = tuners.lock().unwrap_or_else(|e| e.into_inner());
+            t.retain_connected(&connected);
+        }
+        bookkeeping.retain(|name, _| connected.contains(name));
+
+        for snapshot in snapshots {
+            tune_one_board(&tuners, &snapshot, &mut bookkeeping, &mut resumed);
+        }
+    }
+}
+
+/// Evaluate and act on a single board. Split out of [`run`] so the per-board
+/// logic reads the same as it did when only one board could ever be tuned.
+fn tune_one_board(
+    tuners: &SharedAutoTuner,
+    snapshot: &BoardSnapshot,
+    bookkeeping: &mut HashMap<String, Bookkeeping>,
+    resumed: &mut HashSet<String>,
+) {
+    let BoardSnapshot {
+        name,
+        serial,
+        metrics,
+        sender,
+        chip,
+    } = snapshot;
+    let book = bookkeeping.entry(name.clone()).or_default();
+
+    tuners
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(name)
+        .set_chip(*chip);
+
+    // Boot-time resume: if this board was actively auto-tuning when it was
+    // last saved, re-enable its tuner so it converges again. We do NOT
+    // blindly re-apply a stored setpoint — a board left on manual control
+    // keeps its manual settings.
+    if let Some(serial) = serial.as_ref()
+        && resumed.insert(serial.clone())
+        && let Some(saved) = load_saved().get(serial).cloned()
+        && saved.enabled
+    {
+        let mut all = tuners.lock().unwrap_or_else(|e| e.into_inner());
+        let t = all.get_mut(name);
+        if !t.is_enabled() {
+            if let Some(target) = saved.target {
+                t.enable_target(target);
+                info!(board = %name, ?target, "Resuming saved auto-tune target");
+            } else {
+                t.enable_profile(saved.profile);
+                info!(board = %name, profile = ?saved.profile, "Resuming saved auto-tune profile");
             }
-            let board = boards.into_iter().next().unwrap();
-            let Some(sender) = reg.command_sender(&board.name) else {
-                continue;
-            };
-            let temp = board
-                .temperatures
-                .iter()
-                .find(|t| t.name == "asic")
-                .and_then(|t| t.temperature)
-                .map(|t| t.as_degrees_c());
-            let core = board.powers.iter().find(|p| p.name == "core");
-            // Require temperature, clock, power AND voltage: a missing reading
-            // must never default to a value that disables a cap or underflows
-            // a step. Wait for a complete snapshot instead.
-            let (Some(temp), Some(freq), Some(core)) = (temp, board.frequency_mhz, core) else {
-                continue;
-            };
-            let (Some(power_w), Some(voltage_v)) = (core.power_w, core.voltage_v) else {
-                continue;
-            };
-            let metrics = Metrics {
-                asic_temp_c: temp,
-                power_w,
-                hashrate_ths,
-                frequency_mhz: freq,
-                core_voltage_mv: (voltage_v * 1000.0).round() as u16,
-            };
-            let chip = board
-                .chip_model
-                .as_deref()
-                .and_then(chip_profile::profile_for);
-            (
-                board.name.clone(),
-                board.serial.clone(),
-                metrics,
-                sender,
-                chip,
-            )
-        };
-        tuner
+        }
+    }
+
+    // Decide (holding the tuner lock only for the decision).
+    let (action, locked_best) = {
+        let mut all = tuners.lock().unwrap_or_else(|e| e.into_inner());
+        let t = all.get_mut(name);
+        let action = t.evaluate(metrics);
+        let locked = (t.phase == TunePhase::Locked)
+            .then(|| t.best.map(|(setpoint, ..)| setpoint))
+            .flatten();
+        (action, locked)
+    };
+
+    // Persist a freshly-locked best-known-good point (once).
+    if let (Some(best), Some(serial)) = (locked_best, serial.as_ref())
+        && book.saved_best != Some(best)
+    {
+        book.saved_best = Some(best);
+        let mode = tuners
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .set_chip(chip);
+            .get_mut(name)
+            .mode;
+        let (profile, target) = saved_profile_fields(mode);
+        save_profile(
+            serial,
+            SavedProfile {
+                enabled: true,
+                profile,
+                target,
+                setpoint: best,
+            },
+        );
+        info!(board = %name, ?best, "Auto-tune converged; profile saved");
+    }
 
-        // Boot-time resume: if this board was actively auto-tuning when it was
-        // last saved, re-enable the tuner so it converges again. We do NOT
-        // blindly re-apply a stored setpoint — a board left on manual control
-        // keeps its manual settings.
-        if let Some(serial) = serial.as_ref()
-            && resumed.insert(serial.clone())
-            && let Some(saved) = load_saved().get(serial).cloned()
-            && saved.enabled
-        {
-            let mut t = tuner.lock().unwrap_or_else(|e| e.into_inner());
-            if !t.is_enabled() {
-                if let Some(target) = saved.target {
-                    t.enable_target(target);
-                    info!(board = %name, ?target, "Resuming saved auto-tune target");
-                } else {
-                    t.enable_profile(saved.profile);
-                    info!(board = %name, profile = ?saved.profile, "Resuming saved auto-tune profile");
-                }
+    // Persist enable/disable transitions AND mode switches (profile<->
+    // target, or a new target value/profile while staying enabled) so a
+    // reboot resumes the mode the user actually left running rather than
+    // whatever was active the last time `enabled` itself flipped.
+    let (enabled_now, mode_now, best_now) = {
+        let mut all = tuners.lock().unwrap_or_else(|e| e.into_inner());
+        let t = all.get_mut(name);
+        (t.enabled, t.mode, t.best.map(|(setpoint, ..)| setpoint))
+    };
+    if let Some(serial) = serial.as_ref()
+        && book.last_persisted != Some((enabled_now, mode_now))
+    {
+        book.last_persisted = Some((enabled_now, mode_now));
+        let setpoint = best_now.unwrap_or(TuneSetpoint {
+            frequency_mhz: metrics.frequency_mhz,
+            core_voltage_mv: metrics.core_voltage_mv,
+        });
+        let (profile, target) = saved_profile_fields(mode_now);
+        save_profile(
+            serial,
+            SavedProfile {
+                enabled: enabled_now,
+                profile,
+                target,
+                setpoint,
+            },
+        );
+    }
+
+    // Apply the action through the board command channel.
+    if let Some(action) = action {
+        let (cmd, desc): (BoardCommand, String) = match action {
+            TuneAction::SetFrequency(mhz) => {
+                let (tx, _rx) = oneshot::channel();
+                (
+                    BoardCommand::SetFrequency { mhz, reply: tx },
+                    format!("{mhz:.0} MHz"),
+                )
             }
-        }
-
-        // Decide (holding the tuner lock only for the decision).
-        let (action, locked_best) = {
-            let mut t = tuner.lock().unwrap_or_else(|e| e.into_inner());
-            let action = t.evaluate(&metrics);
-            let locked = (t.phase == TunePhase::Locked)
-                .then(|| t.best.map(|(setpoint, ..)| setpoint))
-                .flatten();
-            (action, locked)
-        };
-
-        // Persist a freshly-locked best-known-good point (once).
-        if let (Some(best), Some(serial)) = (locked_best, serial.as_ref())
-            && saved_best != Some(best)
-        {
-            saved_best = Some(best);
-            let mode = tuner.lock().unwrap_or_else(|e| e.into_inner()).mode;
-            let (profile, target) = saved_profile_fields(mode);
-            save_profile(
-                serial,
-                SavedProfile {
-                    enabled: true,
-                    profile,
-                    target,
-                    setpoint: best,
-                },
-            );
-            info!(board = %name, ?best, "Auto-tune converged; profile saved");
-        }
-
-        // Persist enable/disable transitions AND mode switches (profile<->
-        // target, or a new target value/profile while staying enabled) so a
-        // reboot resumes the mode the user actually left running rather than
-        // whatever was active the last time `enabled` itself flipped.
-        let (enabled_now, mode_now, best_now) = {
-            let t = tuner.lock().unwrap_or_else(|e| e.into_inner());
-            (t.enabled, t.mode, t.best.map(|(setpoint, ..)| setpoint))
-        };
-        if let Some(serial) = serial.as_ref()
-            && last_persisted != Some((enabled_now, mode_now))
-        {
-            last_persisted = Some((enabled_now, mode_now));
-            let setpoint = best_now.unwrap_or(TuneSetpoint {
-                frequency_mhz: metrics.frequency_mhz,
-                core_voltage_mv: metrics.core_voltage_mv,
-            });
-            let (profile, target) = saved_profile_fields(mode_now);
-            save_profile(
-                serial,
-                SavedProfile {
-                    enabled: enabled_now,
-                    profile,
-                    target,
-                    setpoint,
-                },
-            );
-        }
-
-        // Apply the action through the board command channel.
-        if let Some(action) = action {
-            let (cmd, desc): (BoardCommand, String) = match action {
-                TuneAction::SetFrequency(mhz) => {
-                    let (tx, _rx) = oneshot::channel();
-                    (
-                        BoardCommand::SetFrequency { mhz, reply: tx },
-                        format!("{mhz:.0} MHz"),
-                    )
-                }
-                TuneAction::SetVoltage(mv) => {
-                    let (tx, _rx) = oneshot::channel();
-                    (
-                        BoardCommand::SetCoreVoltage {
-                            millivolts: mv,
-                            reply: tx,
-                        },
-                        format!("{mv} mV"),
-                    )
-                }
-                TuneAction::SetFanFull => {
-                    let (tx, _rx) = oneshot::channel();
-                    (
-                        BoardCommand::SetFanControl {
-                            update: FanControlUpdate {
-                                auto: false,
-                                percent: Some(100),
-                                ..Default::default()
-                            },
-                            reply: tx,
-                        },
-                        "fan 100%".to_string(),
-                    )
-                }
-                TuneAction::RestoreFanAuto => {
-                    let (tx, _rx) = oneshot::channel();
-                    (
-                        BoardCommand::SetFanControl {
-                            // Auto with no overrides: the board resolves the
-                            // documented default target/minimum. Phase-1
-                            // limitation: this restores the *default* curve,
-                            // not a custom one the operator may have set.
-                            update: FanControlUpdate {
-                                auto: true,
-                                ..Default::default()
-                            },
-                            reply: tx,
-                        },
-                        "fan auto".to_string(),
-                    )
-                }
-            };
-            // Best-effort: a full command buffer just means we retry next cycle.
-            if let Err(e) = sender.try_send(cmd) {
-                debug!(board = %name, error = %e, "Auto-tune command dropped (busy); will retry");
-            } else {
-                debug!(board = %name, action = %desc, "Auto-tune applied");
+            TuneAction::SetVoltage(mv) => {
+                let (tx, _rx) = oneshot::channel();
+                (
+                    BoardCommand::SetCoreVoltage {
+                        millivolts: mv,
+                        reply: tx,
+                    },
+                    format!("{mv} mV"),
+                )
             }
+            TuneAction::SetFanFull => {
+                let (tx, _rx) = oneshot::channel();
+                (
+                    BoardCommand::SetFanControl {
+                        update: FanControlUpdate {
+                            auto: false,
+                            percent: Some(100),
+                            ..Default::default()
+                        },
+                        reply: tx,
+                    },
+                    "fan 100%".to_string(),
+                )
+            }
+            TuneAction::RestoreFanAuto => {
+                let (tx, _rx) = oneshot::channel();
+                (
+                    BoardCommand::SetFanControl {
+                        // Auto with no overrides: the board resolves the
+                        // documented default target/minimum. Phase-1
+                        // limitation: this restores the *default* curve,
+                        // not a custom one the operator may have set.
+                        update: FanControlUpdate {
+                            auto: true,
+                            ..Default::default()
+                        },
+                        reply: tx,
+                    },
+                    "fan auto".to_string(),
+                )
+            }
+        };
+        // Best-effort: a full command buffer just means we retry next cycle.
+        if let Err(e) = sender.try_send(cmd) {
+            debug!(board = %name, error = %e, "Auto-tune command dropped (busy); will retry");
+        } else {
+            debug!(board = %name, action = %desc, "Auto-tune applied");
         }
     }
 }
@@ -1239,6 +1339,42 @@ mod tests {
     fn disabled_tuner_does_nothing() {
         let mut t = AutoTuner::default();
         assert_eq!(t.evaluate(&m(60.0, 12.0, 1.2, 525.0, 1150)), None);
+    }
+
+    #[test]
+    fn each_board_tunes_independently() {
+        // The whole point of the per-board split: enabling one board must
+        // not enable another, and their sweeps must not share phase.
+        let mut tuners = AutoTuners::default();
+        tuners
+            .get_mut("board-a")
+            .enable_profile(TuneProfile::MaxHash);
+
+        assert!(tuners.get_mut("board-a").is_enabled());
+        assert!(!tuners.get_mut("board-b").is_enabled());
+
+        let metrics = m(50.0, 12.0, 1.2, 525.0, 1150);
+        assert!(matches!(
+            step_to_action(tuners.get_mut("board-a"), &metrics),
+            Some(TuneAction::SetFrequency(_))
+        ));
+        assert_eq!(tuners.get_mut("board-b").evaluate(&metrics), None);
+    }
+
+    #[test]
+    fn disconnected_boards_lose_their_tuner() {
+        // A board that goes away must not leave state behind for whatever
+        // reconnects under the same name to resume mid-sweep.
+        let mut tuners = AutoTuners::default();
+        tuners
+            .get_mut("board-a")
+            .enable_profile(TuneProfile::MaxHash);
+        tuners.get_mut("board-b").enable_profile(TuneProfile::Quiet);
+
+        tuners.retain_connected(&HashSet::from(["board-b".to_string()]));
+
+        assert!(!tuners.get_mut("board-a").is_enabled());
+        assert!(tuners.get_mut("board-b").is_enabled());
     }
 
     #[test]

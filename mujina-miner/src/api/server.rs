@@ -21,6 +21,7 @@ use super::{
     v0,
 };
 use crate::api_client::types::MinerTelemetry;
+use crate::config::MinerSettings;
 
 /// API server configuration.
 #[derive(Debug, Clone)]
@@ -36,6 +37,12 @@ pub(crate) struct SharedState {
     pub board_registry: Arc<Mutex<BoardRegistry>>,
     pub scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
     pub autotuner: SharedAutoTuner,
+    /// The settings as last saved. Edited by `PATCH /settings`.
+    pub settings: Arc<Mutex<MinerSettings>>,
+    /// The settings this process actually started with, kept so the API can
+    /// tell the client honestly whether a restart is pending. Immutable for
+    /// the life of the daemon, which is exactly the point.
+    pub running_settings: Arc<MinerSettings>,
 }
 
 impl SharedState {
@@ -48,6 +55,10 @@ impl SharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .boards(&telemetry.threads);
+        // The name shown is the one in effect, not the one pending a
+        // restart, so the dashboard header never claims a rename that the
+        // pool has not seen.
+        telemetry.name = self.running_settings.name.clone();
         telemetry
     }
 }
@@ -67,6 +78,7 @@ pub async fn serve(
     miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     mut board_reg_rx: mpsc::Receiver<BoardRegistration>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
+    running_settings: MinerSettings,
 ) -> Result<()> {
     let board_registry = Arc::new(Mutex::new(BoardRegistry::new()));
 
@@ -95,6 +107,7 @@ pub async fn serve(
         board_registry,
         scheduler_cmd_tx,
         autotuner,
+        running_settings,
     );
 
     let listener = TcpListener::bind(&config.bind_addr).await?;
@@ -127,12 +140,17 @@ pub(crate) fn build_router(
     board_registry: Arc<Mutex<BoardRegistry>>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
     autotuner: SharedAutoTuner,
+    running_settings: MinerSettings,
 ) -> Router {
     let state = SharedState {
         miner_telemetry_rx,
         board_registry,
         scheduler_cmd_tx,
         autotuner,
+        // Seeded from what is running; PATCH replaces it and rewrites the
+        // file, and the two are compared to detect a pending restart.
+        settings: Arc::new(Mutex::new(running_settings.clone())),
+        running_settings: Arc::new(running_settings),
     };
 
     let (router, api) = OpenApiRouter::new()
@@ -198,6 +216,7 @@ mod tests {
                 Arc::new(Mutex::new(registry)),
                 cmd_tx,
                 Default::default(),
+                MinerSettings::default(),
             ),
             _board_senders: board_senders,
             _miner_tx: miner_tx,

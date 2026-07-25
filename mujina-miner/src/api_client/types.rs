@@ -14,6 +14,12 @@ use crate::types::Temperature;
 /// Full miner telemetry snapshot.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct MinerTelemetry {
+    /// User-chosen friendly name for this miner, or null if unnamed.
+    ///
+    /// Config rather than measurement, so the API layer attaches it to each
+    /// snapshot instead of the scheduler carrying it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub uptime_secs: u64,
     /// Aggregate hashrate in hashes per second.
     pub hashrate: u64,
@@ -143,6 +149,68 @@ pub struct ChipTelemetry {
 pub struct MinerPatchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paused: Option<bool>,
+}
+
+/// Pool settings as returned by the API.
+///
+/// The password is never sent back -- the API is unauthenticated, and a
+/// client that only needs to know whether one is configured can read
+/// `password_set`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct PoolSettingsView {
+    pub url: String,
+    /// Account the pool authorizes, without the worker suffix.
+    pub user: String,
+    /// Whether a password is stored. Its value is not disclosed.
+    pub password_set: bool,
+}
+
+/// Response body for `GET`/`PATCH /settings`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct SettingsResponse {
+    /// Friendly miner name, or null if unnamed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Configured pool, or null when the miner runs the dummy job source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<PoolSettingsView>,
+    /// The full worker string that will be sent to the pool: the pool user
+    /// with the miner name appended. Null when no pool is configured.
+    ///
+    /// Returned so a client can show the effect of naming a miner rather
+    /// than making the user infer the concatenation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_username: Option<String>,
+    /// True when the saved settings differ from the ones this process is
+    /// running with. Pool and name are read once at startup, so a change
+    /// only takes effect after a restart and the client must say so.
+    pub restart_required: bool,
+}
+
+/// Pool fields in a `PATCH /settings` body.
+///
+/// `url` and `user` are required when `pool` is present; omitting
+/// `password` keeps the stored one, which is how a client updates the URL
+/// without ever having seen the password.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PoolSettingsPatch {
+    pub url: String,
+    pub user: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+/// Request body for `PATCH /settings`.
+///
+/// Fields left out are unchanged. Sending `name` as an empty (or
+/// whitespace-only) string clears it, rather than needing a `null` that a
+/// plain `Option` cannot distinguish from "absent".
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct SettingsPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<PoolSettingsPatch>,
 }
 
 /// Request body for `PATCH /boards/{name}/fan`.

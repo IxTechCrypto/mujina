@@ -276,6 +276,8 @@ impl Scheduler {
     /// `boards` is left empty here.
     fn compute_miner_telemetry(&mut self) -> MinerTelemetry {
         MinerTelemetry {
+            // Config, not measurement: the API layer fills this in.
+            name: None,
             uptime_secs: self.stats.start_time.elapsed().as_secs(),
             hashrate: u64::from(self.measured_hashrate()),
             shares_submitted: self.stats.shares_submitted,

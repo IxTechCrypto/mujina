@@ -1,6 +1,7 @@
 pub(crate) mod bitaxe;
 pub(crate) mod cpu;
 pub(crate) mod emberone00;
+pub(crate) mod fan_control;
 pub(crate) mod nerdqaxe_pp;
 pub mod pattern;
 

@@ -20,7 +20,7 @@ use tokio_util::{
 };
 
 use crate::{
-    api::{BoardCommand, FanControlUpdate},
+    api::BoardCommand,
     api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
     asic::{
         ChipInfo,
@@ -31,6 +31,7 @@ use crate::{
         },
         hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
     },
+    board::fan_control::FanController,
     hw_trait::{
         gpio::{Gpio, GpioPin, PinValue},
         i2c::I2c,
@@ -207,9 +208,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         chip_model: "BM1370",
         chip_count: chip_infos.len() as u32,
         thread_count: threads.len() as u32,
-        fan_control: FanControl::default(),
-        fan_temp_ema: None,
-        fan_integral: 0.0,
+        fan: FanController::default(),
         freq_control,
         current_freq_mhz: bm13xx::thread::TARGET_FREQUENCY_MHZ,
         over_temp_count: 0,
@@ -246,137 +245,8 @@ const MIN_CORE_VOLTAGE_MV: u16 = bm13xx::chip_profile::BM1370.min_voltage_mv;
 /// The BM1370 should not run above ~1300 mV sustained.
 const MAX_CORE_VOLTAGE_MV: u16 = bm13xx::chip_profile::BM1370.max_voltage_mv;
 
-/// Default automatic-mode target ASIC die temperature, in Celsius.
-const DEFAULT_FAN_TARGET_C: f32 = 60.0;
-/// Default automatic-mode minimum fan duty cycle, in percent.
-const DEFAULT_FAN_MIN_PERCENT: u8 = 25;
-/// Accepted range for an automatic-mode target temperature. The ceiling
-/// stays clear of the 80 C emergency threshold so auto control actually
-/// engages before the emergency shutdown would.
-const MIN_FAN_TARGET_C: f32 = 40.0;
-const MAX_FAN_TARGET_C: f32 = 75.0;
-/// Never let the automatic minimum drop to zero: a running ASIC always
-/// needs some airflow, and the emergency path is a backstop, not a plan.
-const MIN_FAN_FLOOR_PERCENT: u8 = 10;
-/// Temperature span above the target over which the automatic curve
-/// ramps the fan from `min_percent` up to 100%.
-const FAN_RAMP_SPAN_C: f32 = 15.0;
-/// Board monitor tick period. Also the integral term's dt.
+/// Board monitor tick period. Also the fan controller's integral dt.
 const MONITOR_TICK: Duration = Duration::from_secs(2);
-/// EMA smoothing weight applied to each new temperature reading before it
-/// reaches the fan curve, damping sensor noise so the fan doesn't hunt
-/// tick-to-tick. Lower is smoother but slower to react.
-const FAN_TEMP_EMA_ALPHA: f32 = 0.3;
-/// Proportional gain, in fan-percent per degree Celsius of error above
-/// `target_c`. Matches the old proportional-only curve's slope: a single
-/// reading `FAN_RAMP_SPAN_C` above target still drives duty to full on its
-/// own, so the integral term only has to correct steady-state droop, not
-/// carry the whole response.
-const FAN_KP: f32 = (100 - DEFAULT_FAN_MIN_PERCENT as i32) as f32 / FAN_RAMP_SPAN_C;
-/// Integral gain, in fan-percent per (degree-Celsius x second) of
-/// accumulated error. Small: it exists to erase the residual offset a
-/// proportional-only curve leaves once the fan settles at an equilibrium
-/// duty, not to drive the fast response.
-const FAN_KI: f32 = 0.05;
-/// Anti-windup clamp on the integral accumulator, in degree-Celsius x
-/// seconds. Bounds the integral term's maximum contribution to
-/// `FAN_KI * FAN_INTEGRAL_MAX` percentage points, and limits how long a
-/// past excursion keeps pushing the fan after temperature recovers.
-const FAN_INTEGRAL_MAX: f32 = 400.0;
-
-/// Fan control policy for a board.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum FanControl {
-    /// Hold the ASIC die temperature near `target_c`, driving the fan
-    /// between `min_percent` and 100% as temperature rises.
-    Auto { target_c: f32, min_percent: u8 },
-    /// Fixed duty cycle set by the operator; no temperature feedback.
-    Manual { percent: u8 },
-}
-
-impl Default for FanControl {
-    fn default() -> Self {
-        FanControl::Auto {
-            target_c: DEFAULT_FAN_TARGET_C,
-            min_percent: DEFAULT_FAN_MIN_PERCENT,
-        }
-    }
-}
-
-impl FanControl {
-    /// Apply a partial update from the API, carrying forward any value the
-    /// caller left unset from the current policy (or the defaults when
-    /// switching into a mode that has no prior value to inherit).
-    fn with_update(self, update: FanControlUpdate) -> Self {
-        // Current auto parameters, falling back to defaults if we are
-        // switching over from manual mode.
-        let (cur_target, cur_min) = match self {
-            FanControl::Auto {
-                target_c,
-                min_percent,
-            } => (target_c, min_percent),
-            FanControl::Manual { .. } => (DEFAULT_FAN_TARGET_C, DEFAULT_FAN_MIN_PERCENT),
-        };
-        if update.auto {
-            FanControl::Auto {
-                target_c: update
-                    .target_c
-                    .unwrap_or(cur_target)
-                    .clamp(MIN_FAN_TARGET_C, MAX_FAN_TARGET_C),
-                min_percent: update
-                    .min_percent
-                    .unwrap_or(cur_min)
-                    .clamp(MIN_FAN_FLOOR_PERCENT, 100),
-            }
-        } else {
-            let cur_manual = match self {
-                FanControl::Manual { percent } => percent,
-                // No prior manual value: fall back to full speed, the safe
-                // default, rather than something arbitrary.
-                FanControl::Auto { .. } => 100,
-            };
-            FanControl::Manual {
-                percent: update.percent.unwrap_or(cur_manual),
-            }
-        }
-    }
-}
-
-/// Smooth a raw temperature reading with an exponential moving average,
-/// seeding the filter with the first sample rather than an arbitrary
-/// starting guess.
-fn ema_filter(prev: Option<f32>, sample: f32, alpha: f32) -> f32 {
-    match prev {
-        Some(p) => p + alpha * (sample - p),
-        None => sample,
-    }
-}
-
-/// Advance the fan PI controller's integral term by one tick. Accumulates
-/// `(temp_c - target_c) * dt_s`, so it unwinds again once the temperature
-/// drops back under target rather than latching at its peak forever.
-/// Clamped to `[0, FAN_INTEGRAL_MAX]`: it never goes negative (the
-/// proportional floor already owns below-target duty) and never grows
-/// large enough to keep the fan pinned long after a past excursion.
-fn integrate_fan_error(integral: f32, temp_c: f32, target_c: f32, dt_s: f32) -> f32 {
-    let error = temp_c - target_c;
-    (integral + error * dt_s).clamp(0.0, FAN_INTEGRAL_MAX)
-}
-
-/// Automatic fan curve: PI control on the (EMA-filtered) ASIC die
-/// temperature. The proportional term holds `min_percent` at or below
-/// `target_c` and reacts to instantaneous error the same way the original
-/// proportional-only curve did; the integral term layers in a slow
-/// correction for the steady-state droop a proportional-only curve leaves
-/// once the fan settles at an equilibrium duty. `min_percent` and 100%
-/// remain hard floor/ceiling regardless of how large the integral term
-/// gets.
-fn auto_fan_duty(temp_c: f32, target_c: f32, min_percent: u8, integral: f32) -> u8 {
-    let min_percent = (min_percent.min(100)) as f32;
-    let error_above_target = (temp_c - target_c).max(0.0);
-    let duty = min_percent + FAN_KP * error_above_target + FAN_KI * integral;
-    duty.clamp(min_percent, 100.0).round() as u8
-}
 
 /// Internal state owned by the board monitor task.
 ///
@@ -397,14 +267,8 @@ struct Bitaxe {
     /// board's lifetime; re-sent on every telemetry update so the field
     /// does not decay to the `Default` zero after the first snapshot.
     thread_count: u32,
-    /// Fan control policy applied each monitor cycle.
-    fan_control: FanControl,
-    /// EMA-filtered ASIC die temperature fed to the fan PI controller.
-    /// `None` until the first usable reading arrives.
-    fan_temp_ema: Option<f32>,
-    /// Fan PI controller's accumulated integral error, in degree-Celsius x
-    /// seconds. Reset whenever fan control is not in automatic mode.
-    fan_integral: f32,
+    /// Fan control policy and its PI state, evaluated each monitor cycle.
+    fan: FanController,
     /// Handle for retuning the ASIC hash clock at runtime.
     freq_control: FrequencyControl,
     /// Last hash clock commanded to the ASIC, in MHz. Reported in telemetry.
@@ -461,8 +325,8 @@ impl Bitaxe {
     async fn handle_command(&mut self, cmd: BoardCommand) {
         match cmd {
             BoardCommand::SetFanControl { update, reply } => {
-                self.fan_control = self.fan_control.with_update(update);
-                info!(policy = ?self.fan_control, "Fan control updated");
+                self.fan.update(update);
+                info!(policy = ?self.fan.control(), "Fan control updated");
                 let _ = reply.send(Ok(()));
             }
             BoardCommand::SetCoreVoltage { millivolts, reply } => {
@@ -644,27 +508,7 @@ impl Bitaxe {
         // it is rather than guess (the emergency and sensor-fault paths
         // above own the sustained-failure cases), and the filter/integral
         // simply hold at their last value until a reading returns.
-        let commanded_percent = match self.fan_control {
-            FanControl::Manual { percent } => {
-                self.fan_temp_ema = None;
-                self.fan_integral = 0.0;
-                Some(percent)
-            }
-            FanControl::Auto {
-                target_c,
-                min_percent,
-            } => asic_temp.map(|t| {
-                let filtered = ema_filter(self.fan_temp_ema, t, FAN_TEMP_EMA_ALPHA);
-                self.fan_temp_ema = Some(filtered);
-                self.fan_integral = integrate_fan_error(
-                    self.fan_integral,
-                    filtered,
-                    target_c,
-                    MONITOR_TICK.as_secs_f32(),
-                );
-                auto_fan_duty(filtered, target_c, min_percent, self.fan_integral)
-            }),
-        };
+        let commanded_percent = self.fan.tick(asic_temp, MONITOR_TICK.as_secs_f32());
         if let Some(percent) = commanded_percent
             && let Err(e) = self
                 .emc2101
@@ -688,15 +532,9 @@ impl Bitaxe {
                 rpm: fan_rpm,
                 percent: fan_percent,
                 target_percent: commanded_percent,
-                auto: Some(matches!(self.fan_control, FanControl::Auto { .. })),
-                target_c: match self.fan_control {
-                    FanControl::Auto { target_c, .. } => Some(target_c),
-                    FanControl::Manual { .. } => None,
-                },
-                min_percent: match self.fan_control {
-                    FanControl::Auto { min_percent, .. } => Some(min_percent),
-                    FanControl::Manual { .. } => None,
-                },
+                auto: Some(self.fan.control().is_auto()),
+                target_c: self.fan.control().target_c(),
+                min_percent: self.fan.control().min_percent(),
             }],
             temperatures: vec![
                 TemperatureSensor {
@@ -1065,178 +903,5 @@ impl<R: AsyncRead + Unpin> AsyncRead for TracingReader<R> {
         }
 
         result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        DEFAULT_FAN_MIN_PERCENT, DEFAULT_FAN_TARGET_C, FAN_INTEGRAL_MAX, FAN_KI, FAN_RAMP_SPAN_C,
-        FanControl, auto_fan_duty, ema_filter, integrate_fan_error,
-    };
-    use crate::api::FanControlUpdate;
-
-    // With a zero integral the PI curve collapses to the old
-    // proportional-only curve, so these first four cases (integral = 0.0)
-    // pin down the same behavior the simple curve had.
-
-    #[test]
-    fn holds_minimum_at_or_below_target() {
-        let min = DEFAULT_FAN_MIN_PERCENT;
-        let target = DEFAULT_FAN_TARGET_C;
-        assert_eq!(auto_fan_duty(target - 10.0, target, min, 0.0), min);
-        assert_eq!(auto_fan_duty(target, target, min, 0.0), min);
-    }
-
-    #[test]
-    fn reaches_full_at_top_of_ramp() {
-        let min = DEFAULT_FAN_MIN_PERCENT;
-        let target = DEFAULT_FAN_TARGET_C;
-        assert_eq!(
-            auto_fan_duty(target + FAN_RAMP_SPAN_C, target, min, 0.0),
-            100
-        );
-        // Beyond the ramp span the fan stays clamped at 100%.
-        assert_eq!(auto_fan_duty(target + 50.0, target, min, 0.0), 100);
-    }
-
-    #[test]
-    fn ramps_linearly_between_target_and_full() {
-        let min = 25;
-        let target = 60.0;
-        // Halfway up the 15 C span: 25% + 0.5 * (100 - 25) = 62.5 -> 63.
-        assert_eq!(
-            auto_fan_duty(target + FAN_RAMP_SPAN_C / 2.0, target, min, 0.0),
-            63
-        );
-    }
-
-    #[test]
-    fn clamps_minimum_above_one_hundred() {
-        // A nonsensical minimum never drives the fan past 100%.
-        assert_eq!(auto_fan_duty(200.0, 60.0, 250, 0.0), 100);
-    }
-
-    #[test]
-    fn integral_term_lifts_duty_above_proportional_floor() {
-        // Same reading, but a wound-up integral from past error pushes
-        // duty above what the proportional term alone would give.
-        let target = 60.0;
-        let min = 25;
-        let proportional_only = auto_fan_duty(target, target, min, 0.0);
-        let with_integral = auto_fan_duty(target, target, min, 100.0);
-        assert!(with_integral > proportional_only);
-        assert_eq!(with_integral, min + (FAN_KI * 100.0).round() as u8);
-    }
-
-    #[test]
-    fn integral_never_pushes_past_ceiling() {
-        assert_eq!(auto_fan_duty(75.0, 60.0, 25, FAN_INTEGRAL_MAX * 10.0), 100);
-    }
-
-    #[test]
-    fn integral_accumulates_while_above_target() {
-        assert_eq!(integrate_fan_error(0.0, 65.0, 60.0, 2.0), 10.0);
-    }
-
-    #[test]
-    fn integral_unwinds_below_target_and_floors_at_zero() {
-        // A prior wind-up of 10.0 fully unwinds (and stays non-negative)
-        // once temperature drops 5 C under target for 2s.
-        assert_eq!(integrate_fan_error(10.0, 55.0, 60.0, 2.0), 0.0);
-    }
-
-    #[test]
-    fn integral_saturates_at_anti_windup_clamp() {
-        assert_eq!(
-            integrate_fan_error(FAN_INTEGRAL_MAX - 1.0, 100.0, 60.0, 2.0),
-            FAN_INTEGRAL_MAX
-        );
-    }
-
-    #[test]
-    fn ema_filter_seeds_from_first_sample() {
-        assert_eq!(ema_filter(None, 42.0, 0.3), 42.0);
-    }
-
-    #[test]
-    fn ema_filter_smooths_toward_new_sample() {
-        // 30% weight on the new sample: 60 -> 60 + 0.3*(70-60) = 63.
-        let filtered = ema_filter(Some(60.0), 70.0, 0.3);
-        assert_eq!(filtered, 63.0);
-        // Smoothed, so it moves toward but does not jump to the raw
-        // reading in one tick.
-        assert!(filtered > 60.0 && filtered < 70.0);
-    }
-
-    #[test]
-    fn update_changes_only_specified_auto_fields() {
-        let start = FanControl::Auto {
-            target_c: 60.0,
-            min_percent: 25,
-        };
-        // Change only the target; minimum is carried forward.
-        let updated = start.with_update(FanControlUpdate {
-            auto: true,
-            target_c: Some(55.0),
-            min_percent: None,
-            percent: None,
-        });
-        assert_eq!(
-            updated,
-            FanControl::Auto {
-                target_c: 55.0,
-                min_percent: 25
-            }
-        );
-    }
-
-    #[test]
-    fn update_clamps_unsafe_auto_params() {
-        // A target above the emergency threshold and a zero floor are both
-        // pulled back into safe bounds so auto control still cools the chip.
-        let updated = FanControl::default().with_update(FanControlUpdate {
-            auto: true,
-            target_c: Some(119.0),
-            min_percent: Some(0),
-            percent: None,
-        });
-        assert_eq!(
-            updated,
-            FanControl::Auto {
-                target_c: super::MAX_FAN_TARGET_C,
-                min_percent: super::MIN_FAN_FLOOR_PERCENT,
-            }
-        );
-    }
-
-    #[test]
-    fn update_switches_auto_to_manual() {
-        let start = FanControl::default();
-        let updated = start.with_update(FanControlUpdate {
-            auto: false,
-            target_c: None,
-            min_percent: None,
-            percent: Some(70),
-        });
-        assert_eq!(updated, FanControl::Manual { percent: 70 });
-    }
-
-    #[test]
-    fn update_switching_to_auto_from_manual_uses_defaults() {
-        let start = FanControl::Manual { percent: 80 };
-        let updated = start.with_update(FanControlUpdate {
-            auto: true,
-            target_c: None,
-            min_percent: None,
-            percent: None,
-        });
-        assert_eq!(
-            updated,
-            FanControl::Auto {
-                target_c: DEFAULT_FAN_TARGET_C,
-                min_percent: DEFAULT_FAN_MIN_PERCENT
-            }
-        );
     }
 }

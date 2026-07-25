@@ -18,15 +18,18 @@ use super::commands::{BoardCommand, FanControlUpdate, SchedulerCommand};
 use super::server::SharedState;
 use crate::api_client::types::{
     AutoTuneRequest, BoardTelemetry, FanControlRequest, MinerPatchRequest, MinerTelemetry,
-    SourceTelemetry, TuningRequest,
+    PoolSettingsView, SettingsPatch, SettingsResponse, SourceTelemetry, TuningRequest,
 };
 use crate::asic::bm13xx::chip_profile;
+use crate::config::{MinerSettings, PoolSettings};
+use crate::tracing::prelude::*;
 
 /// Build the v0 API routes with OpenAPI metadata.
 pub fn routes() -> OpenApiRouter<SharedState> {
     OpenApiRouter::new()
         .routes(routes!(health))
         .routes(routes!(get_miner, patch_miner))
+        .routes(routes!(get_settings, patch_settings))
         .routes(routes!(get_boards))
         .routes(routes!(get_board))
         .routes(routes!(patch_board_fan))
@@ -96,6 +99,109 @@ async fn patch_miner(
     }
 
     Ok(Json(state.miner_telemetry()))
+}
+
+/// Render settings for the wire, redacting the password and reporting
+/// whether the saved values differ from the ones this process is running.
+fn settings_response(saved: &MinerSettings, running: &MinerSettings) -> SettingsResponse {
+    SettingsResponse {
+        name: saved.name.clone(),
+        pool: saved.pool.as_ref().map(|p| PoolSettingsView {
+            url: p.url.clone(),
+            user: p.user.clone(),
+            password_set: !p.password.is_empty(),
+        }),
+        worker_username: saved.worker_username(),
+        restart_required: !settings_match(saved, running),
+    }
+}
+
+/// Whether two settings describe the same pool session. Compares only what
+/// the daemon acts on at startup: a differing password matters because it
+/// is sent at authorize time.
+fn settings_match(a: &MinerSettings, b: &MinerSettings) -> bool {
+    if a.worker_username() != b.worker_username() || a.name != b.name {
+        return false;
+    }
+    match (&a.pool, &b.pool) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.url == y.url && x.password == y.password,
+        _ => false,
+    }
+}
+
+/// Return the miner's name and pool settings.
+#[utoipa::path(
+    get,
+    path = "/settings",
+    tag = "miner",
+    responses(
+        (status = OK, description = "Current miner settings", body = SettingsResponse),
+    ),
+)]
+async fn get_settings(State(state): State<SharedState>) -> Json<SettingsResponse> {
+    let saved = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+    Json(settings_response(&saved, &state.running_settings))
+}
+
+/// Update the miner's name and/or pool settings.
+///
+/// The new values are persisted immediately but are **not** applied to the
+/// running daemon, which reads them once at startup; the response's
+/// `restart_required` says whether a restart is now pending.
+#[utoipa::path(
+    patch,
+    path = "/settings",
+    tag = "miner",
+    request_body = SettingsPatch,
+    responses(
+        (status = OK, description = "Updated miner settings", body = SettingsResponse),
+        (status = BAD_REQUEST, description = "Empty pool URL or user"),
+        (status = INTERNAL_SERVER_ERROR, description = "Settings could not be saved"),
+    ),
+)]
+async fn patch_settings(
+    State(state): State<SharedState>,
+    Json(req): Json<SettingsPatch>,
+) -> Result<Json<SettingsResponse>, StatusCode> {
+    let mut saved = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(name) = req.name {
+        // An empty field is how a client clears the name; storing it as
+        // Some("") would append a bare dot to the worker string.
+        let name = name.trim();
+        saved.name = (!name.is_empty()).then(|| name.to_string());
+    }
+
+    if let Some(pool) = req.pool {
+        let url = pool.url.trim();
+        let user = pool.user.trim();
+        if url.is_empty() || user.is_empty() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        // An absent password keeps the stored one, so a client that was
+        // never shown the password can still edit the URL.
+        let password = pool
+            .password
+            .or_else(|| saved.pool.as_ref().map(|p| p.password.clone()))
+            .unwrap_or_else(|| "x".to_string());
+        saved.pool = Some(PoolSettings {
+            url: url.to_string(),
+            user: user.to_string(),
+            password,
+        });
+    }
+
+    if let Err(e) = saved.save() {
+        error!(error = %e, "Failed to save miner settings");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    let response = settings_response(&saved, &state.running_settings);
+    if response.restart_required {
+        info!("Miner settings saved; restart required to apply them");
+    }
+    Ok(Json(response))
 }
 
 /// Return all connected boards.
@@ -350,6 +456,7 @@ async fn get_board_autotune(
         .autotuner
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&name)
         .status(setpoint, range);
     Json(status)
 }
@@ -371,24 +478,19 @@ async fn patch_board_autotune(
 ) -> Json<AutoTuneStatus> {
     let setpoint = board_setpoint(&state, &name);
     let range = board_hashrate_target_range(&state, &name);
-    {
-        let mut tuner = state.autotuner.lock().unwrap_or_else(|e| e.into_inner());
-        if req.enabled {
-            if let Some(target) = req.target {
-                tuner.enable_target(target);
-            } else {
-                tuner.enable_profile(parse_profile(req.profile.as_deref()));
-            }
+    let mut all = state.autotuner.lock().unwrap_or_else(|e| e.into_inner());
+    // Only this board's tuner is touched; the others keep running.
+    let tuner = all.get_mut(&name);
+    if req.enabled {
+        if let Some(target) = req.target {
+            tuner.enable_target(target);
         } else {
-            tuner.disable();
+            tuner.enable_profile(parse_profile(req.profile.as_deref()));
         }
+    } else {
+        tuner.disable();
     }
-    let status = state
-        .autotuner
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .status(setpoint, range);
-    Json(status)
+    Json(tuner.status(setpoint, range))
 }
 
 /// Return all registered job sources.

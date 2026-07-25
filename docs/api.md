@@ -84,13 +84,34 @@ table is a summary and may not be exhaustive.
 |--------|--------------|--------------------------------|
 | GET    | `/miner`     | Full state snapshot            |
 | PATCH  | `/miner`     | Update miner config (e.g. pause) |
+| GET    | `/settings`  | Miner name and pool settings   |
+| PATCH  | `/settings`  | Save miner name and/or pool    |
+
+`/settings` is persisted configuration, not live state. The daemon reads
+its name and pool once at startup, so a PATCH is saved immediately but
+takes effect on the next restart; the response's `restart_required` says
+whether the saved values differ from the running ones. The pool password
+is never returned — `pool.password_set` reports only whether one is
+stored, and omitting `password` from a PATCH keeps the stored value.
+
+The miner's name is also sent to the pool as the worker suffix
+(`user.name`), so `worker_username` in the response shows the full string
+that will be authorized.
 
 ### Boards
 
-| Method | Path              | Description           |
-|--------|-------------------|-----------------------|
-| GET    | `/boards`         | List connected boards |
-| GET    | `/boards/{name}`  | Single board detail   |
+| Method | Path                       | Description                |
+|--------|----------------------------|----------------------------|
+| GET    | `/boards`                  | List connected boards      |
+| GET    | `/boards/{name}`           | Single board detail        |
+| PATCH  | `/boards/{name}/fan`       | Fan control policy         |
+| PATCH  | `/boards/{name}/tuning`    | Manual frequency/voltage   |
+| GET    | `/boards/{name}/autotune`  | Auto-tuning status         |
+| PATCH  | `/boards/{name}/autotune`  | Enable/configure auto-tune |
+
+Fan control, manual tuning and auto-tuning are all per board: each board
+runs its own independent auto-tuner, tuned against that board's own
+measured hashrate.
 
 ### Sources
 

@@ -87,14 +87,17 @@ const GROUPS: &[EnvGroup] = &[
         vars: &[
             EnvVar {
                 name: "MUJINA_POOL_URL",
-                summary: "Stratum v1 pool URL. When unset, the daemon runs a \
-                          built-in dummy job source instead.",
+                summary: "Stratum v1 pool URL. Used only until a pool is saved \
+                          through the API, after which mujina-settings.json in \
+                          the state directory wins. When neither is set, the \
+                          daemon runs a built-in dummy job source instead.",
                 default: None,
                 example: Some("stratum+tcp://pool.example.com:3333"),
             },
             EnvVar {
                 name: "MUJINA_POOL_USER",
-                summary: "Worker username sent to the pool.",
+                summary: "Account the pool authorizes. The miner's name, if \
+                          set, is appended to this as the worker suffix.",
                 default: Some("mujina-testing"),
                 example: Some("myworker.1"),
             },
@@ -114,6 +117,17 @@ const GROUPS: &[EnvGroup] = &[
                 example: None,
             },
         ],
+    },
+    EnvGroup {
+        title: "State",
+        vars: &[EnvVar {
+            name: "MUJINA_STATE_DIR",
+            summary: "Directory holding the daemon's persistent files: saved \
+                      miner settings (mujina-settings.json) and per-board \
+                      auto-tune state (mujina-autotune.json).",
+            default: Some("the current working directory"),
+            example: None,
+        }],
     },
     EnvGroup {
         title: "CPU miner",

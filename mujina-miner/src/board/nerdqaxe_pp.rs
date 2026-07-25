@@ -37,13 +37,14 @@ use super::{
     pattern::{BoardPattern, Match},
 };
 use crate::{
-    api::{BoardCommand, commands::FanControlUpdate},
+    api::BoardCommand,
     api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
     asic::{
         bm13xx,
         bm13xx::thread::{BM13xxThread, FrequencyControl},
         hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
     },
+    board::fan_control::{FanControl, FanController},
     hw_trait::{
         gpio::{Gpio, GpioPin, PinValue},
         i2c::I2c as _,
@@ -230,7 +231,14 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         sensors,
         board_name,
         board_serial: info.serial_number.clone(),
+        // Starts manual at a deliberately loud duty rather than on the
+        // shared auto default: the board is built parked, so there is no
+        // meaningful ASIC temperature to track until the rail comes up.
+        fan: FanController::new(FanControl::Manual {
+            percent: DEFAULT_FAN_PERCENT,
+        }),
         fan_percent: DEFAULT_FAN_PERCENT,
+        core_voltage_v: CORE_VOLTAGE_V,
         freq_control,
         current_freq_mhz: bm13xx::thread::TARGET_FREQUENCY_MHZ,
         thread_shutdown: thread_shutdown_tx,
@@ -263,9 +271,16 @@ const POWER_DOWN_SETTLE: Duration = Duration::from_millis(500);
 /// constant rather than something inherited from the regulator's NVM,
 /// because this single number is what four ASICs in parallel are fed.
 ///
-/// Runtime tuning does not touch it yet: `SetCoreVoltage` is refused, so
-/// the rail only ever runs here.
+/// This is the value the rail is brought up at. Runtime tuning may move it
+/// afterwards within the BM1370's safe band; `NerdQaxePp::core_voltage_v`
+/// tracks where it actually is.
 const CORE_VOLTAGE_V: f32 = 1.15;
+
+/// Runtime tuning bounds for the core rail, in mV. The same BM1370 profile
+/// the Bitaxe clamps against -- one chip model, one safe band, regardless
+/// of how many of them a board carries.
+const MIN_CORE_VOLTAGE_MV: u16 = bm13xx::chip_profile::BM1370.min_voltage_mv;
+const MAX_CORE_VOLTAGE_MV: u16 = bm13xx::chip_profile::BM1370.max_voltage_mv;
 
 /// I2C bus speed. Standard mode; every device on this bus supports it and
 /// nothing here needs the throughput of fast mode.
@@ -276,10 +291,11 @@ const MONITOR_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Fan duty applied at startup.
 ///
-/// Deliberately high. The board is parked with its core rail off so it is
-/// barely dissipating anything, but there is no automatic fan curve on
-/// this board yet, so whatever is set here is what runs until someone
-/// changes it. Erring loud is recoverable; erring quiet is not.
+/// Deliberately high. The board is built parked with its core rail off, so
+/// there is no meaningful ASIC temperature for the automatic curve to
+/// track until it comes up; this duty is what runs until the operator or
+/// the auto-tuner asks for something else. Erring loud is recoverable;
+/// erring quiet is not.
 const DEFAULT_FAN_PERCENT: u8 = 80;
 
 /// I2C addresses of the board's sensors.
@@ -366,12 +382,23 @@ struct NerdQaxePp {
     sensors: Sensors,
     board_name: String,
     board_serial: Option<String>,
-    /// Commanded fan duty, applied to both headers.
+    /// Fan control policy and its PI state. Both headers run the same
+    /// duty: they sit in the same airflow path over one heatsink, so
+    /// splitting them would mean two controllers fighting over one
+    /// temperature reading.
+    fan: FanController,
+    /// Duty last commanded to the fans. Reported in telemetry, and the
+    /// value re-applied when the curve asks for no change.
     fan_percent: u8,
     /// Handle for retuning the chain's hash clock.
     freq_control: FrequencyControl,
     /// Last hash clock commanded, in MHz. Reported in telemetry.
     current_freq_mhz: f32,
+    /// Core voltage currently commanded, in volts. Tracked separately from
+    /// `CORE_VOLTAGE_V` because runtime tuning moves it: the drift check
+    /// has to compare the rail against what it was last told, not against
+    /// the bring-up constant.
+    core_voltage_v: f32,
     /// Removes the hash thread when the board goes away, so the chain is
     /// not left hashing against a board that no longer exists.
     thread_shutdown: watch::Sender<ThreadRemovalSignal>,
@@ -413,35 +440,46 @@ impl NerdQaxePp {
     async fn handle_command(&mut self, command: BoardCommand) {
         match command {
             BoardCommand::SetFanControl { update, reply } => {
-                let result = match update {
-                    // No automatic curve on this board yet: without hash
-                    // threads there is no load to track, and inventing a
-                    // curve now would mean rewriting it once there is.
-                    FanControlUpdate { auto: true, .. } => Err(anyhow::anyhow!(
-                        "automatic fan control is not implemented on the NerdQAxe++ yet"
-                    )),
-                    FanControlUpdate {
-                        percent: Some(percent),
-                        ..
-                    } => {
+                self.fan.update(update);
+                info!(policy = ?self.fan.control(), "Fan control updated");
+                // Manual mode takes effect now; automatic mode picks up the
+                // new target on the next sweep, when there is a fresh
+                // temperature reading to evaluate it against.
+                let result = match self.fan.control() {
+                    FanControl::Manual { percent } => {
                         self.fan_percent = percent.min(100);
                         self.apply_fan_speed().await
                     }
-                    // Manual mode with no duty given: nothing to change.
-                    FanControlUpdate { percent: None, .. } => Ok(()),
+                    FanControl::Auto { .. } => Ok(()),
                 };
                 let _ = reply.send(result);
             }
-            BoardCommand::SetCoreVoltage { reply, .. } => {
-                // Refused deliberately. The rail is commanded once, at
-                // CORE_VOLTAGE_V, on the power-up path. Retuning it means
-                // moving four parallel ASICs on a 90 A rail while they are
-                // hashing, and nothing here supervises that yet -- there is
-                // no automatic fan curve to answer the extra heat with.
-                let _ = reply.send(Err(anyhow::anyhow!(
-                    "NerdQAxe++ core voltage is fixed at {CORE_VOLTAGE_V} V; \
-                     runtime tuning is not implemented"
-                )));
+            BoardCommand::SetCoreVoltage { millivolts, reply } => {
+                // Four parallel ASICs on a 90 A rail, so the clamp is the
+                // safety story here: the request is pulled into the
+                // BM1370's band before it reaches the regulator, and the
+                // automatic fan curve answers the extra heat.
+                let clamped = millivolts.clamp(MIN_CORE_VOLTAGE_MV, MAX_CORE_VOLTAGE_MV);
+                let volts = clamped as f32 / 1000.0;
+                let result = self
+                    .sensors
+                    .regulator
+                    .lock()
+                    .await
+                    .set_vout(volts)
+                    .await
+                    .context("failed to set core voltage");
+                match &result {
+                    // Only track it once the write lands. Recording the new
+                    // setpoint after a failed write would make the drift
+                    // check chase a voltage the rail was never given.
+                    Ok(()) => {
+                        self.core_voltage_v = volts;
+                        info!(millivolts = clamped, "NerdQAxe++ core voltage set");
+                    }
+                    Err(e) => warn!(error = %e, "Failed to set NerdQAxe++ core voltage"),
+                }
+                let _ = reply.send(result);
             }
             BoardCommand::SetFrequency { mhz, reply } => {
                 let result = self.freq_control.set(mhz).await;
@@ -474,6 +512,21 @@ impl NerdQaxePp {
         let asic_c = self.read_temp(true).await;
         let vr_c = self.read_temp(false).await;
 
+        // Advance the fan curve before reading the tachometers, so the RPM
+        // reported alongside a duty is measured after that duty was set.
+        // In automatic mode with no temperature reading the controller
+        // returns None and the fans hold where they are.
+        if let Some(percent) = self.fan.tick(
+            asic_c.map(|t| t.as_degrees_c()),
+            MONITOR_INTERVAL.as_secs_f32(),
+        ) && percent != self.fan_percent
+        {
+            self.fan_percent = percent;
+            if let Err(e) = self.apply_fan_speed().await {
+                warn!(error = %e, "failed to apply NerdQAxe++ fan speed");
+            }
+        }
+
         let mut fans = Vec::with_capacity(2);
         for (name, channel) in [("M1", fan::M1), ("M2", fan::M2)] {
             let rpm = match self.sensors.fans.get_rpm(channel).await {
@@ -488,12 +541,9 @@ impl NerdQaxePp {
                 rpm,
                 percent: Some(self.fan_percent),
                 target_percent: Some(self.fan_percent),
-                // No automatic mode on this board yet, so this is always
-                // manual rather than null -- null would imply the board
-                // has no controllable policy at all.
-                auto: Some(false),
-                target_c: None,
-                min_percent: None,
+                auto: Some(self.fan.control().is_auto()),
+                target_c: self.fan.control().target_c(),
+                min_percent: self.fan.control().min_percent(),
             });
         }
 
@@ -533,10 +583,10 @@ impl NerdQaxePp {
             //
             // Half a VID step of slack, so this compares codes rather than
             // chasing float equality.
-            let drifted = (cmd.to_volts() - CORE_VOLTAGE_V).abs() > Vid::STEP_V / 2.0;
+            let drifted = (cmd.to_volts() - self.core_voltage_v).abs() > Vid::STEP_V / 2.0;
             if drifted {
                 warn!(
-                    expected_v = CORE_VOLTAGE_V,
+                    expected_v = self.core_voltage_v,
                     found_v = cmd.to_volts(),
                     "NerdQAxe++ core voltage drifted from what was commanded; re-applying"
                 );
@@ -545,7 +595,7 @@ impl NerdQaxePp {
                     .regulator
                     .lock()
                     .await
-                    .set_vout(CORE_VOLTAGE_V)
+                    .set_vout(self.core_voltage_v)
                     .await
                 {
                     warn!(error = %e, "failed to restore NerdQAxe++ core voltage");
