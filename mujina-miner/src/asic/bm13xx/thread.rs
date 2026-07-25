@@ -324,6 +324,27 @@ fn chain_addresses(chip_count: usize) -> Vec<u8> {
     (0..chips).map(|i| (i * interval) as u8).collect()
 }
 
+/// Which chip on the chain produced a nonce.
+///
+/// BM13xx chips stamp their own address into the nonce they return, in
+/// the byte at bits 24:17 of the big-endian value. Dividing by the same
+/// interval [`chain_addresses`] hands out gives the chip's index.
+///
+/// Returns `None` for a single-chip chain, where the field carries no
+/// address and the answer would always be a meaningless zero.
+fn chip_index_from_nonce(nonce: u32, chip_count: usize) -> Option<u8> {
+    if chip_count <= 1 {
+        return None;
+    }
+    let slots = chip_count.min(256).next_power_of_two();
+    let interval = (256 / slots) as u8;
+    let address = (nonce.swap_bytes() >> 17) as u8;
+    let index = address / interval;
+    // A chip beyond the chain length means the field was not an address:
+    // report nothing rather than inventing a chip that is not there.
+    (usize::from(index) < chip_count).then_some(index)
+}
+
 /// Initialize a BM13xx chain for mining.
 ///
 /// Enables the chips, assigns chip addresses, configures all registers,
@@ -1083,6 +1104,7 @@ async fn bm13xx_thread_actor<R, W>(
                                                 );
 
                                                 let share = Share {
+                                                    chip: chip_index_from_nonce(nonce, chip_count),
                                                     nonce,
                                                     hash,
                                                     version: full_version,
@@ -1213,6 +1235,61 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), 256);
+    }
+
+    /// Build a nonce carrying `address` in the chip-address field, the
+    /// inverse of what `chip_index_from_nonce` extracts.
+    fn nonce_from_address(address: u8) -> u32 {
+        ((address as u32) << 17).swap_bytes()
+    }
+
+    #[test]
+    fn nonce_identifies_the_chip_that_found_it() {
+        // The four addresses a 4-chip chain is assigned map back to
+        // indices 0..3.
+        for (index, address) in [0x00u8, 0x40, 0x80, 0xC0].into_iter().enumerate() {
+            assert_eq!(
+                chip_index_from_nonce(nonce_from_address(address), 4),
+                Some(index as u8),
+                "address {address:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn chip_decode_is_the_inverse_of_address_assignment() {
+        // Whatever addresses we hand out must decode back to the index we
+        // handed them out for; the two must not drift apart.
+        for chip_count in [2usize, 3, 4, 6, 8, 16] {
+            for (index, address) in chain_addresses(chip_count).into_iter().enumerate() {
+                assert_eq!(
+                    chip_index_from_nonce(nonce_from_address(address), chip_count),
+                    Some(index as u8),
+                    "chain of {chip_count}, address {address:#04x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_chip_reports_no_chip_attribution() {
+        // With one chip the field carries no address, so any answer would
+        // be a fabricated zero.
+        assert_eq!(chip_index_from_nonce(nonce_from_address(0x00), 1), None);
+        assert_eq!(chip_index_from_nonce(0xDEADBEEF, 1), None);
+    }
+
+    #[test]
+    fn address_beyond_the_chain_is_rejected() {
+        // A 2-chip chain uses interval 128, so only 0x00 and 0x80 are
+        // real. Anything decoding past the end means the field was not an
+        // address, and inventing chip 3 of a 2-chip chain would be worse
+        // than reporting nothing.
+        assert_eq!(chip_index_from_nonce(nonce_from_address(0x00), 2), Some(0));
+        assert_eq!(chip_index_from_nonce(nonce_from_address(0x80), 2), Some(1));
+        // 3 chips use 4 slots, so index 3 exists in the encoding but not
+        // on the chain.
+        assert_eq!(chip_index_from_nonce(nonce_from_address(0xC0), 3), None);
     }
 
     #[test]

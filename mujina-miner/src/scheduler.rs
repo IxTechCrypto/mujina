@@ -32,7 +32,7 @@
 //! where it belongs.
 
 use slotmap::SlotMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -42,7 +42,7 @@ use tokio_stream::{StreamExt, StreamMap};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::commands::SchedulerCommand;
-use crate::api_client::types::{MinerTelemetry, SourceTelemetry, ThreadTelemetry};
+use crate::api_client::types::{ChipTelemetry, MinerTelemetry, SourceTelemetry, ThreadTelemetry};
 use crate::asic::hash_thread::{HashTask, HashThread, HashThreadEvent, Share};
 use crate::job_source::{
     JobTemplate, MerkleRootKind, Share as SourceShare, SourceCommand, SourceEvent,
@@ -178,6 +178,12 @@ struct ThreadEntry {
     thread: Box<dyn HashThread>,
     hashrate: HashrateEstimator,
 
+    /// Per-chip estimators, for chains whose shares identify the chip that
+    /// found them. Keyed by chip index and created on first share from
+    /// that chip, so a chip that never reports simply never appears --
+    /// which is itself the signal that it is dead.
+    chip_hashrates: BTreeMap<u8, HashrateEstimator>,
+
     /// Hashrate the thread declared via `ExpectedHashRate`, `None` until its
     /// first report.
     expected: Option<HashRate>,
@@ -287,6 +293,14 @@ impl Scheduler {
                     name: entry.thread.name().to_string(),
                     hashrate: u64::from(entry.hashrate.hashrate()),
                     is_active: entry.thread.status().is_active,
+                    chips: entry
+                        .chip_hashrates
+                        .iter_mut()
+                        .map(|(index, estimator)| ChipTelemetry {
+                            index: *index,
+                            hashrate: u64::from(estimator.hashrate()),
+                        })
+                        .collect(),
                 })
                 .collect(),
             sources: self
@@ -575,6 +589,17 @@ impl Scheduler {
         // Feed share work to per-thread hashrate estimator
         if let Some(entry) = self.threads.get_mut(task_entry.thread_id) {
             entry.hashrate.record(share.expected_work);
+
+            // Same work, attributed to the chip that produced it. Chains
+            // that do not identify the chip leave this None and get no
+            // per-ASIC breakdown.
+            if let Some(chip) = share.chip {
+                entry
+                    .chip_hashrates
+                    .entry(chip)
+                    .or_insert_with(|| HashrateEstimator::new(HASHRATE_WINDOW))
+                    .record(share.expected_work);
+            }
         }
 
         // Check if share meets source threshold
@@ -699,6 +724,7 @@ impl Scheduler {
         let thread_id = self.threads.insert(ThreadEntry {
             thread,
             hashrate: HashrateEstimator::new(HASHRATE_WINDOW),
+            chip_hashrates: BTreeMap::new(),
             expected: None,
         });
         self.startup_gate.record_registered();

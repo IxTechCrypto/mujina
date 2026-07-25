@@ -116,6 +116,22 @@ pub struct ThreadTelemetry {
     /// Hashrate in hashes per second.
     pub hashrate: u64,
     pub is_active: bool,
+    /// Per-ASIC breakdown, for chains whose silicon identifies which chip
+    /// found each nonce. Empty on single-chip boards and on any chain that
+    /// does not report it, so an empty list means "not available" rather
+    /// than "no chips".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chips: Vec<ChipTelemetry>,
+}
+
+/// Per-ASIC telemetry within a chain.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct ChipTelemetry {
+    /// Position along the chain, counting from the host.
+    pub index: u8,
+    /// Hashrate in hashes per second, measured from the shares this chip
+    /// produced.
+    pub hashrate: u64,
 }
 
 /// Writable fields for `PATCH /api/v0/miner`.

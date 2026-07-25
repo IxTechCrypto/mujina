@@ -152,16 +152,19 @@ mod tests {
                 name: "thread-a1".into(),
                 hashrate: 100,
                 is_active: true,
+                chips: Vec::new(),
             },
             ThreadTelemetry {
                 name: "thread-b1".into(),
                 hashrate: 200,
                 is_active: true,
+                chips: Vec::new(),
             },
             ThreadTelemetry {
                 name: "thread-a2".into(),
                 hashrate: 300,
                 is_active: false,
+                chips: Vec::new(),
             },
             // Belongs to no registered board -- e.g. a board that just
             // disconnected but whose thread the scheduler has not dropped
@@ -170,6 +173,7 @@ mod tests {
                 name: "orphan".into(),
                 hashrate: 999,
                 is_active: true,
+                chips: Vec::new(),
             },
         ];
 
@@ -199,6 +203,7 @@ mod tests {
             name: "someone-elses".into(),
             hashrate: 500,
             is_active: true,
+            chips: Vec::new(),
         }];
         assert!(registry.boards(&threads)[0].threads.is_empty());
     }
