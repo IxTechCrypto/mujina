@@ -130,6 +130,11 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         ),
         model: info.model.clone(),
         serial: info.serial_number.clone(),
+        // No hash threads yet (`threads: Vec::new()` below), so this board
+        // contributes nothing to the aggregate hashrate. Stated explicitly
+        // rather than left to `Default` so it has to be revisited when
+        // multi-chip chain support lands.
+        thread_count: 0,
         ..Default::default()
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(telemetry);

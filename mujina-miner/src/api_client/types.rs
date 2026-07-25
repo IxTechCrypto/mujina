@@ -45,6 +45,18 @@ pub struct BoardTelemetry {
     pub temperatures: Vec<TemperatureSensor>,
     pub powers: Vec<PowerMeasurement>,
     pub threads: Vec<ThreadTelemetry>,
+    /// Number of hash threads the board handed to the backplane.
+    ///
+    /// Zero means the board is present but contributes nothing to the
+    /// aggregate hashrate, either because its hash threads are not
+    /// implemented yet or because it has none by design. Unlike `threads`,
+    /// which stays empty until per-thread hashrate accounting exists, this
+    /// is a fact every board already knows at construction, so clients can
+    /// use it to attribute the miner-wide hashrate when exactly one board
+    /// is hashing. Always serialized: an absent field means an older
+    /// daemon, which a client cannot distinguish from a genuine zero.
+    #[serde(default)]
+    pub thread_count: u32,
 }
 
 /// Fan status.

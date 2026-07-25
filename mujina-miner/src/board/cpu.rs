@@ -38,6 +38,7 @@ async fn create_cpu_board() -> Result<BackplaneConnector> {
         name: info.serial_number.clone().unwrap(),
         model: info.model.clone(),
         serial: info.serial_number.clone(),
+        thread_count: config.thread_count as u32,
         ..Default::default()
     };
     let (_telemetry_tx, telemetry_rx) = watch::channel(initial_state);

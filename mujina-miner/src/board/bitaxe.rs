@@ -184,6 +184,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         chip_model: Some("BM1370".into()),
         chip_count: Some(chip_infos.len() as u32),
         frequency_mhz: Some(bm13xx::thread::TARGET_FREQUENCY_MHZ),
+        thread_count: threads.len() as u32,
         ..Default::default()
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
@@ -204,6 +205,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         board_serial: serial,
         chip_model: "BM1370",
         chip_count: chip_infos.len() as u32,
+        thread_count: threads.len() as u32,
         fan_control: FanControl::default(),
         fan_temp_ema: None,
         fan_integral: 0.0,
@@ -390,6 +392,10 @@ struct Bitaxe {
     chip_model: &'static str,
     /// Number of ASIC chips discovered on this board's chain.
     chip_count: u32,
+    /// Number of hash threads handed to the backplane. Fixed for the
+    /// board's lifetime; re-sent on every telemetry update so the field
+    /// does not decay to the `Default` zero after the first snapshot.
+    thread_count: u32,
     /// Fan control policy applied each monitor cycle.
     fan_control: FanControl,
     /// EMA-filtered ASIC die temperature fed to the fan PI controller.
@@ -675,6 +681,7 @@ impl Bitaxe {
             chip_model: Some(self.chip_model.into()),
             chip_count: Some(self.chip_count),
             frequency_mhz: Some(self.current_freq_mhz),
+            thread_count: self.thread_count,
             fans: vec![Fan {
                 name: "fan".into(),
                 rpm: fan_rpm,
