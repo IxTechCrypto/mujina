@@ -310,12 +310,18 @@ impl HashThread for BM13xxThread {
 ///
 /// A single-chip chain yields just `[0x00]`, identical to the address the
 /// pre-chain code hardcoded.
+///
+/// The address space is 8-bit, so 256 chips is the hard ceiling. Longer
+/// chains are truncated rather than wrapped: handing back duplicate
+/// addresses would configure two chips as one and be far harder to
+/// diagnose than a short address list.
 fn chain_addresses(chip_count: usize) -> Vec<u8> {
-    let slots = chip_count.max(1).next_power_of_two();
-    let interval = 256usize / slots;
-    (0..chip_count.max(1))
-        .map(|i| (i * interval) as u8)
-        .collect()
+    const MAX_CHIPS: usize = 256;
+
+    let chips = chip_count.clamp(1, MAX_CHIPS);
+    let slots = chips.next_power_of_two();
+    let interval = MAX_CHIPS / slots;
+    (0..chips).map(|i| (i * interval) as u8).collect()
 }
 
 /// Initialize a BM13xx chain for mining.
@@ -1185,6 +1191,19 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), 256);
+    }
+
+    #[test]
+    fn overlong_chains_truncate_rather_than_collide() {
+        // Beyond 256 the interval would round to zero and every chip
+        // would be addressed 0x00 -- silently configuring the whole chain
+        // as one chip. Truncating keeps every returned address distinct.
+        let addrs = chain_addresses(300);
+        assert_eq!(addrs.len(), 256);
+        let mut sorted = addrs.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 256, "addresses must stay distinct");
     }
 
     #[test]

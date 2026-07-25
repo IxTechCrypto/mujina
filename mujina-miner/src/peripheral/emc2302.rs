@@ -6,8 +6,8 @@
 //! separate sensor.
 //!
 //! Register layout is per-channel: each fan has an identical block of
-//! offsets based at [`FAN1_BASE`] / [`FAN2_BASE`], plus a handful of
-//! device-wide configuration registers.
+//! offsets based at its own base address, plus a handful of device-wide
+//! configuration registers.
 //!
 //! Datasheet: <https://www.microchip.com/en-us/product/emc2302>
 
@@ -28,68 +28,30 @@ pub use super::emc2101::Percent;
 /// NerdQAxe++ fits the `-1`.
 pub const DEFAULT_ADDRESS: u8 = 0x2E;
 
-/// Device-wide register addresses.
-pub mod regs {
-    /// Configuration.
-    pub const CONFIG: u8 = 0x20;
-    /// Fan status.
-    pub const FAN_STATUS: u8 = 0x24;
-    /// Stall status.
-    pub const STALL_STATUS: u8 = 0x25;
-    /// Spin-up status.
-    pub const SPIN_STATUS: u8 = 0x26;
-    /// Drive-fail status.
-    pub const DRIVE_STATUS: u8 = 0x27;
-    /// Fan interrupt enable.
-    pub const FAN_IR_EN: u8 = 0x29;
-    /// PWM output polarity, one bit per channel.
-    pub const POLARITY: u8 = 0x2A;
-    /// PWM output driver type (push-pull vs open-drain), one bit per channel.
-    pub const OUTPUT_CONFIG: u8 = 0x2B;
-    /// PWM base frequency for channels 4/5 (not present on the 2-channel part).
-    pub const BASE_F45: u8 = 0x2C;
-    /// PWM base frequency for channels 1/2/3.
-    pub const BASE_F123: u8 = 0x2D;
-}
+// Only the registers this driver touches are named. The rest of the map
+// is in the datasheet; transcribing it here would be unused constants the
+// compiler cannot warn about.
+
+/// PWM output polarity, one bit per channel.
+const REG_POLARITY: u8 = 0x2A;
+/// PWM output driver type (push-pull vs open-drain), one bit per channel.
+const REG_OUTPUT_CONFIG: u8 = 0x2B;
+/// PWM base frequency for channels 1/2/3.
+const REG_BASE_F123: u8 = 0x2D;
 
 /// Register base of the channel 1 block.
-pub const FAN1_BASE: u8 = 0x30;
+const FAN1_BASE: u8 = 0x30;
 /// Register base of the channel 2 block.
-pub const FAN2_BASE: u8 = 0x40;
+const FAN2_BASE: u8 = 0x40;
 
-/// Per-channel register offsets, added to a channel base.
-pub mod ofs {
-    /// PWM duty setting (8-bit, 0-255).
-    pub const FAN_SETTING: u8 = 0x00;
-    /// Tachometer divide.
-    pub const FAN_DIVIDE: u8 = 0x01;
-    /// Fan configuration 1 (edge count, range, control mode).
-    pub const FAN_CONFIG1: u8 = 0x02;
-    /// Fan configuration 2.
-    pub const FAN_CONFIG2: u8 = 0x03;
-    /// Closed-loop gain.
-    pub const GAIN: u8 = 0x05;
-    /// Spin-up configuration.
-    pub const SPIN_UP_CONFIG: u8 = 0x06;
-    /// Maximum step.
-    pub const MAX_STEP: u8 = 0x07;
-    /// Minimum drive.
-    pub const MINIMUM_DRIVE: u8 = 0x08;
-    /// Valid TACH count.
-    pub const VALID_TACH_COUNT: u8 = 0x09;
-    /// Drive fail band, low byte.
-    pub const DRIVE_FAIL_LSB: u8 = 0x0A;
-    /// Drive fail band, high byte.
-    pub const DRIVE_FAIL_MSB: u8 = 0x0B;
-    /// TACH target, low byte.
-    pub const TACH_TARGET_LSB: u8 = 0x0C;
-    /// TACH target, high byte.
-    pub const TACH_TARGET_MSB: u8 = 0x0D;
-    /// TACH reading, high byte.
-    pub const TACH_READING_MSB: u8 = 0x0E;
-    /// TACH reading, low byte.
-    pub const TACH_READING_LSB: u8 = 0x0F;
-}
+/// PWM duty setting (8-bit, 0-255), offset from a channel base.
+const OFS_FAN_SETTING: u8 = 0x00;
+/// Fan configuration 1 (edge count, range, control mode).
+const OFS_FAN_CONFIG1: u8 = 0x02;
+/// TACH reading, high byte.
+const OFS_TACH_READING_MSB: u8 = 0x0E;
+/// TACH reading, low byte.
+const OFS_TACH_READING_LSB: u8 = 0x0F;
 
 /// Which of the two fan outputs to address.
 ///
@@ -147,11 +109,6 @@ impl Tach {
         Self(raw)
     }
 
-    /// The raw period count.
-    pub const fn raw(self) -> u16 {
-        self.0
-    }
-
     /// Convert to RPM. Returns `None` when no fan is detected, rather
     /// than a fabricated zero -- the caller decides whether that means
     /// "stopped" or "not fitted".
@@ -184,11 +141,6 @@ impl<I: I2c> Emc2302<I> {
         }
     }
 
-    /// Create a driver bound to a specific address.
-    pub fn new_with_address(i2c: I, address: u8) -> Self {
-        Self { i2c, address }
-    }
-
     /// Configure both channels for manual PWM control.
     ///
     /// `invert_polarity` selects whether 0x00 drives the fan at full
@@ -202,12 +154,12 @@ impl<I: I2c> Emc2302<I> {
 
         // Push-pull drivers on both channels.
         const OUTPUT_PUSH_PULL_BOTH: u8 = 0x03;
-        self.write_register(regs::OUTPUT_CONFIG, OUTPUT_PUSH_PULL_BOTH)
+        self.write_register(REG_OUTPUT_CONFIG, OUTPUT_PUSH_PULL_BOTH)
             .await?;
 
         // 19.53 kHz PWM base frequency on both channels -- above audible.
         const BASE_FREQ_19_53KHZ: u8 = (0x01) | (0x01 << 3);
-        self.write_register(regs::BASE_F123, BASE_FREQ_19_53KHZ)
+        self.write_register(REG_BASE_F123, BASE_FREQ_19_53KHZ)
             .await?;
 
         // Manual (open-loop) duty control, sampling 5 tach edges per
@@ -215,7 +167,7 @@ impl<I: I2c> Emc2302<I> {
         // `Tach::EDGES` assumes when converting to RPM.
         const FAN_CONFIG1_5_EDGES: u8 = 0b01 << 3;
         for channel in [Channel::Fan1, Channel::Fan2] {
-            self.write_register(channel.base() + ofs::FAN_CONFIG1, FAN_CONFIG1_5_EDGES)
+            self.write_register(channel.base() + OFS_FAN_CONFIG1, FAN_CONFIG1_5_EDGES)
                 .await?;
         }
 
@@ -224,35 +176,26 @@ impl<I: I2c> Emc2302<I> {
     }
 
     /// Set the PWM output polarity for both channels.
-    pub async fn set_polarity(&mut self, invert: bool) -> Result<()> {
+    async fn set_polarity(&mut self, invert: bool) -> Result<()> {
         const BOTH_CHANNELS: u8 = 0x03;
         let value = if invert { BOTH_CHANNELS } else { 0x00 };
-        self.write_register(regs::POLARITY, value).await
+        self.write_register(REG_POLARITY, value).await
     }
 
     /// Drive a channel at the given duty cycle.
     pub async fn set_fan_speed(&mut self, channel: Channel, speed: Percent) -> Result<()> {
         let duty = speed.of(Self::PWM_MAX);
-        self.write_register(channel.base() + ofs::FAN_SETTING, duty)
+        self.write_register(channel.base() + OFS_FAN_SETTING, duty)
             .await
-    }
-
-    /// Read back the duty cycle currently commanded on a channel.
-    pub async fn get_fan_speed(&mut self, channel: Channel) -> Result<Percent> {
-        let duty = self
-            .read_register(channel.base() + ofs::FAN_SETTING)
-            .await?;
-        let percent = ((duty as u16 * 100) / Self::PWM_MAX as u16) as u8;
-        Ok(Percent::new_clamped(percent))
     }
 
     /// Read a channel's raw tachometer count.
     pub async fn get_tach(&mut self, channel: Channel) -> Result<Tach> {
         let msb = self
-            .read_register(channel.base() + ofs::TACH_READING_MSB)
+            .read_register(channel.base() + OFS_TACH_READING_MSB)
             .await?;
         let lsb = self
-            .read_register(channel.base() + ofs::TACH_READING_LSB)
+            .read_register(channel.base() + OFS_TACH_READING_LSB)
             .await?;
 
         // 13-bit count split across the pair: the low 3 bits of LSB are

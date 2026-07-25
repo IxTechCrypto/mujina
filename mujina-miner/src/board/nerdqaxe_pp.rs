@@ -1,25 +1,33 @@
 //! NerdQAxe++ hash board support
 //!
-//! Four BM1370 ASICs on a shared, stacked core-voltage domain, driven by an
+//! Four BM1370 ASICs sharing a single core rail in parallel, driven by an
 //! ESP32-S3 running bitaxe-raw. Same USB control pattern as the Bitaxe Gamma
 //! and emberOne/00: the host owns all chip and peripheral logic, the ESP32 is
 //! a transport bridge.
 //!
-//! Scope: this brings the board up far enough to enumerate the chain. Hashing
-//! needs multi-chip enumeration in `BM13xxThread`, which is not implemented
-//! yet, so no hash threads are handed back. Power (TPS53647) and fan/thermal
-//! (EMC2302, TMP1075) control land with that work; the rails come up at their
-//! hardware defaults here, which is enough for discovery but not for
-//! sustained hashing.
+//! The core rail is a 3-phase TPS53647 at roughly 1.15 V and up to 90 A. It
+//! is *not* a stacked/series voltage domain, so the commanded output is the
+//! per-chip core voltage directly, not a multiple of it.
+//!
+//! Scope: the chain is enumerated, then **parked** -- reset asserted, core
+//! and IO rails off. Hashing needs a real `BM13xxThread` over the chain,
+//! which also has to keep those rails up, and that is not implemented yet,
+//! so no hash threads are handed back.
+//!
+//! The management peripherals (TPS53647, EMC2302, TMP1075) are brought up
+//! and polled regardless, because they sit on the always-on +3V3 rail and
+//! stay readable with the core rail parked. The regulator is identified and
+//! configured but its output is deliberately left off.
 
 use anyhow::{Context as _, Result, bail};
 use std::time::Duration;
 use tokio::{
-    sync::watch,
+    sync::{mpsc, watch},
     time::{self, Instant},
 };
 use tokio_serial::SerialPortBuilderExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio_util::sync::CancellationToken;
 
 use super::{
     BackplaneConnector, BoardDescriptor, BoardInfo,
@@ -27,15 +35,25 @@ use super::{
     pattern::{BoardPattern, Match},
 };
 use crate::{
-    api_client::types::BoardTelemetry,
+    api::{BoardCommand, commands::FanControlUpdate},
+    api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
     asic::bm13xx,
-    hw_trait::gpio::{Gpio, GpioPin, PinValue},
+    hw_trait::{
+        gpio::{Gpio, GpioPin, PinValue},
+        i2c::I2c as _,
+    },
     mgmt_protocol::{
         ControlChannel,
-        bitaxe_raw::{ResponseFormat, gpio::BitaxeRawGpioController},
+        bitaxe_raw::{ResponseFormat, gpio::BitaxeRawGpioController, i2c::BitaxeRawI2c},
+    },
+    peripheral::{
+        emc2302::{Emc2302, Percent},
+        tmp1075::Tmp1075,
+        tps53647::{Tps53647, Tps53647Config},
     },
     tracing::prelude::*,
     transport::{UsbDeviceInfo, serial::SerialStream},
+    types::Temperature,
 };
 
 inventory::submit! {
@@ -123,13 +141,17 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         serial_number: device.serial_number.clone(),
     };
 
+    let board_name = format!(
+        "nerdqaxe-pp-{}",
+        info.serial_number.as_deref().unwrap_or("unknown")
+    );
+
     let telemetry = BoardTelemetry {
-        name: format!(
-            "nerdqaxe-pp-{}",
-            info.serial_number.as_deref().unwrap_or("unknown")
-        ),
+        name: board_name.clone(),
         model: info.model.clone(),
         serial: info.serial_number.clone(),
+        chip_model: Some("BM1370".into()),
+        chip_count: Some(EXPECTED_CHIPS as u32),
         // No hash threads yet (`threads: Vec::new()` below), so this board
         // contributes nothing to the aggregate hashrate. Stated explicitly
         // rather than left to `Default` so it has to be revisited when
@@ -141,26 +163,319 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 
     warn!("NerdQAxe++ hash threads not yet implemented (needs multi-chip chain support)");
 
-    // Keep the telemetry sender alive for the board's lifetime. The API's
-    // registry drops any board whose sender has been released
-    // (`BoardRegistry::boards` filters on `telemetry_rx.has_changed()`), so
-    // dropping it here would make the board vanish from the dashboard the
-    // moment it connects. There is no live sensor task yet — that arrives
-    // with the EMC2302/TMP1075 drivers — so the sender is simply parked in
-    // the shutdown future and released when the board goes away.
+    // Bring up the management peripherals. These all sit on the always-on
+    // +3V3 rail, so they are readable with the ASIC core rail parked --
+    // which is exactly the state this board is left in until hash threads
+    // land. Sensor telemetry therefore works without energizing anything.
+    let mut i2c = BitaxeRawI2c::new(control.clone());
+    i2c.set_frequency(I2C_FREQUENCY_HZ).await?;
+
+    let sensors = Sensors::new(i2c).await?;
+
+    let (command_tx, command_rx) = mpsc::channel::<BoardCommand>(8);
+    let cancel = CancellationToken::new();
+    let monitor = NerdQaxePp {
+        sensors,
+        board_name,
+        board_serial: info.serial_number.clone(),
+        fan_percent: DEFAULT_FAN_PERCENT,
+    };
+    let monitor_handle = tokio::spawn(monitor.run(telemetry_tx, command_rx, cancel.clone()));
+
     let shutdown = Box::pin(async move {
-        drop(telemetry_tx);
+        cancel.cancel();
+        let _ = monitor_handle.await;
     });
 
     Ok(BackplaneConnector {
         info,
         threads: Vec::new(),
         telemetry_rx,
-        // No runtime commands until fan/frequency control lands with the
-        // EMC2302 and TPS53647 drivers.
-        command_tx: None,
+        command_tx: Some(command_tx),
         shutdown: Some(shutdown),
     })
+}
+
+/// I2C bus speed. Standard mode; every device on this bus supports it and
+/// nothing here needs the throughput of fast mode.
+const I2C_FREQUENCY_HZ: u32 = 100_000;
+
+/// Interval between sensor sweeps.
+const MONITOR_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Fan duty applied at startup.
+///
+/// Deliberately high. The board is parked with its core rail off so it is
+/// barely dissipating anything, but there is no automatic fan curve on
+/// this board yet, so whatever is set here is what runs until someone
+/// changes it. Erring loud is recoverable; erring quiet is not.
+const DEFAULT_FAN_PERCENT: u8 = 80;
+
+/// I2C addresses of the board's sensors.
+mod i2c_addr {
+    /// TMP1075N near the ASICs.
+    pub const TMP1075_ASIC: u8 = 0x48;
+    /// TMP1075N on the back, next to the regulator.
+    pub const TMP1075_VR: u8 = 0x49;
+}
+
+/// Fan header to EMC2302 channel mapping.
+///
+/// The silkscreen labels and the silicon's channel numbering do not run
+/// in the same order, so the mapping is spelled out rather than inferred
+/// from an index.
+mod fan {
+    use crate::peripheral::emc2302::Channel;
+
+    /// M1, the regulator fan.
+    pub const M1: Channel = Channel::Fan1;
+    /// M2, the ASIC fan.
+    pub const M2: Channel = Channel::Fan2;
+}
+
+/// The board's management peripherals, once identified.
+struct Sensors {
+    fans: Emc2302<BitaxeRawI2c>,
+    temp_asic: Tmp1075<BitaxeRawI2c>,
+    temp_vr: Tmp1075<BitaxeRawI2c>,
+    regulator: Tps53647<BitaxeRawI2c>,
+}
+
+impl Sensors {
+    /// Identify and configure every peripheral on the I2C bus.
+    ///
+    /// The regulator is configured but its output is left **off**: this
+    /// function must not energize the core rail.
+    async fn new(i2c: BitaxeRawI2c) -> Result<Self> {
+        // Temperature sensors first. They are the simplest transaction on
+        // the bus, so a failure here means the bus itself is wrong rather
+        // than any particular driver -- much easier to read in a log than
+        // a PMBus timeout would be.
+        //
+        // These are TMP1075N parts, which have no Die ID register, so
+        // `probe` is the identification path rather than `init`.
+        let mut temp_asic = Tmp1075::new(i2c.clone(), i2c_addr::TMP1075_ASIC);
+        let asic_c = temp_asic
+            .probe()
+            .await
+            .context("TMP1075 (ASIC) not responding")?;
+
+        let mut temp_vr = Tmp1075::new(i2c.clone(), i2c_addr::TMP1075_VR);
+        let vr_c = temp_vr
+            .probe()
+            .await
+            .context("TMP1075 (VR) not responding")?;
+
+        debug!(
+            asic_c = asic_c.as_degrees_c(),
+            vr_c = vr_c.as_degrees_c(),
+            "NerdQAxe++ temperature sensors online"
+        );
+
+        let mut fans = Emc2302::new(i2c.clone());
+        fans.init(false).await.context("EMC2302 init failed")?;
+
+        let mut regulator = Tps53647::new(i2c, Tps53647Config::NERDQAXE_PP);
+        regulator.init().await.context("TPS53647 init failed")?;
+
+        Ok(Self {
+            fans,
+            temp_asic,
+            temp_vr,
+            regulator,
+        })
+    }
+}
+
+/// State owned by the board monitor task.
+struct NerdQaxePp {
+    sensors: Sensors,
+    board_name: String,
+    board_serial: Option<String>,
+    /// Commanded fan duty, applied to both headers.
+    fan_percent: u8,
+}
+
+impl NerdQaxePp {
+    async fn run(
+        mut self,
+        telemetry_tx: watch::Sender<BoardTelemetry>,
+        mut command_rx: mpsc::Receiver<BoardCommand>,
+        cancel: CancellationToken,
+    ) {
+        if let Err(e) = self.apply_fan_speed().await {
+            warn!(error = %e, "failed to apply initial NerdQAxe++ fan speed");
+        }
+
+        let mut ticker = time::interval(MONITOR_INTERVAL);
+        ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        ticker.tick().await; // discard the immediate first tick
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                Some(command) = command_rx.recv() => self.handle_command(command).await,
+                _ = ticker.tick() => self.publish(&telemetry_tx).await,
+            }
+        }
+
+        debug!("NerdQAxe++ monitor stopped");
+    }
+
+    async fn handle_command(&mut self, command: BoardCommand) {
+        match command {
+            BoardCommand::SetFanControl { update, reply } => {
+                let result = match update {
+                    // No automatic curve on this board yet: without hash
+                    // threads there is no load to track, and inventing a
+                    // curve now would mean rewriting it once there is.
+                    FanControlUpdate { auto: true, .. } => Err(anyhow::anyhow!(
+                        "automatic fan control is not implemented on the NerdQAxe++ yet"
+                    )),
+                    FanControlUpdate {
+                        percent: Some(percent),
+                        ..
+                    } => {
+                        self.fan_percent = percent.min(100);
+                        self.apply_fan_speed().await
+                    }
+                    // Manual mode with no duty given: nothing to change.
+                    FanControlUpdate { percent: None, .. } => Ok(()),
+                };
+                let _ = reply.send(result);
+            }
+            BoardCommand::SetCoreVoltage { reply, .. } => {
+                // Refused rather than applied: the rail is parked off and
+                // nothing is hashing, so setting a core voltage would only
+                // energize four ASICs with no thermal supervision.
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "NerdQAxe++ core rail stays off until hash threads are implemented"
+                )));
+            }
+            BoardCommand::SetFrequency { reply, .. } => {
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "NerdQAxe++ has no hash threads to retune yet"
+                )));
+            }
+        }
+    }
+
+    async fn apply_fan_speed(&mut self) -> Result<()> {
+        let percent = Percent::new_clamped(self.fan_percent);
+        for channel in [fan::M1, fan::M2] {
+            self.sensors
+                .fans
+                .set_fan_speed(channel, percent)
+                .await
+                .with_context(|| format!("failed to set {channel:?} speed"))?;
+        }
+        Ok(())
+    }
+
+    /// Read every sensor and publish a telemetry snapshot.
+    ///
+    /// Each read is independent: one failing sensor reports null for its
+    /// own fields rather than blanking the whole snapshot, so a single
+    /// flaky device does not make the board look disconnected.
+    async fn publish(&mut self, tx: &watch::Sender<BoardTelemetry>) {
+        let asic_c = self.read_temp(true).await;
+        let vr_c = self.read_temp(false).await;
+
+        let mut fans = Vec::with_capacity(2);
+        for (name, channel) in [("M1", fan::M1), ("M2", fan::M2)] {
+            let rpm = match self.sensors.fans.get_rpm(channel).await {
+                Ok(rpm) => rpm,
+                Err(e) => {
+                    warn!(fan = name, error = %e, "EMC2302 tach read failed");
+                    None
+                }
+            };
+            fans.push(Fan {
+                name: name.into(),
+                rpm,
+                percent: Some(self.fan_percent),
+                target_percent: Some(self.fan_percent),
+                // No automatic mode on this board yet, so this is always
+                // manual rather than null -- null would imply the board
+                // has no controllable policy at all.
+                auto: Some(false),
+                target_c: None,
+                min_percent: None,
+            });
+        }
+
+        let regulator = &mut self.sensors.regulator;
+        let vin = regulator.vin().await.ok();
+        let vout = regulator.vout().await.ok();
+        let iout = regulator.iout().await.ok();
+        let vr_internal_c = regulator.temperature().await.ok();
+
+        let powers = vec![
+            PowerMeasurement {
+                name: "input".into(),
+                voltage_v: vin,
+                current_a: None,
+                power_w: None,
+            },
+            PowerMeasurement {
+                name: "core".into(),
+                voltage_v: vout,
+                current_a: iout,
+                // Computed rather than read: the part exposes input power,
+                // not output power, and V*I at the output is the number
+                // the dashboard's efficiency figure needs.
+                power_w: vout.zip(iout).map(|(v, i)| v * i),
+            },
+        ];
+
+        let mut temperatures = vec![
+            TemperatureSensor {
+                name: "asic".into(),
+                temperature: asic_c,
+            },
+            TemperatureSensor {
+                name: "vr".into(),
+                temperature: vr_c,
+            },
+        ];
+        if let Some(c) = vr_internal_c {
+            temperatures.push(TemperatureSensor {
+                name: "vr-internal".into(),
+                temperature: Some(Temperature::from_celsius(c)),
+            });
+        }
+
+        let _ = tx.send(BoardTelemetry {
+            name: self.board_name.clone(),
+            model: "NerdQAxe++".into(),
+            serial: self.board_serial.clone(),
+            chip_model: Some("BM1370".into()),
+            chip_count: Some(EXPECTED_CHIPS as u32),
+            // No hash clock is being driven while the chain is parked.
+            frequency_mhz: None,
+            fans,
+            temperatures,
+            powers,
+            threads: Vec::new(),
+            thread_count: 0,
+        });
+    }
+
+    /// Read one temperature sensor, logging and nulling out on failure.
+    async fn read_temp(&mut self, asic: bool) -> Option<Temperature> {
+        let (label, sensor) = if asic {
+            ("asic", &mut self.sensors.temp_asic)
+        } else {
+            ("vr", &mut self.sensors.temp_vr)
+        };
+        match sensor.read().await {
+            Ok(reading) => Some(Temperature::from_celsius(reading.as_degrees_c())),
+            Err(e) => {
+                warn!(sensor = label, error = %e, "TMP1075 read failed");
+                None
+            }
+        }
+    }
 }
 
 /// Power up the core and IO rails, release the chain from reset, and

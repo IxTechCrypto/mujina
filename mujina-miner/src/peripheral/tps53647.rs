@@ -197,20 +197,6 @@ impl<I: I2c> Tps53647<I> {
         }
     }
 
-    /// Create a driver bound to a specific address.
-    pub fn new_with_address(i2c: I, address: u8, config: Tps53647Config) -> Self {
-        Self {
-            i2c,
-            address,
-            config,
-        }
-    }
-
-    /// The configuration this driver was built with.
-    pub fn config(&self) -> &Tps53647Config {
-        &self.config
-    }
-
     /// Read the device code without configuring anything.
     ///
     /// Safe to call before [`init`](Self::init) as a presence check.
@@ -218,11 +204,23 @@ impl<I: I2c> Tps53647<I> {
         Ok(self.read_word(mfr::DEVICE_CODE).await?)
     }
 
-    /// Identify and configure the regulator, leaving the output **off**.
+    /// Identify the regulator and configure its phase, current and
+    /// temperature limits.
     ///
-    /// The output stays disabled until [`set_vout`](Self::set_vout) is
-    /// called: bringing a 90 A rail up at whatever voltage happened to be
-    /// in NVM is not something to do as a side effect of initialization.
+    /// # This does not gate the output
+    ///
+    /// Whether the rail is live is decided by the ENABLE pin, which this
+    /// driver does not own -- the board holds it. Calling `init` on a
+    /// board that already has ENABLE asserted **will** leave a live rail.
+    /// Callers must have the enable line low first.
+    ///
+    /// What `init` does guarantee is the *voltage* the rail would come up
+    /// at: `RESTORE_DEFAULT_ALL` reloads VOUT_COMMAND from NVM, so the
+    /// last step here overwrites it with the bottom of the configured
+    /// window. Without that, enabling the rail later would bring four
+    /// ASICs up at whatever voltage happened to be stored -- the factory
+    /// default is 1.000 V, comfortably live. Coming up at the floor is
+    /// recoverable; coming up at an unknown voltage is not.
     pub async fn init(&mut self) -> DriverResult<()> {
         let code = self.device_code().await?;
         if code != DEVICE_CODE {
@@ -276,11 +274,16 @@ impl<I: I2c> Tps53647<I> {
         self.write_linear11(PmbusCommand::IoutOcFaultLimit.as_u8(), self.config.ifault_a)
             .await?;
 
+        // Leave a known voltage behind, overwriting whatever
+        // RESTORE_DEFAULT_ALL loaded. See the note on this function.
+        self.set_vout(self.config.vout_min_v).await?;
+
         debug!(
             phases = self.config.phases,
             imax_a = self.config.imax_a,
             ifault_a = self.config.ifault_a,
-            "TPS53647 configured, output still off"
+            vout_v = self.config.vout_min_v,
+            "TPS53647 configured; rail will come up at the window floor when enabled"
         );
         Ok(())
     }
@@ -310,13 +313,6 @@ impl<I: I2c> Tps53647<I> {
         Ok(())
     }
 
-    /// Turn the output off.
-    pub async fn set_output_off(&mut self) -> DriverResult<()> {
-        self.write_word(PmbusCommand::VoutCommand.as_u8(), Vid::OFF.raw() as u16)
-            .await?;
-        Ok(())
-    }
-
     /// Read the measured output voltage, in volts.
     ///
     /// Uses the manufacturer register rather than `READ_VOUT`: the value
@@ -341,24 +337,6 @@ impl<I: I2c> Tps53647<I> {
     pub async fn temperature(&mut self) -> DriverResult<f32> {
         self.read_linear11(PmbusCommand::ReadTemperature1.as_u8())
             .await
-    }
-
-    /// Read the input power, in watts.
-    pub async fn pin(&mut self) -> DriverResult<f32> {
-        /// READ_PIN. Not in the shared command enum yet.
-        const READ_PIN: u8 = 0x97;
-        self.read_linear11(READ_PIN).await
-    }
-
-    /// Read the summary status word.
-    pub async fn status(&mut self) -> DriverResult<u16> {
-        Ok(self.read_word(PmbusCommand::StatusWord.as_u8()).await?)
-    }
-
-    /// Clear latched fault flags.
-    pub async fn clear_faults(&mut self) -> DriverResult<()> {
-        self.write_command(PmbusCommand::ClearFaults).await?;
-        Ok(())
     }
 
     /// Reload all settings from NVM.
