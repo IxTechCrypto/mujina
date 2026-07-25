@@ -251,6 +251,11 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     })
 }
 
+/// How long to hold the core rail down before bringing it back up, so the
+/// bulk output capacitance actually discharges and the ASICs lose state.
+/// Too short and the chips keep their chain addresses across a restart.
+const POWER_DOWN_SETTLE: Duration = Duration::from_millis(500);
+
 /// Core voltage commanded before the rail is enabled, in volts.
 ///
 /// The reference firmware runs this board at 1.15 V for its four BM1370,
@@ -669,6 +674,19 @@ async fn enumerate_chain(
     data_reader: &mut ChainReader,
     data_writer: &mut ChainWriter,
 ) -> Result<Vec<crate::asic::ChipInfo>> {
+    // Start from a known-off state rather than assuming one.
+    //
+    // The daemon does not always get to tear the board down on the way out
+    // -- a kill, a crash, or simply exiting before the hash thread finishes
+    // disabling leaves the rail up and the chips still carrying the chain
+    // addresses from the previous session. Enumerating into that reports
+    // the wrong chip count (observed: 8 on a 4-chip chain) and the board is
+    // then rejected for as long as the daemon runs. Dropping the core rail
+    // first makes the chips forget everything, so discovery always starts
+    // from silicon reset.
+    power.park().await;
+    time::sleep(POWER_DOWN_SETTLE).await;
+
     // Everything from here on energizes the board, so a failure partway
     // through must not strand it live. `park` runs whatever the outcome.
     let result = async {
