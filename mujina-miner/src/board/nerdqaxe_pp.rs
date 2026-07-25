@@ -9,20 +9,22 @@
 //! is *not* a stacked/series voltage domain, so the commanded output is the
 //! per-chip core voltage directly, not a multiple of it.
 //!
-//! Scope: the chain is enumerated, then **parked** -- reset asserted, core
-//! and IO rails off. Hashing needs a real `BM13xxThread` over the chain,
-//! which also has to keep those rails up, and that is not implemented yet,
-//! so no hash threads are handed back.
+//! The board is enumerated once at construction and then parked. From that
+//! point the hash thread owns the power sequence: [`NerdQaxePpAsicEnable`]
+//! commands the core voltage, brings the IO and core rails up in order,
+//! waits for the regulator, and releases reset -- and unwinds all of it on
+//! disable. Nothing else in this module energizes the rail, so there is a
+//! single path to audit.
 //!
-//! The management peripherals (TPS53647, EMC2302, TMP1075) are brought up
-//! and polled regardless, because they sit on the always-on +3V3 rail and
-//! stay readable with the core rail parked. The regulator is identified and
-//! configured but its output is deliberately left off.
+//! The management peripherals (TPS53647, EMC2302, TMP1075) sit on the
+//! always-on +3V3 rail and are polled whatever the core rail is doing.
 
 use anyhow::{Context as _, Result, bail};
+use async_trait::async_trait;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{Mutex, mpsc, watch},
     time::{self, Instant},
 };
 use tokio_serial::SerialPortBuilderExt;
@@ -37,14 +39,22 @@ use super::{
 use crate::{
     api::{BoardCommand, commands::FanControlUpdate},
     api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
-    asic::bm13xx,
+    asic::{
+        bm13xx,
+        bm13xx::thread::{BM13xxThread, FrequencyControl},
+        hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
+    },
     hw_trait::{
         gpio::{Gpio, GpioPin, PinValue},
         i2c::I2c as _,
     },
     mgmt_protocol::{
         ControlChannel,
-        bitaxe_raw::{ResponseFormat, gpio::BitaxeRawGpioController, i2c::BitaxeRawI2c},
+        bitaxe_raw::{
+            ResponseFormat,
+            gpio::{BitaxeRawGpioController, BitaxeRawGpioPin},
+            i2c::BitaxeRawI2c,
+        },
     },
     peripheral::{
         emc2302::{Emc2302, Percent},
@@ -52,7 +62,10 @@ use crate::{
         tps53647::{Tps53647, Tps53647Config},
     },
     tracing::prelude::*,
-    transport::{UsbDeviceInfo, serial::SerialStream},
+    transport::{
+        UsbDeviceInfo,
+        serial::{SerialReader, SerialStream, SerialWriter},
+    },
     types::Temperature,
 };
 
@@ -108,9 +121,9 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 
     let mut gpio = BitaxeRawGpioController::new(control.clone());
     let mut asic_resetn = gpio.pin(gpio_cmd::ASIC_RESETN).await?;
-    let mut pwr_en = gpio.pin(gpio_cmd::PWR_EN).await?;
-    let mut ldo_en = gpio.pin(gpio_cmd::LDO_EN).await?;
-    let mut vr_rdy = gpio.pin(gpio_cmd::VR_RDY).await?;
+    let pwr_en = gpio.pin(gpio_cmd::PWR_EN).await?;
+    let ldo_en = gpio.pin(gpio_cmd::LDO_EN).await?;
+    let vr_rdy = gpio.pin(gpio_cmd::VR_RDY).await?;
 
     // Hold the chain in reset across the whole power-up. This write has
     // nothing to undo on failure, so it stays outside the guarded section.
@@ -129,36 +142,39 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     // never be reached.
     let mut i2c = BitaxeRawI2c::new(control.clone());
     i2c.set_frequency(I2C_FREQUENCY_HZ).await?;
-    let mut sensors = Sensors::new(i2c).await?;
+    let sensors = Sensors::new(i2c).await?;
 
-    // Everything from here on energizes the board or takes the chain out of
-    // reset, so a failure partway through must not strand it live and
-    // unsupervised. `park()` always runs before this function returns,
-    // whether bring-up succeeded or failed.
-    let bring_up = bring_up_chain(
-        &serial_ports[1],
-        &mut asic_resetn,
-        &mut pwr_en,
-        &mut ldo_en,
-        &mut vr_rdy,
-    )
-    .await;
+    // The data port is opened once and kept: enumeration and the hash
+    // thread share the same framed pair, so there is only ever one owner
+    // of the chain's UART.
+    let data_stream =
+        SerialStream::new(&serial_ports[1], 115200).context("failed to open data port")?;
+    let (data_reader, data_writer, _data_control) = data_stream.split();
+    let mut data_reader =
+        FramedRead::new(TracingReader::new(data_reader, "Data"), bm13xx::FrameCodec);
+    let mut data_writer = FramedWrite::new(data_writer, bm13xx::FrameCodec);
 
-    park(&mut asic_resetn, &mut pwr_en, &mut ldo_en).await;
+    let mut power = NerdQaxePpAsicEnable {
+        asic_resetn,
+        pwr_en,
+        ldo_en,
+        vr_rdy,
+        regulator: Arc::clone(&sensors.regulator),
+        core_voltage_v: CORE_VOLTAGE_V,
+    };
+
+    let chain = enumerate_chain(&mut power, &mut data_reader, &mut data_writer).await;
 
     // A failed power-up is almost always the regulator refusing to start,
     // and from the outside every cause looks the same. Read the fault
     // registers while we still can, so the log says which one it was.
-    if bring_up.is_err() {
-        match sensors.regulator.status().await {
+    if chain.is_err() {
+        match sensors.regulator.lock().await.status().await {
             Ok(status) => warn!(%status, "TPS53647 status after failed bring-up"),
             Err(e) => warn!(error = %e, "could not read TPS53647 status after failed bring-up"),
         }
     }
-
-    // Chip details aren't consumed yet; discovery already logged the count.
-    // They'll feed hash-thread construction once chain support lands.
-    bring_up?;
+    let chip_infos = chain?;
 
     let info = BoardInfo {
         model: "NerdQAxe++".to_string(),
@@ -171,22 +187,42 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         info.serial_number.as_deref().unwrap_or("unknown")
     );
 
+    // Hand the chain to a hash thread. It owns the power sequence from
+    // here: the board is parked right now, and the thread brings it back
+    // up through `NerdQaxePpAsicEnable` when the scheduler assigns work.
+    let (thread_shutdown_tx, thread_shutdown_rx) = watch::channel(ThreadRemovalSignal::Running);
+    let thread_name = match &device.serial_number {
+        Some(serial) => format!("NerdQAxe-PP-{}", &serial[..8.min(serial.len())]),
+        None => "NerdQAxe-PP".to_string(),
+    };
+    let peripherals = BoardPeripherals {
+        asic_enable: Some(Box::new(power)),
+        // The regulator is reachable, but nothing tunes voltage at runtime
+        // on this board yet -- see the SetCoreVoltage arm of handle_command.
+        voltage_regulator: None,
+    };
+    let thread = BM13xxThread::new(
+        thread_name,
+        data_reader,
+        data_writer,
+        peripherals,
+        thread_shutdown_rx,
+        chip_infos.len(),
+    );
+    let freq_control = thread.frequency_control();
+    let threads: Vec<Box<dyn HashThread>> = vec![Box::new(thread)];
+
     let telemetry = BoardTelemetry {
         name: board_name.clone(),
         model: info.model.clone(),
         serial: info.serial_number.clone(),
         chip_model: Some("BM1370".into()),
-        chip_count: Some(EXPECTED_CHIPS as u32),
-        // No hash threads yet (`threads: Vec::new()` below), so this board
-        // contributes nothing to the aggregate hashrate. Stated explicitly
-        // rather than left to `Default` so it has to be revisited when
-        // multi-chip chain support lands.
-        thread_count: 0,
+        chip_count: Some(chip_infos.len() as u32),
+        frequency_mhz: Some(bm13xx::thread::TARGET_FREQUENCY_MHZ),
+        thread_count: threads.len() as u32,
         ..Default::default()
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(telemetry);
-
-    warn!("NerdQAxe++ hash threads not yet implemented (needs multi-chip chain support)");
 
     let (command_tx, command_rx) = mpsc::channel::<BoardCommand>(8);
     let cancel = CancellationToken::new();
@@ -195,6 +231,9 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         board_name,
         board_serial: info.serial_number.clone(),
         fan_percent: DEFAULT_FAN_PERCENT,
+        freq_control,
+        current_freq_mhz: bm13xx::thread::TARGET_FREQUENCY_MHZ,
+        thread_shutdown: thread_shutdown_tx,
     };
     let monitor_handle = tokio::spawn(monitor.run(telemetry_tx, command_rx, cancel.clone()));
 
@@ -205,12 +244,23 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 
     Ok(BackplaneConnector {
         info,
-        threads: Vec::new(),
+        threads,
         telemetry_rx,
         command_tx: Some(command_tx),
         shutdown: Some(shutdown),
     })
 }
+
+/// Core voltage commanded before the rail is enabled, in volts.
+///
+/// The reference firmware runs this board at 1.15 V for its four BM1370,
+/// and that is what the chips are specified around. It is a deliberate
+/// constant rather than something inherited from the regulator's NVM,
+/// because this single number is what four ASICs in parallel are fed.
+///
+/// Runtime tuning does not touch it yet: `SetCoreVoltage` is refused, so
+/// the rail only ever runs here.
+const CORE_VOLTAGE_V: f32 = 1.15;
 
 /// I2C bus speed. Standard mode; every device on this bus supports it and
 /// nothing here needs the throughput of fast mode.
@@ -254,7 +304,10 @@ struct Sensors {
     fans: Emc2302<BitaxeRawI2c>,
     temp_asic: Tmp1075<BitaxeRawI2c>,
     temp_vr: Tmp1075<BitaxeRawI2c>,
-    regulator: Tps53647<BitaxeRawI2c>,
+    /// Shared with [`NerdQaxePpAsicEnable`], which commands the core
+    /// voltage on the power-up path while the monitor reads measurements
+    /// from the same part.
+    regulator: Arc<Mutex<Tps53647<BitaxeRawI2c>>>,
 }
 
 impl Sensors {
@@ -298,7 +351,7 @@ impl Sensors {
             fans,
             temp_asic,
             temp_vr,
-            regulator,
+            regulator: Arc::new(Mutex::new(regulator)),
         })
     }
 }
@@ -310,6 +363,13 @@ struct NerdQaxePp {
     board_serial: Option<String>,
     /// Commanded fan duty, applied to both headers.
     fan_percent: u8,
+    /// Handle for retuning the chain's hash clock.
+    freq_control: FrequencyControl,
+    /// Last hash clock commanded, in MHz. Reported in telemetry.
+    current_freq_mhz: f32,
+    /// Removes the hash thread when the board goes away, so the chain is
+    /// not left hashing against a board that no longer exists.
+    thread_shutdown: watch::Sender<ThreadRemovalSignal>,
 }
 
 impl NerdQaxePp {
@@ -334,6 +394,13 @@ impl NerdQaxePp {
                 _ = ticker.tick() => self.publish(&telemetry_tx).await,
             }
         }
+
+        // Tear the hash thread down before returning. The thread owns the
+        // enable path, so this is what actually de-energizes the rail: the
+        // board disappearing must not leave four ASICs hashing unattended.
+        let _ = self
+            .thread_shutdown
+            .send(ThreadRemovalSignal::BoardDisconnected);
 
         debug!("NerdQAxe++ monitor stopped");
     }
@@ -361,17 +428,22 @@ impl NerdQaxePp {
                 let _ = reply.send(result);
             }
             BoardCommand::SetCoreVoltage { reply, .. } => {
-                // Refused rather than applied: the rail is parked off and
-                // nothing is hashing, so setting a core voltage would only
-                // energize four ASICs with no thermal supervision.
+                // Refused deliberately. The rail is commanded once, at
+                // CORE_VOLTAGE_V, on the power-up path. Retuning it means
+                // moving four parallel ASICs on a 90 A rail while they are
+                // hashing, and nothing here supervises that yet -- there is
+                // no automatic fan curve to answer the extra heat with.
                 let _ = reply.send(Err(anyhow::anyhow!(
-                    "NerdQAxe++ core rail stays off until hash threads are implemented"
+                    "NerdQAxe++ core voltage is fixed at {CORE_VOLTAGE_V} V; \
+                     runtime tuning is not implemented"
                 )));
             }
-            BoardCommand::SetFrequency { reply, .. } => {
-                let _ = reply.send(Err(anyhow::anyhow!(
-                    "NerdQAxe++ has no hash threads to retune yet"
-                )));
+            BoardCommand::SetFrequency { mhz, reply } => {
+                let result = self.freq_control.set(mhz).await;
+                if result.is_ok() {
+                    self.current_freq_mhz = mhz;
+                }
+                let _ = reply.send(result);
             }
         }
     }
@@ -420,11 +492,18 @@ impl NerdQaxePp {
             });
         }
 
-        let regulator = &mut self.sensors.regulator;
-        let vin = regulator.vin().await.ok();
-        let vout = regulator.vout().await.ok();
-        let iout = regulator.iout().await.ok();
-        let vr_internal_c = regulator.temperature().await.ok();
+        // Held only for the duration of these four reads. The power-up path
+        // takes the same lock to command the core voltage, and blocking a
+        // rail bring-up behind a telemetry sweep would be a poor trade.
+        let (vin, vout, iout, vr_internal_c) = {
+            let mut regulator = self.sensors.regulator.lock().await;
+            (
+                regulator.vin().await.ok(),
+                regulator.vout().await.ok(),
+                regulator.iout().await.ok(),
+                regulator.temperature().await.ok(),
+            )
+        };
 
         let powers = vec![
             PowerMeasurement {
@@ -467,13 +546,14 @@ impl NerdQaxePp {
             serial: self.board_serial.clone(),
             chip_model: Some("BM1370".into()),
             chip_count: Some(EXPECTED_CHIPS as u32),
-            // No hash clock is being driven while the chain is parked.
-            frequency_mhz: None,
+            frequency_mhz: Some(self.current_freq_mhz),
             fans,
             temperatures,
             powers,
+            // Per-thread hashrate accounting does not exist yet, so this
+            // stays empty and `thread_count` carries the fact instead.
             threads: Vec::new(),
-            thread_count: 0,
+            thread_count: 1,
         });
     }
 
@@ -494,88 +574,141 @@ impl NerdQaxePp {
     }
 }
 
-/// Power up the core and IO rails, release the chain from reset, and
-/// enumerate the chips.
+/// Owns the board's power sequence and presents it to the hash thread as
+/// a plain enable/disable.
 ///
-/// Callers must always run [`park`] after this returns, `Ok` or `Err`: on
-/// error the rails may be partway through power-up (any point from IO rails
-/// on through chain enumeration) and must still be de-energized.
-async fn bring_up_chain(
-    data_port: &str,
-    asic_resetn: &mut impl GpioPin,
-    pwr_en: &mut impl GpioPin,
-    ldo_en: &mut impl GpioPin,
-    vr_rdy: &mut impl GpioPin,
-) -> Result<Vec<crate::asic::ChipInfo>> {
-    // IO rails before the core rail, so the chips never see IO driven while
-    // unpowered.
-    ldo_en.write(PinValue::High).await?;
-    // MCP1824 settles in ~0.2 ms; round up for the pair.
-    time::sleep(Duration::from_millis(5)).await;
-
-    pwr_en.write(PinValue::High).await?;
-    wait_for_vr_rdy(vr_rdy).await?;
-
-    let data_stream = SerialStream::new(data_port, 115200).context("failed to open data port")?;
-    let (data_reader, data_writer, _data_control) = data_stream.split();
-    let mut data_reader =
-        FramedRead::new(TracingReader::new(data_reader, "Data"), bm13xx::FrameCodec);
-    let mut data_writer = FramedWrite::new(data_writer, bm13xx::FrameCodec);
-
-    // Release the chain; discover_chain waits for the chip UARTs to boot,
-    // sends the version-mask preamble, and retries.
-    debug!("De-asserting ASIC nRST");
-    asic_resetn.write(PinValue::High).await?;
-
-    let chip_infos = discover_chain(&mut data_reader, &mut data_writer).await?;
-    debug!(count = chip_infos.len(), "Discovered chips");
-
-    if let Some(first) = chip_infos.first()
-        && first.chip_id != EXPECTED_CHIP_ID
-    {
-        bail!(
-            "wrong chip type for NerdQAxe++: expected BM1370 ({:02x}{:02x}), found {:02x}{:02x}",
-            EXPECTED_CHIP_ID[0],
-            EXPECTED_CHIP_ID[1],
-            first.chip_id[0],
-            first.chip_id[1]
-        );
-    }
-
-    // A short chain means a chip failed to enumerate. Report it rather than
-    // running a partially-populated board.
-    if chip_infos.len() != EXPECTED_CHIPS {
-        bail!(
-            "expected {EXPECTED_CHIPS} BM1370 on the chain, discovered {}",
-            chip_infos.len()
-        );
-    }
-
-    Ok(chip_infos)
+/// The whole rail is behind this, not just the reset line the Bitaxe's
+/// equivalent controls: on this board "enable the ASICs" means commanding
+/// a core voltage, bringing up the IO and core rails in order, waiting for
+/// the regulator, and only then releasing reset. Disabling unwinds all of
+/// it. Keeping that in one place is what stops the rail being left live by
+/// a path that forgot to tear it down.
+#[derive(Clone)]
+struct NerdQaxePpAsicEnable {
+    asic_resetn: BitaxeRawGpioPin,
+    pwr_en: BitaxeRawGpioPin,
+    ldo_en: BitaxeRawGpioPin,
+    vr_rdy: BitaxeRawGpioPin,
+    regulator: Arc<Mutex<Tps53647<BitaxeRawI2c>>>,
+    /// Core voltage commanded before the rail is enabled.
+    core_voltage_v: f32,
 }
 
-/// De-energize the board: assert reset, then drop the core rail and the IO
-/// rails.
+#[async_trait]
+impl AsicEnable for NerdQaxePpAsicEnable {
+    async fn enable(&mut self) -> Result<()> {
+        // Voltage first, while the output is still gated off.
+        //
+        // `Tps53647::init` deliberately leaves VOUT_COMMAND alone, so
+        // without this the rail would come up at whatever the part holds
+        // in NVM. This is the one place that decides what four ASICs in
+        // parallel are fed, so it is explicit rather than inherited.
+        self.regulator
+            .lock()
+            .await
+            .set_vout(self.core_voltage_v)
+            .await
+            .context("failed to command NerdQAxe++ core voltage")?;
+
+        // IO rails before the core rail, so the chips never see IO driven
+        // while unpowered.
+        self.ldo_en.write(PinValue::High).await?;
+        // MCP1824 settles in ~0.2 ms; round up for the pair.
+        time::sleep(Duration::from_millis(5)).await;
+
+        self.pwr_en.write(PinValue::High).await?;
+        wait_for_vr_rdy(&mut self.vr_rdy).await?;
+
+        debug!(
+            core_voltage_v = self.core_voltage_v,
+            "NerdQAxe++ core rail up; releasing ASIC reset"
+        );
+        self.asic_resetn.write(PinValue::High).await?;
+        Ok(())
+    }
+
+    async fn disable(&mut self) -> Result<()> {
+        self.park().await;
+        Ok(())
+    }
+}
+
+impl NerdQaxePpAsicEnable {
+    /// De-energize the board: assert reset, then drop the core rail and
+    /// the IO rails.
+    ///
+    /// Best-effort: each write is attempted independently and a failure is
+    /// logged rather than short-circuiting the rest, since this is the only
+    /// thing standing between the board and being left powered and
+    /// unsupervised. A `warn!` here means the board may still be live and
+    /// needs a manual check (power-cycle the USB port).
+    async fn park(&mut self) {
+        if let Err(e) = self.asic_resetn.write(PinValue::Low).await {
+            warn!(error = %e, "failed to assert ASIC reset while parking NerdQAxe++");
+        }
+        if let Err(e) = self.pwr_en.write(PinValue::Low).await {
+            warn!(error = %e, "failed to disable core rail while parking NerdQAxe++");
+        }
+        if let Err(e) = self.ldo_en.write(PinValue::Low).await {
+            warn!(error = %e, "failed to disable IO rails while parking NerdQAxe++");
+        }
+    }
+}
+
+/// Framed halves of the chain's UART, shared by enumeration and the hash
+/// thread.
+type ChainReader = FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>;
+type ChainWriter = FramedWrite<SerialWriter, bm13xx::FrameCodec>;
+
+/// Enumerate the chain, leaving the board parked afterwards.
 ///
-/// Best-effort: each write is attempted independently and a failure is
-/// logged rather than short-circuiting the rest, since after a failed
-/// bring-up this is the only thing standing between the board and being
-/// left powered and unsupervised. A `warn!` here means the board may still
-/// be live and needs a manual check (power-cycle the USB port).
-async fn park(
-    asic_resetn: &mut impl GpioPin,
-    pwr_en: &mut impl GpioPin,
-    ldo_en: &mut impl GpioPin,
-) {
-    if let Err(e) = asic_resetn.write(PinValue::Low).await {
-        warn!(error = %e, "failed to assert ASIC reset while parking NerdQAxe++");
+/// Runs the same power sequence the hash thread will use, so enumeration
+/// exercises the real path rather than a parallel copy of it.
+async fn enumerate_chain(
+    power: &mut NerdQaxePpAsicEnable,
+    data_reader: &mut ChainReader,
+    data_writer: &mut ChainWriter,
+) -> Result<Vec<crate::asic::ChipInfo>> {
+    // Everything from here on energizes the board, so a failure partway
+    // through must not strand it live. `park` runs whatever the outcome.
+    let result = async {
+        power.enable().await?;
+
+        // discover_chain waits for the chip UARTs to boot, sends the
+        // version-mask preamble, and retries.
+        let chip_infos = discover_chain(data_reader, data_writer).await?;
+        debug!(count = chip_infos.len(), "Discovered chips");
+
+        if let Some(first) = chip_infos.first()
+            && first.chip_id != EXPECTED_CHIP_ID
+        {
+            bail!(
+                "wrong chip type for NerdQAxe++: expected BM1370 ({:02x}{:02x}), found {:02x}{:02x}",
+                EXPECTED_CHIP_ID[0],
+                EXPECTED_CHIP_ID[1],
+                first.chip_id[0],
+                first.chip_id[1]
+            );
+        }
+
+        // A short chain means a chip failed to enumerate. Report it rather
+        // than running a partially-populated board.
+        if chip_infos.len() != EXPECTED_CHIPS {
+            bail!(
+                "expected {EXPECTED_CHIPS} BM1370 on the chain, discovered {}",
+                chip_infos.len()
+            );
+        }
+
+        Ok(chip_infos)
     }
-    if let Err(e) = pwr_en.write(PinValue::Low).await {
-        warn!(error = %e, "failed to disable core rail while parking NerdQAxe++");
-    }
-    if let Err(e) = ldo_en.write(PinValue::Low).await {
-        warn!(error = %e, "failed to disable IO rails while parking NerdQAxe++");
-    }
+    .await;
+
+    // Park regardless. The hash thread powers the board back up on its own
+    // terms when the scheduler gives it work.
+    power.park().await;
+
+    result
 }
 
 /// Wait for the TPS53647 to report power-good.
