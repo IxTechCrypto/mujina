@@ -59,7 +59,7 @@ use crate::{
     peripheral::{
         emc2302::{Emc2302, Percent},
         tmp1075::Tmp1075,
-        tps53647::{Tps53647, Tps53647Config},
+        tps53647::{Tps53647, Tps53647Config, Vid},
     },
     tracing::prelude::*,
     transport::{
@@ -523,6 +523,34 @@ impl NerdQaxePp {
                 iout_a = iout.unwrap_or(0.0),
                 "NerdQAxe++ core rail"
             );
+
+            // The controller has been seen to drop back to its NVM default
+            // after the output is enabled, leaving the ASICs running well
+            // under their intended voltage. Nothing faults when that
+            // happens -- the chips draw full power and quietly get most of
+            // their results wrong -- so the only way to catch it is to keep
+            // checking what the rail was told.
+            //
+            // Half a VID step of slack, so this compares codes rather than
+            // chasing float equality.
+            let drifted = (cmd.to_volts() - CORE_VOLTAGE_V).abs() > Vid::STEP_V / 2.0;
+            if drifted {
+                warn!(
+                    expected_v = CORE_VOLTAGE_V,
+                    found_v = cmd.to_volts(),
+                    "NerdQAxe++ core voltage drifted from what was commanded; re-applying"
+                );
+                if let Err(e) = self
+                    .sensors
+                    .regulator
+                    .lock()
+                    .await
+                    .set_vout(CORE_VOLTAGE_V)
+                    .await
+                {
+                    warn!(error = %e, "failed to restore NerdQAxe++ core voltage");
+                }
+            }
         }
 
         let powers = vec![
@@ -638,6 +666,25 @@ impl AsicEnable for NerdQaxePpAsicEnable {
 
         self.pwr_en.write(PinValue::High).await?;
         wait_for_vr_rdy(&mut self.vr_rdy).await?;
+
+        // Command the voltage AGAIN, now that the rail is actually up.
+        //
+        // Enabling the output makes the controller reload VOUT_COMMAND from
+        // NVM, discarding what was set moments earlier: measured on hardware
+        // as a rail that read back 0xb5 (1.15 V) at write time and 0x97
+        // (1.000 V, the factory default) a few seconds later while hashing.
+        // The chips then ran 150 mV low at full clock, which is not visible
+        // as a fault anywhere -- they draw full power and simply get most of
+        // their results wrong.
+        //
+        // The pre-enable write above is kept so the rail never comes up at
+        // an unknown NVM voltage; this one is what it actually settles at.
+        self.regulator
+            .lock()
+            .await
+            .set_vout(self.core_voltage_v)
+            .await
+            .context("failed to re-apply NerdQAxe++ core voltage after power-up")?;
 
         debug!(
             core_voltage_v = self.core_voltage_v,
