@@ -23,8 +23,8 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 
 use super::{
     BackplaneConnector, BoardDescriptor, BoardInfo,
-    bitaxe::{TracingReader, discover_chips},
-    pattern::{BoardPattern, Match, StringMatch},
+    bitaxe::{TracingReader, discover_chain},
+    pattern::{BoardPattern, Match},
 };
 use crate::{
     api_client::types::BoardTelemetry,
@@ -41,11 +41,17 @@ use crate::{
 inventory::submit! {
     BoardDescriptor {
         pattern: BoardPattern {
-            vid: Match::Any,
-            pid: Match::Any,
+            // Match by VID:PID, same reasoning as the Bitaxe Gamma pattern:
+            // manufacturer/product string descriptors are not reliably
+            // readable on all platforms (observed on Windows), so VID:PID
+            // is the only discriminator trustworthy enough to rely on. The
+            // firmware uses a PID (0xcaf1) distinct from stock bitaxe-raw's
+            // 0xcafe specifically so this stays unambiguous.
+            vid: Match::Specific(0xc0de),
+            pid: Match::Specific(0xcaf1),
             bcd_device: Match::Any,
-            manufacturer: Match::Specific(StringMatch::Exact("shufps")),
-            product: Match::Specific(StringMatch::Exact("NerdQAxe++")),
+            manufacturer: Match::Any,
+            product: Match::Any,
             serial_pattern: Match::Any,
         },
         name: "NerdQAxe++",
@@ -126,9 +132,20 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         serial: info.serial_number.clone(),
         ..Default::default()
     };
-    let (_telemetry_tx, telemetry_rx) = watch::channel(telemetry);
+    let (telemetry_tx, telemetry_rx) = watch::channel(telemetry);
 
     warn!("NerdQAxe++ hash threads not yet implemented (needs multi-chip chain support)");
+
+    // Keep the telemetry sender alive for the board's lifetime. The API's
+    // registry drops any board whose sender has been released
+    // (`BoardRegistry::boards` filters on `telemetry_rx.has_changed()`), so
+    // dropping it here would make the board vanish from the dashboard the
+    // moment it connects. There is no live sensor task yet — that arrives
+    // with the EMC2302/TMP1075 drivers — so the sender is simply parked in
+    // the shutdown future and released when the board goes away.
+    let shutdown = Box::pin(async move {
+        drop(telemetry_tx);
+    });
 
     Ok(BackplaneConnector {
         info,
@@ -137,7 +154,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         // No runtime commands until fan/frequency control lands with the
         // EMC2302 and TPS53647 drivers.
         command_tx: None,
-        shutdown: None,
+        shutdown: Some(shutdown),
     })
 }
 
@@ -169,12 +186,12 @@ async fn bring_up_chain(
         FramedRead::new(TracingReader::new(data_reader, "Data"), bm13xx::FrameCodec);
     let mut data_writer = FramedWrite::new(data_writer, bm13xx::FrameCodec);
 
-    // Release the chain and let the chips come out of reset before probing.
+    // Release the chain; discover_chain waits for the chip UARTs to boot,
+    // sends the version-mask preamble, and retries.
     debug!("De-asserting ASIC nRST");
     asic_resetn.write(PinValue::High).await?;
-    time::sleep(Duration::from_millis(200)).await;
 
-    let chip_infos = discover_chips(&mut data_reader, &mut data_writer).await?;
+    let chip_infos = discover_chain(&mut data_reader, &mut data_writer).await?;
     debug!(count = chip_infos.len(), "Discovered chips");
 
     if let Some(first) = chip_infos.first()
@@ -228,27 +245,28 @@ async fn park(
 /// Wait for the TPS53647 to report power-good.
 ///
 /// Proceeding without this risks releasing reset into a core rail that has
-/// not settled. Bounded close to `TIMEOUT` even if a read stalls: the
-/// control channel's own timeout is much longer (1s, see `ControlChannel::
-/// send_packet`), so each read is additionally capped at `READ_TIMEOUT`
-/// rather than letting one slow read eat most of the budget.
+/// not settled.
+///
+/// Each poll is a plain `read()` with no surrounding timeout on purpose. A
+/// `read()` is one request/response transaction over the shared control
+/// channel, and cancelling it mid-flight (which an outer `time::timeout`
+/// does when it fires) leaves the response unread, desyncing every
+/// subsequent transaction by one — observed on hardware as a persistent
+/// "Response ID mismatch" once a poll ran long. The channel already bounds
+/// each transaction internally (1s, see `ControlChannel::send_packet`), so a
+/// stalled read fails cleanly rather than hanging. The `TIMEOUT` below is a
+/// wall-clock budget checked between polls, not a per-read cap.
 ///
 /// `TIMEOUT` is a starting guess, not a measured value — confirm against
 /// real hardware once the TPS53647 soft-start timing is known.
 async fn wait_for_vr_rdy(pin: &mut impl GpioPin) -> Result<()> {
     const TIMEOUT: Duration = Duration::from_millis(100);
-    const READ_TIMEOUT: Duration = Duration::from_millis(20);
     const POLL: Duration = Duration::from_millis(2);
 
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline {
-        match time::timeout(READ_TIMEOUT, pin.read()).await {
-            Ok(Ok(PinValue::High)) => return Ok(()),
-            Ok(Ok(PinValue::Low)) => {}
-            Ok(Err(e)) => return Err(e.into()),
-            // Read itself stalled; treat as not-ready yet rather than
-            // consuming the rest of the budget on one slow poll.
-            Err(_) => {}
+        if pin.read().await? == PinValue::High {
+            return Ok(());
         }
         time::sleep(POLL).await;
     }
