@@ -168,6 +168,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         data_writer,
         peripherals,
         thread_shutdown_rx,
+        chip_infos.len(),
     );
     let freq_control = thread.frequency_control();
     let threads: Vec<Box<dyn HashThread>> = vec![Box::new(thread)];

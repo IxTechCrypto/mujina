@@ -175,12 +175,15 @@ impl BM13xxThread {
     /// * `chip_commands` - Sink for sending encoded commands to chips
     /// * `peripherals` - Hardware interfaces from board (enable, regulator, etc.)
     /// * `removal_rx` - Watch channel for board-triggered removal
+    /// * `chip_count` - Chips discovered on the chain; determines the
+    ///   addresses assigned during bring-up
     pub fn new<R, W>(
         name: String,
         chip_responses: R,
         chip_commands: W,
         peripherals: BoardPeripherals,
         removal_rx: watch::Receiver<ThreadRemovalSignal>,
+        chip_count: usize,
     ) -> Self
     where
         R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin + Send + 'static,
@@ -203,6 +206,7 @@ impl BM13xxThread {
                 chip_responses,
                 chip_commands,
                 peripherals,
+                chip_count,
             )
             .await;
         });
@@ -295,20 +299,53 @@ impl HashThread for BM13xxThread {
     }
 }
 
-/// Initialize BM13xx chip for mining.
+/// Chip addresses for a chain of `chip_count` chips.
 ///
-/// Enables chip, configures all registers, and ramps frequency to target.
-async fn initialize_chip<W>(
+/// Addresses are spread evenly over the 8-bit address space rather than
+/// packed from zero: the interval is `256 / chip_count` rounded up to a
+/// power of two, so a 4-chip chain is addressed 0x00, 0x40, 0x80, 0xC0.
+/// This matches the reference BM1370 firmware, and the chips derive their
+/// share of the nonce space from the address spacing — there is no
+/// separate per-chip nonce-range write.
+///
+/// A single-chip chain yields just `[0x00]`, identical to the address the
+/// pre-chain code hardcoded.
+fn chain_addresses(chip_count: usize) -> Vec<u8> {
+    let slots = chip_count.max(1).next_power_of_two();
+    let interval = 256usize / slots;
+    (0..chip_count.max(1))
+        .map(|i| (i * interval) as u8)
+        .collect()
+}
+
+/// Initialize a BM13xx chain for mining.
+///
+/// Enables the chips, assigns chip addresses, configures all registers,
+/// and ramps frequency to target.
+///
+/// Register writes are either broadcast to the whole chain or addressed to
+/// one chip at a time; the per-chip block is repeated for every address.
+/// With one chip this emits exactly the same command stream as the
+/// single-chip code it replaced.
+async fn initialize_chain<W>(
     chip_commands: &mut W,
     peripherals: &mut BoardPeripherals,
     asic_difficulty: Log2Difficulty,
     target_mhz: f32,
+    chip_count: usize,
 ) -> Result<()>
 where
     W: Sink<protocol::Command> + Unpin,
     W::Error: std::fmt::Debug,
 {
     use protocol::{Command, Register};
+
+    let addresses = chain_addresses(chip_count);
+    debug!(
+        chips = addresses.len(),
+        addresses = ?addresses.iter().map(|a| format!("0x{a:02x}")).collect::<Vec<_>>(),
+        "Initializing chain"
+    );
 
     // Enable the ASIC
     if let Some(ref mut asic_enable) = peripherals.asic_enable {
@@ -321,8 +358,24 @@ where
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // Send a register write command, converting the sink error to anyhow.
+    // Broadcast a register write to the whole chain, converting the sink
+    // error to anyhow. `chip_address` is ignored by the chips when the
+    // broadcast flag is set, so it stays 0x00.
     async fn send_reg<W>(chip_commands: &mut W, broadcast: bool, register: Register) -> Result<()>
+    where
+        W: Sink<protocol::Command> + Unpin,
+        W::Error: std::fmt::Debug,
+    {
+        send_reg_to(chip_commands, broadcast, 0x00, register).await
+    }
+
+    // Write a register on one specific chip.
+    async fn send_reg_to<W>(
+        chip_commands: &mut W,
+        broadcast: bool,
+        chip_address: u8,
+        register: Register,
+    ) -> Result<()>
     where
         W: Sink<protocol::Command> + Unpin,
         W::Error: std::fmt::Debug,
@@ -330,7 +383,7 @@ where
         chip_commands
             .send(Command::WriteRegister {
                 broadcast,
-                chip_address: 0x00,
+                chip_address,
                 register,
             })
             .await
@@ -378,11 +431,16 @@ where
         .map_err(|e| anyhow!("{e:?}"))
         .context("failed to send ChainInactive")?;
 
-    chip_commands
-        .send(Command::SetChipAddress { chip_address: 0x00 })
-        .await
-        .map_err(|e| anyhow!("{e:?}"))
-        .context("failed to send SetChipAddress")?;
+    // Walk the chain assigning addresses. Each SetChipAddress is consumed
+    // by the first chip that has not yet been addressed, so the order here
+    // determines which physical chip gets which address.
+    for &chip_address in &addresses {
+        chip_commands
+            .send(Command::SetChipAddress { chip_address })
+            .await
+            .map_err(|e| anyhow!("{e:?}"))
+            .with_context(|| format!("failed to send SetChipAddress 0x{chip_address:02x}"))?;
+    }
 
     // Core configuration (broadcast)
     debug!("Sending broadcast core configuration");
@@ -418,46 +476,53 @@ where
     // Chip-specific configuration
     debug!("Sending chip-specific configuration");
 
-    send_reg(
-        chip_commands,
-        false,
-        Register::InitControl {
-            raw_value: 0xF0010700,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        false,
-        Register::MiscControl {
-            raw_value: 0x00C100F0,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        false,
-        Register::Core {
-            raw_value: 0x8000_8B00,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        false,
-        Register::Core {
-            raw_value: 0x8000_800C,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        false,
-        Register::Core {
-            raw_value: 0x8000_82AA,
-        },
-    )
-    .await?;
+    for &addr in &addresses {
+        send_reg_to(
+            chip_commands,
+            false,
+            addr,
+            Register::InitControl {
+                raw_value: 0xF0010700,
+            },
+        )
+        .await?;
+        send_reg_to(
+            chip_commands,
+            false,
+            addr,
+            Register::MiscControl {
+                raw_value: 0x00C100F0,
+            },
+        )
+        .await?;
+        send_reg_to(
+            chip_commands,
+            false,
+            addr,
+            Register::Core {
+                raw_value: 0x8000_8B00,
+            },
+        )
+        .await?;
+        send_reg_to(
+            chip_commands,
+            false,
+            addr,
+            Register::Core {
+                raw_value: 0x8000_800C,
+            },
+        )
+        .await?;
+        send_reg_to(
+            chip_commands,
+            false,
+            addr,
+            Register::Core {
+                raw_value: 0x8000_82AA,
+            },
+        )
+        .await?;
+    }
 
     // Additional settings
     send_reg(
@@ -511,7 +576,18 @@ where
 
     debug!("Frequency ramping complete");
 
-    // Final configuration
+    // Final configuration.
+    //
+    // Register 0x10 is named `NonceRange` after its BM1397-era function,
+    // but on BM1370 it carries the voltage-regulator sync frequency: this
+    // raw value is little-endian 00 00 1e b5, and 0x1eb5 is exactly the
+    // default the reference BM1370 firmware writes here. It is NOT a
+    // nonce-space split, so it stays broadcast and chain-length
+    // independent. Do not "fix" this by substituting
+    // `NonceRangeConfig::multi_chip(chip_count)` — that table belongs to a
+    // different chip generation and would write a garbage VR frequency.
+    // The chain divides the nonce space by chip address instead, which is
+    // handled by the SetChipAddress walk above.
     send_reg(
         chip_commands,
         true,
@@ -714,6 +790,9 @@ fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllConfig> 
 ///
 /// Chip is disabled on startup to establish known state. Chip is enabled and
 /// configured when scheduler assigns first work.
+// One private actor entry point wired up by `BM13xxThread::new`; bundling
+// its parameters into a struct would only move the same fields around.
+#[expect(clippy::too_many_arguments)]
 async fn bm13xx_thread_actor<R, W>(
     mut cmd_rx: mpsc::Receiver<ThreadCommand>,
     evt_tx: mpsc::Sender<HashThreadEvent>,
@@ -722,6 +801,7 @@ async fn bm13xx_thread_actor<R, W>(
     mut chip_responses: R,
     mut chip_commands: W,
     mut peripherals: BoardPeripherals,
+    chip_count: usize,
 ) where
     R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin,
     W: Sink<protocol::Command> + Unpin,
@@ -795,8 +875,8 @@ async fn bm13xx_thread_actor<R, W>(
                         }
 
                         if !chip_initialized {
-                            trace!("Initializing chip on first assignment.");
-                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals, asic_difficulty, target_freq).await {
+                            trace!("Initializing chain on first assignment.");
+                            if let Err(e) = initialize_chain(&mut chip_commands, &mut peripherals, asic_difficulty, target_freq, chip_count).await {
                                 error!(error = %e, "Chip initialization failed");
                                 response_tx.send(Err(e)).ok();
                                 continue;
@@ -846,8 +926,8 @@ async fn bm13xx_thread_actor<R, W>(
                         }
 
                         if !chip_initialized {
-                            trace!("Initializing chip on first assignment.");
-                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals, asic_difficulty, target_freq).await {
+                            trace!("Initializing chain on first assignment.");
+                            if let Err(e) = initialize_chain(&mut chip_commands, &mut peripherals, asic_difficulty, target_freq, chip_count).await {
                                 error!(error = %e, "Chip initialization failed");
                                 response_tx.send(Err(e)).ok();
                                 continue;
@@ -1069,6 +1149,50 @@ async fn bm13xx_thread_actor<R, W>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_chip_chain_keeps_the_legacy_address() {
+        // The pre-chain code hardcoded 0x00. A one-chip chain must still
+        // emit exactly that, so the Bitaxe command stream is unchanged.
+        assert_eq!(chain_addresses(1), vec![0x00]);
+    }
+
+    #[test]
+    fn four_chip_chain_spreads_over_the_address_space() {
+        // Interval 256/4 = 64, matching the reference BM1370 firmware.
+        assert_eq!(chain_addresses(4), vec![0x00, 0x40, 0x80, 0xC0]);
+    }
+
+    #[test]
+    fn non_power_of_two_chains_round_the_interval_up() {
+        // 3 chips use 4 slots (interval 64), leaving the last slot unused
+        // rather than overlapping addresses.
+        assert_eq!(chain_addresses(3), vec![0x00, 0x40, 0x80]);
+        // 6 chips use 8 slots (interval 32).
+        assert_eq!(chain_addresses(6), vec![0x00, 0x20, 0x40, 0x60, 0x80, 0xA0]);
+    }
+
+    #[test]
+    fn full_chain_addresses_stay_in_range() {
+        // 256 chips is the densest chain the 8-bit space allows: interval
+        // 1, addresses 0x00..=0xFF, no wrap.
+        let addrs = chain_addresses(256);
+        assert_eq!(addrs.len(), 256);
+        assert_eq!(addrs[0], 0x00);
+        assert_eq!(addrs[255], 0xFF);
+        // Every address distinct.
+        let mut sorted = addrs.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 256);
+    }
+
+    #[test]
+    fn zero_chips_degrades_to_a_single_address() {
+        // Defensive: discovery returning nothing must not produce an empty
+        // address list that silently skips all per-chip configuration.
+        assert_eq!(chain_addresses(0), vec![0x00]);
+    }
 
     #[test]
     fn test_pll_calculations_match_reference() {
