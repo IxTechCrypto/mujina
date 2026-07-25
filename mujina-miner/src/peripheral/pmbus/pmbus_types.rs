@@ -87,11 +87,27 @@ impl Linear11 {
         Self(raw)
     }
 
+    /// Largest positive mantissa. The field is 11-bit **two's complement**,
+    /// so the positive range stops at 1023, not 2047.
+    const MANTISSA_MAX: i32 = 1023;
+    /// Most negative mantissa.
+    const MANTISSA_MIN: i32 = -1024;
+
     pub fn to_f32(self) -> f32 {
         let exp_raw = ((self.0 >> 11) & 0x1F) as u8;
         let exponent = extract_5bit_exponent(exp_raw) as i32;
-        let mantissa = (self.0 & 0x07FF) as u32;
-        mantissa as f32 * 2.0_f32.powi(exponent)
+        Self::sign_extend_mantissa(self.0) as f32 * 2.0_f32.powi(exponent)
+    }
+
+    /// Sign-extend the low 11 bits of a raw word.
+    fn sign_extend_mantissa(raw: u16) -> i32 {
+        const SIGN_BIT: u16 = 0x0400;
+        let mantissa = raw & 0x07FF;
+        if mantissa & SIGN_BIT != 0 {
+            mantissa as i32 - 0x0800
+        } else {
+            mantissa as i32
+        }
     }
 
     pub fn from_f32(value: f32) -> Result<Self, PMBusError> {
@@ -99,32 +115,36 @@ impl Linear11 {
             return Ok(Self(0));
         }
 
-        // Find best exponent for unsigned mantissa
-        let mut best_exp = 0i8;
-        let mut best_error = f32::MAX;
+        // Pick the exponent that represents `value` most precisely with a
+        // mantissa that fits the *signed* 11-bit field.
+        //
+        // Allowing the full unsigned 0..2047 range here silently produced
+        // negative values on the wire: 95.0 chose exponent -4 and mantissa
+        // 1520, which a device sign-extends to -528 and reads as -33. In an
+        // overcurrent or overtemperature limit that is not a rounding error,
+        // it is a regulator that faults the instant it is enabled -- which
+        // is exactly how this was found.
+        let mut best: Option<(i8, i32, f32)> = None;
 
         for exp in -16i8..=15 {
             let mantissa_f = value / 2.0_f32.powi(exp as i32);
-
-            if (0.0..2048.0).contains(&mantissa_f) {
-                let mantissa = mantissa_f.round() as u32;
-                let reconstructed = mantissa as f32 * 2.0_f32.powi(exp as i32);
-                let error = (reconstructed - value).abs();
-
-                if error < best_error {
-                    best_error = error;
-                    best_exp = exp;
-                }
+            if !(Self::MANTISSA_MIN as f32..=Self::MANTISSA_MAX as f32).contains(&mantissa_f) {
+                continue;
+            }
+            let mantissa = mantissa_f.round() as i32;
+            if !(Self::MANTISSA_MIN..=Self::MANTISSA_MAX).contains(&mantissa) {
+                continue;
+            }
+            let error = (mantissa as f32 * 2.0_f32.powi(exp as i32) - value).abs();
+            if best.is_none_or(|(_, _, best_error)| error < best_error) {
+                best = Some((exp, mantissa, error));
             }
         }
 
-        let mantissa = (value / 2.0_f32.powi(best_exp as i32)).round() as u32;
-        if mantissa > 0x07FF {
-            return Err(PMBusError::ValueOutOfRange);
-        }
+        let (exp, mantissa, _) = best.ok_or(PMBusError::ValueOutOfRange)?;
 
-        let exp_bits = (best_exp as u16) & 0x1F;
-        let mant_bits = (mantissa & 0x07FF) as u16;
+        let exp_bits = (exp as u16) & 0x1F;
+        let mant_bits = (mantissa as u16) & 0x07FF;
 
         Ok(Self((exp_bits << 11) | mant_bits))
     }
@@ -157,6 +177,48 @@ impl Linear16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every value written must survive a round trip through a device
+    /// that sign-extends the mantissa, which is what the spec requires.
+    #[test]
+    fn linear11_round_trips_through_a_signed_mantissa() {
+        for value in [
+            0.5, 1.0, 12.0, 25.0, 60.0, 95.0, 100.0, 125.0, 128.0, 512.0, 1023.0, 1024.0, 2000.0,
+        ] {
+            let encoded = Linear11::from_f32(value).expect("encodable");
+            let decoded = encoded.to_f32();
+            assert!(
+                (decoded - value).abs() <= value * 0.01,
+                "{value} encoded as {:#06x} decoded back as {decoded}",
+                encoded.0
+            );
+            assert!(decoded > 0.0, "{value} decoded to non-positive {decoded}");
+        }
+    }
+
+    /// The regression that motivated the signed-mantissa fix: 95.0 used to
+    /// encode with mantissa 1520, which sign-extends to -528 and reads back
+    /// as -33. Written to an overcurrent limit it faulted the regulator the
+    /// moment the rail was enabled.
+    #[test]
+    fn linear11_ninety_five_is_not_negative_on_the_wire() {
+        let encoded = Linear11::from_f32(95.0).expect("encodable");
+        let mantissa = Linear11::sign_extend_mantissa(encoded.0);
+        assert!(
+            mantissa > 0,
+            "mantissa {mantissa} is negative in raw {:#06x}",
+            encoded.0
+        );
+        assert!((encoded.to_f32() - 95.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn linear11_decodes_negative_values() {
+        // -33 is what the old encoder was accidentally producing; make sure
+        // the decoder reports it as such rather than as a large positive.
+        let raw = ((-4i8 as u16) & 0x1F) << 11 | (1520 & 0x07FF);
+        assert!((Linear11(raw).to_f32() - (-33.0)).abs() < 0.1);
+    }
 
     #[test]
     fn test_extract_5bit_exponent_positive() {
@@ -252,9 +314,15 @@ mod tests {
 
     #[test]
     fn test_linear11_max_mantissa() {
-        // Max unsigned mantissa is 0x7FF (2047) with exp=0
-        let l = Linear11::new(0x07FF); // exp=0, mant=2047
-        assert_eq!(l.to_f32(), 2047.0);
+        // The mantissa is 11-bit two's complement, so 0x7FF is -1, not
+        // 2047. This test previously asserted the unsigned reading, which
+        // is what let the encoder emit negative limits unnoticed.
+        let l = Linear11::new(0x07FF); // exp=0, mant=-1
+        assert_eq!(l.to_f32(), -1.0);
+
+        // Largest positive mantissa.
+        let l = Linear11::new(0x03FF); // exp=0, mant=1023
+        assert_eq!(l.to_f32(), 1023.0);
 
         // Test with positive exponent
         let l = Linear11::new(0x7801); // exp=15, mant=1

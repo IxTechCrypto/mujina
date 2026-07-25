@@ -81,6 +81,27 @@ pub enum Error {
 
 type DriverResult<T> = std::result::Result<T, Error>;
 
+/// Snapshot of the PMBus fault status registers.
+#[derive(Debug, Clone, Copy)]
+pub struct Status {
+    /// Summary word; zero means no faults asserted anywhere.
+    pub word: u16,
+    pub vout: u8,
+    pub iout: u8,
+    pub input: u8,
+    pub temperature: u8,
+}
+
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "word={:#06x} vout={:#04x} iout={:#04x} input={:#04x} temp={:#04x}",
+            self.word, self.vout, self.iout, self.input, self.temperature
+        )
+    }
+}
+
 /// An 8-bit VR12-style voltage identification code.
 ///
 /// The mapping is linear: code 1 is [`Vid::FLOOR_V`] and each further
@@ -207,20 +228,30 @@ impl<I: I2c> Tps53647<I> {
     /// Identify the regulator and configure its phase, current and
     /// temperature limits.
     ///
-    /// # This does not gate the output
+    /// # This does not gate the output, and does not set the voltage
     ///
     /// Whether the rail is live is decided by the ENABLE pin, which this
     /// driver does not own -- the board holds it. Calling `init` on a
     /// board that already has ENABLE asserted **will** leave a live rail.
     /// Callers must have the enable line low first.
     ///
-    /// What `init` does guarantee is the *voltage* the rail would come up
-    /// at: `RESTORE_DEFAULT_ALL` reloads VOUT_COMMAND from NVM, so the
-    /// last step here overwrites it with the bottom of the configured
-    /// window. Without that, enabling the rail later would bring four
-    /// ASICs up at whatever voltage happened to be stored -- the factory
-    /// default is 1.000 V, comfortably live. Coming up at the floor is
-    /// recoverable; coming up at an unknown voltage is not.
+    /// `RESTORE_DEFAULT_ALL` here reloads VOUT_COMMAND from NVM, so the
+    /// voltage the rail would come up at is whatever the part was
+    /// programmed with. **Callers must call [`set_vout`](Self::set_vout)
+    /// before enabling the rail** rather than relying on that default.
+    ///
+    /// An earlier revision tried to be helpful and left the bottom of the
+    /// configured window in VOUT_COMMAND instead. That bricked bring-up:
+    /// 0.8 V sits at or below the undervoltage fault threshold the part
+    /// carries in NVM for a ~1.2 V rail, so enabling latched a UV fault,
+    /// the regulator shut down, and VR_RDY never asserted. Because the
+    /// controller stays powered from the 12 V input, the latched fault
+    /// then survived daemon restarts. Do not reintroduce it -- the safe
+    /// voltage is the one the board picks deliberately, not a floor this
+    /// driver invents.
+    ///
+    /// The `CLEAR_FAULTS` below is what recovers a part left latched by a
+    /// previous session, so this must run *before* the rail is enabled.
     pub async fn init(&mut self) -> DriverResult<()> {
         let code = self.device_code().await?;
         if code != DEVICE_CODE {
@@ -274,16 +305,11 @@ impl<I: I2c> Tps53647<I> {
         self.write_linear11(PmbusCommand::IoutOcFaultLimit.as_u8(), self.config.ifault_a)
             .await?;
 
-        // Leave a known voltage behind, overwriting whatever
-        // RESTORE_DEFAULT_ALL loaded. See the note on this function.
-        self.set_vout(self.config.vout_min_v).await?;
-
         debug!(
             phases = self.config.phases,
             imax_a = self.config.imax_a,
             ifault_a = self.config.ifault_a,
-            vout_v = self.config.vout_min_v,
-            "TPS53647 configured; rail will come up at the window floor when enabled"
+            "TPS53647 configured; caller must set_vout before enabling the rail"
         );
         Ok(())
     }
@@ -311,6 +337,25 @@ impl<I: I2c> Tps53647<I> {
             "TPS53647 vout set"
         );
         Ok(())
+    }
+
+    /// Read the fault status registers.
+    ///
+    /// Worth logging whenever the rail misbehaves: a regulator that
+    /// refuses to start looks identical from the outside whatever the
+    /// cause, and these bits are the only thing that distinguishes an
+    /// overcurrent trip from an overtemperature one from a configuration
+    /// the part simply will not accept.
+    pub async fn status(&mut self) -> DriverResult<Status> {
+        Ok(Status {
+            word: self.read_word(PmbusCommand::StatusWord.as_u8()).await?,
+            vout: self.read_byte(PmbusCommand::StatusVout.as_u8()).await?,
+            iout: self.read_byte(PmbusCommand::StatusIout.as_u8()).await?,
+            input: self.read_byte(PmbusCommand::StatusInput.as_u8()).await?,
+            temperature: self
+                .read_byte(PmbusCommand::StatusTemperature.as_u8())
+                .await?,
+        })
     }
 
     /// Read the measured output voltage, in volts.
@@ -362,6 +407,12 @@ impl<I: I2c> Tps53647<I> {
     async fn write_word(&mut self, cmd: u8, value: u16) -> Result<()> {
         let [lo, hi] = value.to_le_bytes();
         self.i2c.write(self.address, &[cmd, lo, hi]).await
+    }
+
+    async fn read_byte(&mut self, cmd: u8) -> Result<u8> {
+        let mut buf = [0u8; 1];
+        self.i2c.write_read(self.address, &[cmd], &mut buf).await?;
+        Ok(buf[0])
     }
 
     async fn read_word(&mut self, cmd: u8) -> Result<u16> {

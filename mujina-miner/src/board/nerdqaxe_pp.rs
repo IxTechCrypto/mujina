@@ -116,6 +116,21 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     // nothing to undo on failure, so it stays outside the guarded section.
     asic_resetn.write(PinValue::Low).await?;
 
+    // Management peripherals come up before the core rail, not after.
+    //
+    // They live on the always-on +3V3 rail, so nothing here needs the core
+    // rail -- but the regulator does need to be reachable *before* PWR_EN
+    // goes high. `Tps53647::init` issues CLEAR_FAULTS, and that is the only
+    // thing that recovers a controller left in a latched fault by a previous
+    // session. The controller keeps its state as long as 12 V is present, so
+    // doing this after the power-up would mean a single bad session wedged
+    // the board until it was physically unplugged: VR_RDY would never
+    // assert, bring-up would fail, and the code that clears the fault would
+    // never be reached.
+    let mut i2c = BitaxeRawI2c::new(control.clone());
+    i2c.set_frequency(I2C_FREQUENCY_HZ).await?;
+    let mut sensors = Sensors::new(i2c).await?;
+
     // Everything from here on energizes the board or takes the chain out of
     // reset, so a failure partway through must not strand it live and
     // unsupervised. `park()` always runs before this function returns,
@@ -130,6 +145,16 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     .await;
 
     park(&mut asic_resetn, &mut pwr_en, &mut ldo_en).await;
+
+    // A failed power-up is almost always the regulator refusing to start,
+    // and from the outside every cause looks the same. Read the fault
+    // registers while we still can, so the log says which one it was.
+    if bring_up.is_err() {
+        match sensors.regulator.status().await {
+            Ok(status) => warn!(%status, "TPS53647 status after failed bring-up"),
+            Err(e) => warn!(error = %e, "could not read TPS53647 status after failed bring-up"),
+        }
+    }
 
     // Chip details aren't consumed yet; discovery already logged the count.
     // They'll feed hash-thread construction once chain support lands.
@@ -162,15 +187,6 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     let (telemetry_tx, telemetry_rx) = watch::channel(telemetry);
 
     warn!("NerdQAxe++ hash threads not yet implemented (needs multi-chip chain support)");
-
-    // Bring up the management peripherals. These all sit on the always-on
-    // +3V3 rail, so they are readable with the ASIC core rail parked --
-    // which is exactly the state this board is left in until hash threads
-    // land. Sensor telemetry therefore works without energizing anything.
-    let mut i2c = BitaxeRawI2c::new(control.clone());
-    i2c.set_frequency(I2C_FREQUENCY_HZ).await?;
-
-    let sensors = Sensors::new(i2c).await?;
 
     let (command_tx, command_rx) = mpsc::channel::<BoardCommand>(8);
     let cancel = CancellationToken::new();
@@ -577,15 +593,31 @@ async fn park(
 /// stalled read fails cleanly rather than hanging. The `TIMEOUT` below is a
 /// wall-clock budget checked between polls, not a per-read cap.
 ///
-/// `TIMEOUT` is a starting guess, not a measured value — confirm against
-/// real hardware once the TPS53647 soft-start timing is known.
+/// Measured on hardware: the rail asserts VR_RDY **30 ms** after PWR_EN.
+/// The budget is several times that, since overshooting costs only a
+/// slower failure path while undershooting costs a board that will not
+/// start. The elapsed time is logged on success, so drift shows up in a
+/// log rather than as a mystery timeout.
+///
+/// A timeout here means the regulator refused to start, not that it was
+/// slow. Chasing that by raising the budget is a dead end -- when this
+/// fired during bring-up of the TPS53647 driver the cause was an
+/// overcurrent and overtemperature limit encoded as a *negative* number,
+/// so the part faulted the instant it was enabled and would never have
+/// asserted VR_RDY at any timeout. The caller logs the PMBus status
+/// registers on failure for exactly this reason; read those first.
 async fn wait_for_vr_rdy(pin: &mut impl GpioPin) -> Result<()> {
-    const TIMEOUT: Duration = Duration::from_millis(100);
+    const TIMEOUT: Duration = Duration::from_millis(250);
     const POLL: Duration = Duration::from_millis(2);
 
-    let deadline = Instant::now() + TIMEOUT;
+    let started = Instant::now();
+    let deadline = started + TIMEOUT;
     while Instant::now() < deadline {
         if pin.read().await? == PinValue::High {
+            debug!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Core regulator asserted VR_RDY"
+            );
             return Ok(());
         }
         time::sleep(POLL).await;
