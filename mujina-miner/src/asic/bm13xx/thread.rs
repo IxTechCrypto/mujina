@@ -479,6 +479,28 @@ where
     )
     .await?;
 
+    // PLL3 configuration.
+    //
+    // PLL3 clocks the chip-to-chip UART relay, so on a chain every chip
+    // past the first depends on it to get its nonces back to the host.
+    // A single chip talks to the host directly and does not care, which is
+    // why this was missing without the Bitaxe ever noticing.
+    //
+    // The reference firmware puts the bytes 5A A5 5A A5 on the wire. This
+    // register serializes little-endian (unlike `Core`, which does not),
+    // so the raw value is the byte-reversed 0xA55AA55A -- writing the
+    // literal 0x5AA55AA5 here would send A5 5A A5 5A instead. The
+    // register's field layout is not documented, so the bytes have to
+    // match exactly rather than be derived.
+    send_reg(
+        chip_commands,
+        true,
+        Register::Pll3Parameter {
+            raw_value: 0xA55A_A55A,
+        },
+    )
+    .await?;
+
     // Chip-specific configuration
     debug!("Sending chip-specific configuration");
 

@@ -847,10 +847,41 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
     Ok(tps546)
 }
 
+/// Discard any frames already sitting in the reader.
+///
+/// Used to make each discovery attempt independent of the last. Stops at
+/// the first quiet moment rather than reading for a fixed period, so it
+/// costs nothing on the common path where nothing is pending.
+async fn drain_pending(reader: &mut FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>) {
+    /// How long to wait for a straggler before calling the line quiet.
+    const QUIET: Duration = Duration::from_millis(20);
+
+    // Ends on a quiet line or a closed stream; either way there is nothing
+    // stale left to confuse the caller.
+    let mut dropped = 0usize;
+    while let Ok(Some(_)) = time::timeout(QUIET, reader.next()).await {
+        dropped += 1;
+    }
+    if dropped > 0 {
+        debug!(dropped, "Discarded stale frames before chip discovery");
+    }
+}
+
 pub(crate) async fn discover_chips(
     reader: &mut FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>,
     writer: &mut FramedWrite<SerialWriter, bm13xx::FrameCodec>,
 ) -> Result<Vec<ChipInfo>> {
+    // Drop anything already buffered before asking.
+    //
+    // A discovery attempt that times out does not cancel the chips'
+    // replies -- they simply arrive after the window closed and sit in the
+    // reader. The next attempt would then count them *plus* its own,
+    // reporting twice the real chip count. Observed on a 4-chip chain as
+    // "discovered 8": the first attempt was too early, and the second saw
+    // both sets. A single chip answers fast enough that this rarely shows
+    // up on the Bitaxe, which is why it survived this long.
+    drain_pending(reader).await;
+
     let discover_cmd = BM13xxProtocol::discover_chips();
 
     writer
