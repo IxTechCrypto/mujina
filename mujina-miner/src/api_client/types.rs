@@ -21,6 +21,14 @@ pub struct MinerTelemetry {
     pub paused: bool,
     pub boards: Vec<BoardTelemetry>,
     pub sources: Vec<SourceTelemetry>,
+    /// Per-thread measurements, carried from the scheduler so the API can
+    /// attach each one to the board that owns it.
+    ///
+    /// Not serialized: the public contract is the per-board `threads`
+    /// array, and repeating the same numbers at the top level would be
+    /// two things to keep in agreement.
+    #[serde(skip)]
+    pub threads: Vec<ThreadTelemetry>,
 }
 
 /// Board telemetry snapshot.

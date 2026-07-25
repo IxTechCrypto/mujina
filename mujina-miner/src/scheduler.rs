@@ -42,7 +42,7 @@ use tokio_stream::{StreamExt, StreamMap};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::commands::SchedulerCommand;
-use crate::api_client::types::{MinerTelemetry, SourceTelemetry};
+use crate::api_client::types::{MinerTelemetry, SourceTelemetry, ThreadTelemetry};
 use crate::asic::hash_thread::{HashTask, HashThread, HashThreadEvent, Share};
 use crate::job_source::{
     JobTemplate, MerkleRootKind, Share as SourceShare, SourceCommand, SourceEvent,
@@ -275,6 +275,20 @@ impl Scheduler {
             shares_submitted: self.stats.shares_submitted,
             paused: self.paused,
             boards: vec![],
+            // The scheduler is the only place that measures per-thread
+            // hashrate. Publishing it lets the API attach each thread to
+            // the board that owns it; without this a multi-board miner can
+            // report an aggregate and nothing else, and has to guess at the
+            // split.
+            threads: self
+                .threads
+                .values_mut()
+                .map(|entry| ThreadTelemetry {
+                    name: entry.thread.name().to_string(),
+                    hashrate: u64::from(entry.hashrate.hashrate()),
+                    is_active: entry.thread.status().is_active,
+                })
+                .collect(),
             sources: self
                 .sources
                 .values()

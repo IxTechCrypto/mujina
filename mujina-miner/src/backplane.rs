@@ -143,9 +143,17 @@ impl Backplane {
             shutdown,
         } = conn;
 
+        // Record which threads belong to this board before handing them to
+        // the scheduler. This is the only point where the pairing is known:
+        // afterwards the threads live in the scheduler and the telemetry in
+        // the API, with nothing linking them. Recovering it later would mean
+        // inferring the relationship from a naming convention.
+        let thread_names: Vec<String> = threads.iter().map(|t| t.name().to_string()).collect();
+
         let registration = BoardRegistration {
             telemetry_rx,
             command_tx,
+            thread_names,
         };
         if let Err(e) = self.board_reg_tx.send(registration).await {
             error!(

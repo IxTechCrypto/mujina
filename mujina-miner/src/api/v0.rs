@@ -108,13 +108,9 @@ async fn patch_miner(
     ),
 )]
 async fn get_boards(State(state): State<SharedState>) -> Json<Vec<BoardTelemetry>> {
-    Json(
-        state
-            .board_registry
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .boards(),
-    )
+    // Via miner_telemetry so each board carries its per-thread hashrate,
+    // which only the scheduler measures.
+    Json(state.miner_telemetry().boards)
 }
 
 /// Return a single board by name, or 404 if not found.
@@ -135,10 +131,8 @@ async fn get_board(
     Path(name): Path<String>,
 ) -> Result<Json<BoardTelemetry>, StatusCode> {
     state
-        .board_registry
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .boards()
+        .miner_telemetry()
+        .boards
         .into_iter()
         .find(|b| b.name == name)
         .map(Json)
@@ -192,10 +186,8 @@ async fn patch_board_fan(
     };
 
     state
-        .board_registry
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .boards()
+        .miner_telemetry()
+        .boards
         .into_iter()
         .find(|b| b.name == name)
         .map(Json)
@@ -250,7 +242,8 @@ async fn patch_board_tuning(
             .command_sender(&name)
             .ok_or(StatusCode::NOT_FOUND)?;
         let current_freq = registry
-            .boards()
+            // No thread data needed: only the tuning fields are read.
+            .boards(&[])
             .into_iter()
             .find(|b| b.name == name)
             .and_then(|b| b.frequency_mhz);
@@ -283,10 +276,8 @@ async fn patch_board_tuning(
     }
 
     state
-        .board_registry
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .boards()
+        .miner_telemetry()
+        .boards
         .into_iter()
         .find(|b| b.name == name)
         .map(Json)
@@ -299,7 +290,8 @@ fn board_setpoint(state: &SharedState, name: &str) -> Option<TuneSetpoint> {
         .board_registry
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .boards()
+        // No thread data needed: only the tuning fields are read.
+        .boards(&[])
         .into_iter()
         .find(|b| b.name == name)?;
     let frequency_mhz = board.frequency_mhz?;
@@ -332,7 +324,8 @@ fn board_hashrate_target_range(state: &SharedState, name: &str) -> Option<Target
         .board_registry
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .boards()
+        // No thread data needed: only the tuning fields are read.
+        .boards(&[])
         .into_iter()
         .find(|b| b.name == name)?;
     let chip = chip_profile::profile_for(board.chip_model.as_deref()?)?;

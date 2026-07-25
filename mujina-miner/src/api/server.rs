@@ -47,7 +47,7 @@ impl SharedState {
             .board_registry
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .boards();
+            .boards(&telemetry.threads);
         telemetry
     }
 }
@@ -187,6 +187,7 @@ mod tests {
             registry.push(BoardRegistration {
                 telemetry_rx: rx,
                 command_tx: None,
+                thread_names: Vec::new(),
             });
             board_senders.push(tx);
         }

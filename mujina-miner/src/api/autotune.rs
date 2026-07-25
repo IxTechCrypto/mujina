@@ -1015,10 +1015,15 @@ pub async fn run(
         // Gather the board's telemetry plus the aggregate hashrate. The tuner
         // supports a single board: with more than one connected, the aggregate
         // hashrate can't be attributed, so hold off rather than mis-tune.
-        let hashrate_ths = miner_telemetry_rx.borrow().hashrate as f32 / 1e12;
+        // TODO: boards now carry their own per-thread hashrate, so the
+        // single-board restriction below could be lifted by tuning against
+        // `board.threads` instead of the aggregate. Left alone here because
+        // changing what the tuner optimizes deserves its own testing.
+        let telemetry = miner_telemetry_rx.borrow().clone();
+        let hashrate_ths = telemetry.hashrate as f32 / 1e12;
         let (name, serial, metrics, sender, chip) = {
             let mut reg = board_registry.lock().unwrap_or_else(|e| e.into_inner());
-            let boards = reg.boards();
+            let boards = reg.boards(&telemetry.threads);
             if boards.len() != 1 {
                 continue;
             }
