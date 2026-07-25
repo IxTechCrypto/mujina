@@ -1046,6 +1046,13 @@ fn board_hashrate_ths(board: &crate::api_client::types::BoardTelemetry) -> f32 {
     board.threads.iter().map(|t| t.hashrate).sum::<u64>() as f32 / 1e12
 }
 
+/// The boards present this tick, by both keys the supervisor tracks state
+/// under: name for the live tuners, serial for the boot-resume record.
+struct Connected {
+    names: HashSet<String>,
+    serials: HashSet<String>,
+}
+
 /// Collect a complete snapshot for every board that has one.
 ///
 /// A board missing any reading is skipped for this tick rather than
@@ -1054,10 +1061,16 @@ fn board_hashrate_ths(board: &crate::api_client::types::BoardTelemetry) -> f32 {
 fn snapshot_boards(
     board_registry: &Arc<Mutex<BoardRegistry>>,
     threads: &[crate::api_client::types::ThreadTelemetry],
-) -> (Vec<BoardSnapshot>, HashSet<String>) {
+) -> (Vec<BoardSnapshot>, Connected) {
     let mut reg = board_registry.lock().unwrap_or_else(|e| e.into_inner());
     let boards = reg.boards(threads);
-    let connected: HashSet<String> = boards.iter().map(|b| b.name.clone()).collect();
+    // Every registered board, including ones whose telemetry is incomplete
+    // this tick -- a board waiting on its first sensor sweep is present,
+    // and must not have its tuner pruned out from under it.
+    let connected = Connected {
+        names: boards.iter().map(|b| b.name.clone()).collect(),
+        serials: boards.iter().filter_map(|b| b.serial.clone()).collect(),
+    };
 
     let mut snapshots = Vec::new();
     for board in boards {
@@ -1132,9 +1145,15 @@ pub async fn run(
         let (snapshots, connected) = snapshot_boards(&board_registry, &telemetry.threads);
         {
             let mut t = tuners.lock().unwrap_or_else(|e| e.into_inner());
-            t.retain_connected(&connected);
+            t.retain_connected(&connected.names);
         }
-        bookkeeping.retain(|name, _| connected.contains(name));
+        bookkeeping.retain(|name, _| connected.names.contains(name));
+        // Forget the resume record for a board that went away, so a board
+        // that comes back -- a USB blip, a replug -- resumes its saved
+        // profile again. Its tuner was just dropped above, so without this
+        // a momentary disconnect would silently leave that board on manual
+        // control for the rest of the daemon's life.
+        resumed.retain(|serial| connected.serials.contains(serial));
 
         for snapshot in snapshots {
             tune_one_board(&tuners, &snapshot, &mut bookkeeping, &mut resumed);

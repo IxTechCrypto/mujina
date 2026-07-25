@@ -34,6 +34,32 @@ fn settings_path() -> PathBuf {
     state_dir().join("mujina-settings.json")
 }
 
+/// Check that a pool URL is one the daemon will actually be able to dial.
+///
+/// Worth doing at the point of saving rather than at connect time: the
+/// setting is only read at startup, so a URL that turns out to be
+/// unparseable is discovered after a restart, with the miner already down
+/// and no longer able to say why. Mirrors `stratum_v1::Connection::connect`
+/// -- optional `stratum+tcp://` or `tcp://` scheme, then `host:port`.
+pub fn validate_pool_url(url: &str) -> Result<(), &'static str> {
+    let authority = url
+        .strip_prefix("stratum+tcp://")
+        .or_else(|| url.strip_prefix("tcp://"))
+        .unwrap_or(url);
+    // rsplit_once, not split_once: an IPv6 literal is full of colons and
+    // only the last one separates the port.
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return Err("pool URL needs a port, e.g. stratum+tcp://pool.example.com:3333");
+    };
+    if host.is_empty() {
+        return Err("pool URL has no host");
+    }
+    if port.parse::<u16>().is_err() {
+        return Err("pool URL port must be a number from 0 to 65535");
+    }
+    Ok(())
+}
+
 /// Pool connection settings.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PoolSettings {
@@ -175,6 +201,26 @@ mod tests {
             pool: pool("bc1qexample"),
         };
         assert_eq!(settings.worker_username().unwrap(), "bc1qexample");
+    }
+
+    #[test]
+    fn accepts_pool_urls_the_daemon_can_dial() {
+        assert!(validate_pool_url("stratum+tcp://pool.example.com:3333").is_ok());
+        assert!(validate_pool_url("tcp://pool.example.com:3333").is_ok());
+        // Scheme is optional, matching Connection::connect.
+        assert!(validate_pool_url("pool.example.com:3333").is_ok());
+        // An IPv6 literal is all colons; only the last one is the port.
+        assert!(validate_pool_url("stratum+tcp://[::1]:3333").is_ok());
+    }
+
+    #[test]
+    fn rejects_pool_urls_that_would_fail_at_startup() {
+        assert!(validate_pool_url("stratum+tcp://pool.example.com").is_err());
+        assert!(validate_pool_url("pool.example.com:notaport").is_err());
+        assert!(validate_pool_url("stratum+tcp://:3333").is_err());
+        assert!(validate_pool_url("").is_err());
+        // Above u16.
+        assert!(validate_pool_url("pool.example.com:99999").is_err());
     }
 
     #[test]

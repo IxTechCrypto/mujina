@@ -21,7 +21,7 @@ use crate::api_client::types::{
     PoolSettingsView, SettingsPatch, SettingsResponse, SourceTelemetry, TuningRequest,
 };
 use crate::asic::bm13xx::chip_profile;
-use crate::config::{MinerSettings, PoolSettings};
+use crate::config::{MinerSettings, PoolSettings, validate_pool_url};
 use crate::tracing::prelude::*;
 
 /// Build the v0 API routes with OpenAPI metadata.
@@ -156,46 +156,60 @@ async fn get_settings(State(state): State<SharedState>) -> Json<SettingsResponse
     request_body = SettingsPatch,
     responses(
         (status = OK, description = "Updated miner settings", body = SettingsResponse),
-        (status = BAD_REQUEST, description = "Empty pool URL or user"),
+        (status = BAD_REQUEST, description = "Empty pool user, or an unusable pool URL"),
         (status = INTERNAL_SERVER_ERROR, description = "Settings could not be saved"),
     ),
 )]
 async fn patch_settings(
     State(state): State<SharedState>,
     Json(req): Json<SettingsPatch>,
-) -> Result<Json<SettingsResponse>, StatusCode> {
+) -> Result<Json<SettingsResponse>, (StatusCode, &'static str)> {
     let mut saved = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Built as a candidate and only committed to shared state once the
+    // write succeeds. Mutating in place first would leave a failed save
+    // reporting the new values back on the next GET, as though they had
+    // been stored.
+    let mut candidate = saved.clone();
 
     if let Some(name) = req.name {
         // An empty field is how a client clears the name; storing it as
         // Some("") would append a bare dot to the worker string.
         let name = name.trim();
-        saved.name = (!name.is_empty()).then(|| name.to_string());
+        candidate.name = (!name.is_empty()).then(|| name.to_string());
     }
 
     if let Some(pool) = req.pool {
         let url = pool.url.trim();
         let user = pool.user.trim();
-        if url.is_empty() || user.is_empty() {
-            return Err(StatusCode::BAD_REQUEST);
+        if user.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "pool user must not be empty"));
         }
+        // Checked here rather than at connect time: this is only read at
+        // startup, so an unusable URL would otherwise surface after a
+        // restart, with the miner down and unable to explain itself.
+        validate_pool_url(url).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
         // An absent password keeps the stored one, so a client that was
         // never shown the password can still edit the URL.
         let password = pool
             .password
-            .or_else(|| saved.pool.as_ref().map(|p| p.password.clone()))
+            .or_else(|| candidate.pool.as_ref().map(|p| p.password.clone()))
             .unwrap_or_else(|| "x".to_string());
-        saved.pool = Some(PoolSettings {
+        candidate.pool = Some(PoolSettings {
             url: url.to_string(),
             user: user.to_string(),
             password,
         });
     }
 
-    if let Err(e) = saved.save() {
+    if let Err(e) = candidate.save() {
         error!(error = %e, "Failed to save miner settings");
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "settings could not be written to disk",
+        ));
     }
+    *saved = candidate;
 
     let response = settings_response(&saved, &state.running_settings);
     if response.restart_required {
