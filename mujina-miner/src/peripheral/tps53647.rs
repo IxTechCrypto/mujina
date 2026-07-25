@@ -159,6 +159,11 @@ impl Vid {
     pub const fn raw(self) -> u8 {
         self.0
     }
+
+    /// Wrap a raw code read back from the device.
+    pub const fn from_raw(code: u8) -> Self {
+        Self(code)
+    }
 }
 
 /// Configuration applied by [`Tps53647::init`].
@@ -330,13 +335,41 @@ impl<I: I2c> Tps53647<I> {
         let vid = Vid::from_volts(volts)?;
         self.write_word(PmbusCommand::VoutCommand.as_u8(), vid.raw() as u16)
             .await?;
+
+        // Read it straight back. A write that silently does not stick --
+        // wrong register width, a part that rejects the value, a VID the
+        // controller clamps -- is otherwise indistinguishable from one that
+        // worked, and the only symptom is a rail at the wrong voltage.
+        let readback = self.commanded_vout().await?;
         debug!(
             requested_v = volts,
             vid = format!("{:#04x}", vid.raw()),
-            actual_v = vid.to_volts(),
+            encoded_v = vid.to_volts(),
+            readback_vid = format!("{:#04x}", readback.raw()),
+            readback_v = readback.to_volts(),
             "TPS53647 vout set"
         );
+        if readback != vid {
+            warn!(
+                wrote_vid = format!("{:#04x}", vid.raw()),
+                read_vid = format!("{:#04x}", readback.raw()),
+                "TPS53647 did not accept the commanded VID"
+            );
+        }
         Ok(())
+    }
+
+    /// Read back the commanded output voltage as a VID code.
+    ///
+    /// This is what the controller was *told* to produce. Comparing it
+    /// against [`vout`](Self::vout), which is what the output is actually
+    /// doing, separates "the command never landed" from "the rail is
+    /// sagging under load" -- two faults that look identical from a
+    /// hashrate figure.
+    pub async fn commanded_vout(&mut self) -> DriverResult<Vid> {
+        // The VID occupies the low byte; the part returns a word.
+        let raw = self.read_word(PmbusCommand::VoutCommand.as_u8()).await?;
+        Ok(Vid::from_raw(raw as u8))
     }
 
     /// Read the fault status registers.

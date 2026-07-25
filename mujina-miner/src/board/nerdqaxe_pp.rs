@@ -500,15 +500,30 @@ impl NerdQaxePp {
         // Held only for the duration of these four reads. The power-up path
         // takes the same lock to command the core voltage, and blocking a
         // rail bring-up behind a telemetry sweep would be a poor trade.
-        let (vin, vout, iout, vr_internal_c) = {
+        let (vin, vout, iout, vr_internal_c, commanded_v) = {
             let mut regulator = self.sensors.regulator.lock().await;
             (
                 regulator.vin().await.ok(),
                 regulator.vout().await.ok(),
                 regulator.iout().await.ok(),
                 regulator.temperature().await.ok(),
+                regulator.commanded_vout().await.ok(),
             )
         };
+
+        // Commanded against measured, under whatever load is present. If
+        // they track, the rail is doing what it was told; if measured sits
+        // persistently below commanded, the difference is droop and the
+        // chips are running at the lower number.
+        if let (Some(cmd), Some(measured)) = (commanded_v, vout) {
+            debug!(
+                commanded_v = cmd.to_volts(),
+                measured_v = measured,
+                droop_mv = (cmd.to_volts() - measured) * 1000.0,
+                iout_a = iout.unwrap_or(0.0),
+                "NerdQAxe++ core rail"
+            );
+        }
 
         let powers = vec![
             PowerMeasurement {
