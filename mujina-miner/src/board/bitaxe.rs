@@ -12,7 +12,7 @@ use tokio::{
     sync::{Mutex, watch},
     time::{self, Instant, MissedTickBehavior},
 };
-use tokio_serial::SerialPortBuilderExt;
+use tokio_serial::{SerialPort, SerialPortBuilderExt};
 use tokio_stream::StreamExt;
 use tokio_util::{
     codec::{FramedRead, FramedWrite},
@@ -83,7 +83,19 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     );
 
     // Open control port, create management channel and I2C bus
-    let control_port = tokio_serial::new(&serial_ports[0], 115200).open_native_async()?;
+    let mut control_port = tokio_serial::new(&serial_ports[0], 115200).open_native_async()?;
+
+    // Issue ESP32 auto-reset pulse via DTR/RTS lines to ensure the board boots
+    // into normal execution mode after a USB unplug/replug instead of staying
+    // stuck in reset or bootloader state.
+    debug!("Issuing ESP32 auto-reset pulse via DTR/RTS modem control lines");
+    let _ = control_port.write_data_terminal_ready(false);
+    let _ = control_port.write_request_to_send(true);
+    time::sleep(Duration::from_millis(50)).await;
+    let _ = control_port.write_request_to_send(false);
+    let _ = control_port.write_data_terminal_ready(false);
+    time::sleep(Duration::from_millis(150)).await;
+
     let control_channel = ControlChannel::new(control_port, ResponseFormat::V0);
     let mut i2c = BitaxeRawI2c::new(control_channel.clone());
 
