@@ -273,6 +273,7 @@ impl Scheduler {
             uptime_secs: self.stats.start_time.elapsed().as_secs(),
             hashrate: u64::from(self.measured_hashrate()),
             shares_submitted: self.stats.shares_submitted,
+            best_share: self.stats.best_share,
             paused: self.paused,
             boards: vec![],
             sources: self
@@ -566,6 +567,11 @@ impl Scheduler {
         // Check if share meets source threshold
         if task_entry.template.share_target.is_met_by(hash) {
             self.stats.shares_submitted += 1;
+            let diff = share_difficulty.as_f64();
+            self.stats.best_share = Some(match self.stats.best_share {
+                Some(prev) => prev.max(diff),
+                None => diff,
+            });
 
             // Submit share to originating source
             if let Some(source) = self.sources.get(task_entry.source_id) {
@@ -1137,6 +1143,7 @@ impl StartupGate {
 struct MiningStats {
     start_time: std::time::Instant,
     shares_submitted: u64,
+    best_share: Option<f64>,
 }
 
 impl Default for MiningStats {
@@ -1144,6 +1151,7 @@ impl Default for MiningStats {
         Self {
             start_time: std::time::Instant::now(),
             shares_submitted: 0,
+            best_share: None,
         }
     }
 }

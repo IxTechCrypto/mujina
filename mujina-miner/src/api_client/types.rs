@@ -17,6 +17,9 @@ pub struct MinerTelemetry {
     /// Aggregate hashrate in hashes per second.
     pub hashrate: u64,
     pub shares_submitted: u64,
+    /// Highest share difficulty achieved so far.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_share: Option<f64>,
     pub paused: bool,
     pub boards: Vec<BoardTelemetry>,
     pub sources: Vec<SourceTelemetry>,
