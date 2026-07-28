@@ -96,6 +96,10 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     let _ = control_port.write_data_terminal_ready(false);
     time::sleep(Duration::from_millis(150)).await;
 
+    // Discard any stray ROM bootloader ASCII text emitted during boot so it
+    // does not corrupt the binary packet decoder length header in ControlChannel.
+    let _ = control_port.clear(tokio_serial::ClearBuffer::Input);
+
     let control_channel = ControlChannel::new(control_port, ResponseFormat::V0);
     let mut i2c = BitaxeRawI2c::new(control_channel.clone());
 
