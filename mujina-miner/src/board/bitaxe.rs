@@ -86,6 +86,9 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     // Open control port, create management channel and I2C bus
     let mut control_port = tokio_serial::new(&serial_ports[0], 115200).open_native_async()?;
 
+    // Brief pause after opening handle on Windows to let COM port initialization settle
+    time::sleep(Duration::from_millis(20)).await;
+
     // Issue ESP32 auto-reset pulse via DTR/RTS lines to ensure the board boots
     // into normal execution mode after a USB unplug/replug instead of staying
     // stuck in reset or bootloader state.

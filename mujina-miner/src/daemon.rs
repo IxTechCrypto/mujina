@@ -112,18 +112,52 @@ impl Daemon {
         });
 
         // Create job source (Stratum v1 or Dummy)
-        // Controlled by environment variables:
+        // Controlled by environment variables or saved mujina-settings.json:
         // - MUJINA_POOL_URL: Pool address (e.g., stratum+tcp://localhost:3333)
-        // - MUJINA_POOL_USER: Worker username (optional, defaults to "mujina-testing")
-        // - MUJINA_POOL_PASS: Worker password (optional, defaults to "x")
+        // - MUJINA_POOL_USER: Worker username (optional)
+        // - MUJINA_POOL_PASS: Worker password (optional)
         let (source_event_tx, source_event_rx) = mpsc::channel::<SourceEvent>(100);
         let (source_cmd_tx, source_cmd_rx) = mpsc::channel(10);
 
-        if let Ok(pool_url) = env::var("MUJINA_POOL_URL") {
+        // Resolve pool config from env or saved settings file
+        let mut pool_url_opt = env::var("MUJINA_POOL_URL").ok();
+        let mut pool_user_opt = env::var("MUJINA_POOL_USER").ok();
+        let mut pool_pass_opt = env::var("MUJINA_POOL_PASS").ok();
+
+        if pool_url_opt.is_none() {
+            let candidates = [
+                std::path::PathBuf::from("mujina-settings.json"),
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.join("mujina-settings.json")))
+                    .unwrap_or_default(),
+            ];
+            for path in candidates {
+                if path.exists() {
+                    if let Ok(contents) = std::fs::read_to_string(&path) {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&contents) {
+                            if let Some(p) = v.get("pool") {
+                                if pool_url_opt.is_none() {
+                                    pool_url_opt = p.get("url").and_then(|s| s.as_str()).map(String::from);
+                                }
+                                if pool_user_opt.is_none() {
+                                    pool_user_opt = p.get("user").and_then(|s| s.as_str()).map(String::from);
+                                }
+                                if pool_pass_opt.is_none() {
+                                    pool_pass_opt = p.get("password").and_then(|s| s.as_str()).map(String::from);
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        if let Some(pool_url) = pool_url_opt {
             // Use Stratum v1 source
-            let pool_user =
-                env::var("MUJINA_POOL_USER").unwrap_or_else(|_| "mujina-testing".to_string());
-            let pool_pass = env::var("MUJINA_POOL_PASS").unwrap_or_else(|_| "x".to_string());
+            let pool_user = pool_user_opt.unwrap_or_else(|| "mujina-testing".to_string());
+            let pool_pass = pool_pass_opt.unwrap_or_else(|| "x".to_string());
 
             let stratum_config = StratumPoolConfig {
                 url: pool_url.clone(),
