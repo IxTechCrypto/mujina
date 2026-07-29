@@ -84,21 +84,24 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     );
 
     // Open control port, create management channel and I2C bus
-    let mut control_port = tokio_serial::new(&serial_ports[0], 115200).open_native_async()?;
+    let control_port = tokio_serial::new(&serial_ports[0], 115200).open_native_async()?;
 
     // Brief pause after opening handle on Windows to let COM port initialization settle
     time::sleep(Duration::from_millis(20)).await;
 
-    // Issue ESP32 auto-reset pulse via DTR/RTS lines to ensure the board boots
-    // into normal execution mode after a USB unplug/replug instead of staying
-    // stuck in reset or bootloader state.
-    debug!("Issuing ESP32 auto-reset pulse via DTR/RTS modem control lines");
-    let _ = control_port.write_data_terminal_ready(false);
-    let _ = control_port.write_request_to_send(true);
-    time::sleep(Duration::from_millis(50)).await;
-    let _ = control_port.write_request_to_send(false);
-    let _ = control_port.write_data_terminal_ready(false);
-    time::sleep(Duration::from_millis(150)).await;
+    // On Linux/Unix, issue ESP32 auto-reset pulse via DTR/RTS lines.
+    // On Windows, toggling RTS forces the ESP32 USB controller to detach,
+    // causing Windows usbser.sys to invalidate the open COM handle ('Control stream closed').
+    #[cfg(not(windows))]
+    {
+        debug!("Issuing ESP32 auto-reset pulse via DTR/RTS modem control lines");
+        let _ = control_port.write_data_terminal_ready(false);
+        let _ = control_port.write_request_to_send(true);
+        time::sleep(Duration::from_millis(50)).await;
+        let _ = control_port.write_request_to_send(false);
+        let _ = control_port.write_data_terminal_ready(false);
+        time::sleep(Duration::from_millis(150)).await;
+    }
 
     // Discard any stray ROM bootloader ASCII text emitted during boot so it
     // does not corrupt the binary packet decoder length header in ControlChannel.
