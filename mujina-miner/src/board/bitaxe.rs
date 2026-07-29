@@ -83,15 +83,18 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         "Opening Bitaxe Gamma serial ports"
     );
 
-    // Open control port, create management channel and I2C bus
-    let control_port = tokio_serial::new(&serial_ports[0], 115200).open_native_async()?;
+    let control_port =
+        SerialStream::new(&serial_ports[0], 115200).context("failed to open control port")?;
+    let data_stream =
+        SerialStream::new(&serial_ports[1], 115200).context("failed to open data port")?;
+    let (data_reader, data_writer, _data_control) = data_stream.split();
+    let tracing_reader = TracingReader::new(data_reader, "Data");
+    let mut data_reader = FramedRead::new(tracing_reader, bm13xx::FrameCodec);
+    let mut data_writer = FramedWrite::new(data_writer, bm13xx::FrameCodec);
 
-    // Brief pause after opening handle on Windows to let COM port initialization settle
-    time::sleep(Duration::from_millis(20)).await;
+    // Brief pause to let Windows composite USB driver settle both COM port handles
+    time::sleep(Duration::from_millis(50)).await;
 
-    // On Linux/Unix, issue ESP32 auto-reset pulse via DTR/RTS lines.
-    // On Windows, toggling RTS forces the ESP32 USB controller to detach,
-    // causing Windows usbser.sys to invalidate the open COM handle ('Control stream closed').
     #[cfg(not(windows))]
     {
         debug!("Issuing ESP32 auto-reset pulse via DTR/RTS modem control lines");
@@ -103,22 +106,12 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         time::sleep(Duration::from_millis(150)).await;
     }
 
-    // Discard any stray ROM bootloader ASCII text emitted during boot so it
-    // does not corrupt the binary packet decoder length header in ControlChannel.
+    #[cfg(not(windows))]
     let _ = control_port.clear(tokio_serial::ClearBuffer::Input);
 
     let control_channel = ControlChannel::new(control_port, ResponseFormat::V0);
     let mut i2c = BitaxeRawI2c::new(control_channel.clone());
 
-    // Open data port for chip communication
-    let data_stream =
-        SerialStream::new(&serial_ports[1], 115200).context("failed to open data port")?;
-    let (data_reader, data_writer, _data_control) = data_stream.split();
-    let tracing_reader = TracingReader::new(data_reader, "Data");
-    let mut data_reader = FramedRead::new(tracing_reader, bm13xx::FrameCodec);
-    let mut data_writer = FramedWrite::new(data_writer, bm13xx::FrameCodec);
-
-    // Get reset pin
     const ASIC_RESET_PIN: u8 = 0;
     let mut gpio_controller = BitaxeRawGpioController::new(control_channel);
     let mut reset_pin = gpio_controller.pin(ASIC_RESET_PIN).await?;
@@ -126,7 +119,6 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     // Hold ASIC in reset during power configuration
     reset_pin.write(PinValue::Low).await?;
 
-    // Initialize peripherals
     i2c.set_frequency(100_000).await?;
 
     let emc2101 = init_fan_controller(i2c.clone()).await?;

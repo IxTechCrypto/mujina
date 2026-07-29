@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
-use tokio_serial::SerialPortBuilderExt;
+use crate::transport::serial::SerialStream;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -91,9 +91,8 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         "Opening emberOne/00 serial ports"
     );
 
-    let control_port = tokio_serial::new(&serial_ports[0], 115200)
-        .open_native_async()
-        .context("failed to open control port")?;
+    let control_port =
+        SerialStream::new(&serial_ports[0], 115200).context("failed to open control port")?;
     let version = DeviceVersion::from_bcd(device.bcd_device);
     let format = response_format(&version);
     let control = ControlChannel::new(control_port, format);

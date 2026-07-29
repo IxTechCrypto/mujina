@@ -3,13 +3,14 @@
 //! This module provides a control channel abstraction that handles
 //! packet ID management and request/response correlation.
 
+use crate::tracing::prelude::*;
 use futures::SinkExt;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time;
-use tokio_serial::SerialStream;
+use crate::transport::serial::{SerialReader, SerialStream, SerialWriter};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -25,8 +26,8 @@ pub struct ControlChannel {
 }
 
 struct ControlChannelInner {
-    writer: FramedWrite<tokio::io::WriteHalf<SerialStream>, ControlCodec>,
-    reader: FramedRead<tokio::io::ReadHalf<SerialStream>, ControlCodec>,
+    writer: FramedWrite<SerialWriter, ControlCodec>,
+    reader: FramedRead<SerialReader, ControlCodec>,
     next_id: u8,
 }
 
@@ -36,7 +37,7 @@ impl ControlChannel {
     /// The `format` parameter selects the response framing and error
     /// signaling variant. See [`ResponseFormat`] for details.
     pub fn new(stream: SerialStream, format: ResponseFormat) -> Self {
-        let (reader, writer) = tokio::io::split(stream);
+        let (reader, writer, _control) = stream.split();
         Self {
             inner: Arc::new(Mutex::new(ControlChannelInner {
                 writer: FramedWrite::new(writer, ControlCodec::new(format)),
