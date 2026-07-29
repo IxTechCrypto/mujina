@@ -190,7 +190,7 @@ fn build_stream(path: &str, config: &SerialConfig) -> Result<TokioSerialStream, 
         .data_bits(data_bits)
         .stop_bits(stop_bits)
         .parity(config.parity.into())
-        .timeout(Duration::from_millis(0))
+        .timeout(Duration::from_secs(10))
         .open_native_async()
         .map_err(|e| SerialError::OpenError(io::Error::other(e)))
 }

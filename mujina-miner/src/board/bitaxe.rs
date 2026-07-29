@@ -83,10 +83,10 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         "Opening Bitaxe Gamma serial ports"
     );
 
-    let control_port =
-        SerialStream::new(&serial_ports[0], 115200).context("failed to open control port")?;
-    let data_stream =
-        SerialStream::new(&serial_ports[1], 115200).context("failed to open data port")?;
+    let control_port = SerialStream::new(&serial_ports[0], 115200)
+        .context("failed to open control port")?;
+    let data_stream = SerialStream::new(&serial_ports[1], 115200)
+        .context("failed to open data port")?;
     let (data_reader, data_writer, _data_control) = data_stream.split();
     let tracing_reader = TracingReader::new(data_reader, "Data");
     let mut data_reader = FramedRead::new(tracing_reader, bm13xx::FrameCodec);
