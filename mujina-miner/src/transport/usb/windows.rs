@@ -76,11 +76,31 @@ pub async fn get_serial_ports(device_path: &str, expected: usize) -> Result<Vec<
 fn matching_ports(device_path: &str) -> Result<Vec<String>> {
     let mut matched: Vec<(Option<u8>, String)> = Vec::new();
 
+    // First attempt: try exact match including serial number (make_key)
     for port in available_ports()? {
         if let SerialPortType::UsbPort(usb) = &port.port_type
             && make_key(usb.vid, usb.pid, usb.serial_number.as_deref()) == device_path
         {
             matched.push((usb.interface, port.port_name.clone()));
+        }
+    }
+
+    // If no exact match was found, fall back to matching by VID:PID only on Windows.
+    // This handles cases where Windows generates a synthetic serial for nusb but
+    // reports Serial: None in SetupAPI / available_ports.
+    if matched.is_empty() {
+        let parts: Vec<&str> = device_path.split(':').collect();
+        if parts.len() >= 2 {
+            let target_vid = u16::from_str_radix(parts[0], 16).unwrap_or(0);
+            let target_pid = u16::from_str_radix(parts[1], 16).unwrap_or(0);
+            for port in available_ports()? {
+                if let SerialPortType::UsbPort(usb) = &port.port_type
+                    && usb.vid == target_vid
+                    && usb.pid == target_pid
+                {
+                    matched.push((usb.interface, port.port_name.clone()));
+                }
+            }
         }
     }
 

@@ -115,8 +115,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         "Opening NerdQAxe++ serial ports"
     );
 
-    let control_port = tokio_serial::new(&serial_ports[0], 115200)
-        .open_native_async()
+    let control_port = SerialStream::new(&serial_ports[0], 115200)
         .context("failed to open control port")?;
     let control = ControlChannel::new(control_port, ResponseFormat::V0);
 

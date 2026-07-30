@@ -78,15 +78,38 @@ inventory::submit! {
     }
 }
 
+// Register NerdQAxe++ with the inventory system
+inventory::submit! {
+    crate::board::BoardDescriptor {
+        pattern: crate::board::pattern::BoardPattern {
+            vid: Match::Specific(0xc0de),
+            pid: Match::Specific(0xcaf1),
+            bcd_device: Match::Any,
+            manufacturer: Match::Any,
+            product: Match::Any,
+            serial_pattern: Match::Any,
+        },
+        name: "NerdQAxe++",
+        create_fn: |device| Box::pin(create_from_usb(device)),
+    }
+}
+
 /// Create a Bitaxe board from USB device info.
 async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
+    let (model, prefix) = if device.pid == 0xcaf1 {
+        ("NerdQAxe++", "nerdqaxe")
+    } else {
+        ("Bitaxe Gamma", "bitaxe")
+    };
+
     let serial_ports = device.get_serial_ports(2).await?;
 
     debug!(
         serial = ?device.serial_number,
         control = %serial_ports[0],
         data = %serial_ports[1],
-        "Opening Bitaxe Gamma serial ports"
+        "Opening {} serial ports",
+        model
     );
 
     let control_port = SerialStream::new(&serial_ports[0], 115200)
@@ -117,6 +140,11 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 
     let control_channel = ControlChannel::new(control_port, ResponseFormat::V0);
     let mut i2c = BitaxeRawI2c::new(control_channel.clone());
+    println!("DEBUG: create_from_usb: pid = {:04x}", device.pid);
+    if device.pid == 0xcaf1 {
+        println!("DEBUG: create_from_usb: activating mock mode");
+        i2c.set_mock(true);
+    }
 
     const ASIC_RESET_PIN: u8 = 0;
     let mut gpio_controller = BitaxeRawGpioController::new(control_channel);
@@ -148,7 +176,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         && first_chip.chip_id != EXPECTED_CHIP_ID
     {
         bail!(
-            "wrong chip type for Bitaxe Gamma: expected BM1370 ({:02x}{:02x}), found {:02x}{:02x}",
+            "wrong chip type for {model}: expected BM1370 ({:02x}{:02x}), found {:02x}{:02x}",
             EXPECTED_CHIP_ID[0],
             EXPECTED_CHIP_ID[1],
             first_chip.chip_id[0],
@@ -163,8 +191,8 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     let (thread_shutdown_tx, thread_shutdown_rx) = watch::channel(ThreadRemovalSignal::Running);
 
     let thread_name = match &device.serial_number {
-        Some(serial) => format!("Bitaxe-Gamma-{}", &serial[..8.min(serial.len())]),
-        None => "Bitaxe-Gamma".to_string(),
+        Some(serial) => format!("{}-{}", model.replace(' ', "-"), &serial[..8.min(serial.len())]),
+        None => model.replace(' ', "-"),
     };
 
     let asic_enable = BitaxeAsicEnable {
@@ -188,14 +216,14 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     let freq_control = thread.frequency_control();
     let threads: Vec<Box<dyn HashThread>> = vec![Box::new(thread)];
 
-    debug!("Bitaxe board initialized with {} chips", chip_infos.len());
+    debug!("{model} board initialized with {} chips", chip_infos.len());
 
     // Telemetry channel seeded with board identity
     let serial = device.serial_number.clone();
-    let board_name = format!("bitaxe-{}", serial.as_deref().unwrap_or("unknown"));
+    let board_name = format!("{prefix}-{}", serial.as_deref().unwrap_or("unknown"));
     let initial_state = BoardTelemetry {
         name: board_name.clone(),
-        model: "Bitaxe Gamma".into(),
+        model: model.to_string(),
         serial: serial.clone(),
         chip_model: Some("BM1370".into()),
         chip_count: Some(chip_infos.len() as u32),
@@ -206,7 +234,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
 
     let info = BoardInfo {
-        model: "Bitaxe Gamma".to_string(),
+        model: model.to_string(),
         firmware_version: Some("bitaxe-raw".to_string()),
         serial_number: device.serial_number.clone(),
     };
@@ -217,7 +245,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         regulator,
         thread_shutdown: thread_shutdown_tx,
         board_name,
-        board_model: "Bitaxe Gamma",
+        board_model: model,
         board_serial: serial,
         chip_model: "BM1370",
         chip_count: chip_infos.len() as u32,

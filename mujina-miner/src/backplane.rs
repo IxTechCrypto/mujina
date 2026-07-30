@@ -134,7 +134,12 @@ impl Backplane {
     }
 
     /// Route a board connection's parts to where they belong.
-    async fn start_board(&mut self, board_id: String, conn: BackplaneConnector) {
+    async fn start_board(
+        &mut self,
+        board_id: String,
+        device_path: Option<String>,
+        conn: BackplaneConnector,
+    ) {
         let BackplaneConnector {
             info,
             threads,
@@ -185,7 +190,14 @@ impl Backplane {
             }
         }
 
-        self.boards.insert(board_id, ActiveBoard { info, shutdown });
+        self.boards.insert(
+            board_id,
+            ActiveBoard {
+                info,
+                device_path,
+                shutdown,
+            },
+        );
     }
 
     /// Tell the scheduler that startup enumeration across all transports is
@@ -220,6 +232,7 @@ impl Backplane {
                     "Hash board connected via USB."
                 );
 
+                let device_path_clone = device_info.device_path.clone();
                 let conn = match (descriptor.create_fn)(device_info).await {
                     Ok(conn) => conn,
                     Err(e) => {
@@ -232,21 +245,28 @@ impl Backplane {
                     }
                 };
 
-                let board_id = conn
-                    .info
-                    .serial_number
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string());
+                let board_id = if let Some(ref serial) = conn.info.serial_number {
+                    serial.clone()
+                } else {
+                    format!(
+                        "unknown-{}",
+                        device_path_clone.replace(['/', '\\', ':', '.'], "-")
+                    )
+                };
 
-                self.start_board(board_id, conn).await;
+                self.start_board(board_id, Some(device_path_clone), conn).await;
             }
-            UsbTransportEvent::UsbDeviceDisconnected { device_path: _ } => {
-                // Find and shutdown the board
-                // Note: Current design uses serial number as key, but we get device_path
-                // in disconnect event. For single-board setups this works fine.
-                // TODO: Maintain device_path -> board_id mapping for multi-board support
-                let board_ids: Vec<String> = self.boards.keys().cloned().collect();
-                for board_id in board_ids {
+            UsbTransportEvent::UsbDeviceDisconnected { device_path } => {
+                // Find and shutdown the board matching this device_path
+                let board_id = self.boards.iter().find_map(|(id, board)| {
+                    if board.device_path.as_deref() == Some(device_path.as_str()) {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(board_id) = board_id {
                     if let Some(mut board) = self.boards.remove(&board_id) {
                         board.shutdown().await;
                         info!(
@@ -254,8 +274,9 @@ impl Backplane {
                             serial = %board_id,
                             "Board disconnected"
                         );
-                        break; // For now, assume one board per device
                     }
+                } else {
+                    warn!(%device_path, "Disconnected device not found in active boards");
                 }
             }
         }
@@ -292,7 +313,7 @@ impl Backplane {
                 };
 
                 let board_id = device_info.device_id.clone();
-                self.start_board(board_id, conn).await;
+                self.start_board(board_id, None, conn).await;
             }
             CpuTransportEvent::CpuDeviceDisconnected { device_id } => {
                 if let Some(mut board) = self.boards.remove(&device_id) {
@@ -309,6 +330,7 @@ impl Backplane {
 /// Per-board state the backplane keeps for lifecycle management.
 struct ActiveBoard {
     info: BoardInfo,
+    device_path: Option<String>,
     shutdown: Option<BoxFuture<'static, ()>>,
 }
 
