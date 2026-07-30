@@ -37,6 +37,12 @@ pub enum Error<E> {
     /// Device ID register returned an unexpected value
     #[error("unexpected device ID: 0x{0:04X}")]
     UnexpectedDeviceId(u16),
+
+    /// The temperature register read back a value outside the part's
+    /// rated range, which means the bus floated rather than a device
+    /// answering.
+    #[error("implausible temperature reading 0x{0:04X}; no sensor at this address")]
+    NoSensor(u16),
 }
 
 /// A raw temperature reading from the TMP1075.
@@ -77,12 +83,38 @@ impl<I: I2c> Tmp1075<I> {
     }
 
     /// Verify the device ID register.
+    ///
+    /// Only valid on the base TMP1075. The TMP1075**N** has no Die ID
+    /// register and will fail here -- use [`probe`](Self::probe) for that
+    /// variant.
     pub async fn init(&mut self) -> Result<()> {
         let id = self.read_register(Register::DieId).await?;
         if id != DEVICE_ID {
             return Err(Error::UnexpectedDeviceId(id));
         }
         Ok(())
+    }
+
+    /// Confirm a sensor is present without reading the Die ID.
+    ///
+    /// The TMP1075N drops the Die ID register that [`init`](Self::init)
+    /// checks, so identification has to come from the temperature
+    /// register instead. A missing device NACKs its address and surfaces
+    /// as an I2C error; a present one returns a reading inside the part's
+    /// operating range. Values above the datasheet maximum mean the bus
+    /// floated high rather than a device answering, which is the failure
+    /// this catches that a bare ACK check would not.
+    pub async fn probe(&mut self) -> Result<Reading> {
+        /// Highest code the 12-bit register can hold, 127.9375 C. The
+        /// part is only rated to 128 C, so anything at the rail is a
+        /// floating bus, not a temperature.
+        const MAX_VALID_RAW: u16 = 0x7FF0;
+
+        let raw = self.read_register(Register::Temp).await?;
+        if raw >= MAX_VALID_RAW {
+            return Err(Error::NoSensor(raw));
+        }
+        Ok(Reading::from_raw(raw))
     }
 
     /// Read the current temperature.

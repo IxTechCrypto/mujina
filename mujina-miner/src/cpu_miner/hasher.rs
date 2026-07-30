@@ -308,6 +308,8 @@ fn try_nonce(task: &HashTask, merkle_root: bitcoin::TxMerkleNode, nonce: u32) ->
 
     if task.share_target.is_met_by(hash) {
         Some(Share {
+            // A CPU thread has no chain and no chips to attribute to.
+            chip: None,
             nonce,
             hash,
             version: template.version.base(),

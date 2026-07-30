@@ -15,6 +15,7 @@ use crate::tracing::prelude::*;
 use crate::{
     api::{self, ApiConfig, commands::SchedulerCommand},
     backplane::Backplane,
+    config::MinerSettings,
     cpu_miner::CpuMinerConfig,
     job_source::{
         SourceCommand, SourceEvent,
@@ -44,6 +45,13 @@ impl Daemon {
 
     /// Run the daemon until shutdown is requested.
     pub async fn run(self) -> anyhow::Result<()> {
+        // User-editable settings (miner name, pool). Loaded once: everything
+        // downstream captures its values at startup.
+        let settings = MinerSettings::load();
+        if let Some(name) = settings.name.as_deref() {
+            info!(name, "Miner name");
+        }
+
         // Create channels for component communication. Each transport gets its
         // own event channel; the backplane waits for one enumeration completion
         // per channel.
@@ -111,58 +119,28 @@ impl Daemon {
             }
         });
 
-        // Create job source (Stratum v1 or Dummy)
-        // Controlled by environment variables or saved mujina-settings.json:
-        // - MUJINA_POOL_URL: Pool address (e.g., stratum+tcp://localhost:3333)
-        // - MUJINA_POOL_USER: Worker username (optional)
-        // - MUJINA_POOL_PASS: Worker password (optional)
+        // Create job source (Stratum v1 or Dummy).
+        //
+        // Settings come from the saved settings file, falling back to
+        // MUJINA_POOL_URL / _USER / _PASS when it has none. Read once here:
+        // changing the pool from the API rewrites the file and takes effect
+        // on the next start, so there is no reconfigure path to honor.
         let (source_event_tx, source_event_rx) = mpsc::channel::<SourceEvent>(100);
         let (source_cmd_tx, source_cmd_rx) = mpsc::channel(10);
 
-        // Resolve pool config from env or saved settings file
-        let mut pool_url_opt = env::var("MUJINA_POOL_URL").ok();
-        let mut pool_user_opt = env::var("MUJINA_POOL_USER").ok();
-        let mut pool_pass_opt = env::var("MUJINA_POOL_PASS").ok();
-
-        if pool_url_opt.is_none() {
-            let candidates = [
-                std::path::PathBuf::from("mujina-settings.json"),
-                std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| d.join("mujina-settings.json")))
-                    .unwrap_or_default(),
-            ];
-            for path in candidates {
-                if path.exists() {
-                    if let Ok(contents) = std::fs::read_to_string(&path) {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&contents) {
-                            if let Some(p) = v.get("pool") {
-                                if pool_url_opt.is_none() {
-                                    pool_url_opt = p.get("url").and_then(|s| s.as_str()).map(String::from);
-                                }
-                                if pool_user_opt.is_none() {
-                                    pool_user_opt = p.get("user").and_then(|s| s.as_str()).map(String::from);
-                                }
-                                if pool_pass_opt.is_none() {
-                                    pool_pass_opt = p.get("password").and_then(|s| s.as_str()).map(String::from);
-                                }
-                            }
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-
-        if let Some(pool_url) = pool_url_opt {
-            // Use Stratum v1 source
-            let pool_user = pool_user_opt.unwrap_or_else(|| "mujina-testing".to_string());
-            let pool_pass = pool_pass_opt.unwrap_or_else(|| "x".to_string());
+        if let Some(pool) = settings.pool.clone() {
+            let pool_url = pool.url;
+            // The miner's name rides along as the worker suffix, so a named
+            // rig is identifiable on the pool side and not just locally.
+            let username = settings
+                .worker_username()
+                .unwrap_or_else(|| pool.user.clone());
+            info!(url = %pool_url, worker = %username, "Connecting to pool");
 
             let stratum_config = StratumPoolConfig {
                 url: pool_url.clone(),
-                username: pool_user,
-                password: pool_pass,
+                username,
+                password: pool.password,
                 user_agent: "mujina-miner/0.1.0-alpha".to_string(),
             };
 
@@ -244,7 +222,7 @@ impl Daemon {
             }
         } else {
             // Use DummySource
-            info!("Using dummy job source (set MUJINA_POOL_URL to use Stratum v1)");
+            info!("Using dummy job source (configure a pool, or set MUJINA_POOL_URL)");
 
             let dummy_source = DummySource::new(
                 source_cmd_rx,
@@ -303,6 +281,7 @@ impl Daemon {
                     miner_telemetry_rx,
                     board_reg_rx,
                     scheduler_cmd_tx,
+                    settings,
                 )
                 .await
                 {

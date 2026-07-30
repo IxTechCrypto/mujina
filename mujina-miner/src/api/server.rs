@@ -15,11 +15,13 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_swagger_ui::SwaggerUi;
 
 use super::{
+    autotune::{self, SharedAutoTuner},
     commands::SchedulerCommand,
     registry::{BoardRegistration, BoardRegistry},
     v0,
 };
 use crate::api_client::types::MinerTelemetry;
+use crate::config::MinerSettings;
 
 /// API server configuration.
 #[derive(Debug, Clone)]
@@ -34,6 +36,13 @@ pub(crate) struct SharedState {
     pub miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     pub board_registry: Arc<Mutex<BoardRegistry>>,
     pub scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
+    pub autotuner: SharedAutoTuner,
+    /// The settings as last saved. Edited by `PATCH /settings`.
+    pub settings: Arc<Mutex<MinerSettings>>,
+    /// The settings this process actually started with, kept so the API can
+    /// tell the client honestly whether a restart is pending. Immutable for
+    /// the life of the daemon, which is exactly the point.
+    pub running_settings: Arc<MinerSettings>,
 }
 
 impl SharedState {
@@ -45,7 +54,11 @@ impl SharedState {
             .board_registry
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .boards();
+            .boards(&telemetry.threads);
+        // The name shown is the one in effect, not the one pending a
+        // restart, so the dashboard header never claims a rename that the
+        // pool has not seen.
+        telemetry.name = self.running_settings.name.clone();
         telemetry
     }
 }
@@ -65,6 +78,7 @@ pub async fn serve(
     miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     mut board_reg_rx: mpsc::Receiver<BoardRegistration>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
+    running_settings: MinerSettings,
 ) -> Result<()> {
     let board_registry = Arc::new(Mutex::new(BoardRegistry::new()));
 
@@ -79,7 +93,22 @@ pub async fn serve(
         }
     });
 
-    let app = build_router(miner_telemetry_rx, board_registry, scheduler_cmd_tx);
+    // Auto-tuning supervisor, sharing its state with the API handlers.
+    let autotuner: SharedAutoTuner = Default::default();
+    tokio::spawn(autotune::run(
+        autotuner.clone(),
+        board_registry.clone(),
+        miner_telemetry_rx.clone(),
+        shutdown.clone(),
+    ));
+
+    let app = build_router(
+        miner_telemetry_rx,
+        board_registry,
+        scheduler_cmd_tx,
+        autotuner,
+        running_settings,
+    );
 
     let listener = TcpListener::bind(&config.bind_addr).await?;
     let actual_addr = listener.local_addr()?;
@@ -110,11 +139,18 @@ pub(crate) fn build_router(
     miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     board_registry: Arc<Mutex<BoardRegistry>>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
+    autotuner: SharedAutoTuner,
+    running_settings: MinerSettings,
 ) -> Router {
     let state = SharedState {
         miner_telemetry_rx,
         board_registry,
         scheduler_cmd_tx,
+        autotuner,
+        // Seeded from what is running; PATCH replaces it and rewrites the
+        // file, and the two are compared to detect a pending restart.
+        settings: Arc::new(Mutex::new(running_settings.clone())),
+        running_settings: Arc::new(running_settings),
     };
 
     let (router, api) = OpenApiRouter::new()
@@ -166,12 +202,22 @@ mod tests {
         let mut board_senders = Vec::new();
         for state in board_states {
             let (tx, rx) = watch::channel(state);
-            registry.push(BoardRegistration { telemetry_rx: rx });
+            registry.push(BoardRegistration {
+                telemetry_rx: rx,
+                command_tx: None,
+                thread_names: Vec::new(),
+            });
             board_senders.push(tx);
         }
 
         TestFixtures {
-            router: build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx),
+            router: build_router(
+                miner_rx,
+                Arc::new(Mutex::new(registry)),
+                cmd_tx,
+                Default::default(),
+                MinerSettings::default(),
+            ),
             _board_senders: board_senders,
             _miner_tx: miner_tx,
             _cmd_rx: cmd_rx,

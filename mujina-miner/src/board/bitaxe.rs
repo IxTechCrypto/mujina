@@ -9,7 +9,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, ReadBuf},
-    sync::{Mutex, watch},
+    sync::{Mutex, mpsc, watch},
     time::{self, Instant, MissedTickBehavior},
 };
 use tokio_serial::{SerialPort, SerialPortBuilderExt};
@@ -20,12 +20,18 @@ use tokio_util::{
 };
 
 use crate::{
+    api::BoardCommand,
     api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
     asic::{
         ChipInfo,
-        bm13xx::{self, BM13xxProtocol, protocol::Command, thread::BM13xxThread},
+        bm13xx::{
+            self, BM13xxProtocol,
+            protocol::Command,
+            thread::{BM13xxThread, FrequencyControl},
+        },
         hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
     },
+    board::fan_control::FanController,
     hw_trait::{
         gpio::{Gpio, GpioPin, PinValue},
         i2c::I2c,
@@ -132,48 +138,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     debug!("De-asserting ASIC nRST");
     reset_pin.write(PinValue::High).await?;
 
-    time::sleep(Duration::from_millis(500)).await;
-
-    // Version mask + chip discovery, retried a few times. A cold ASIC can
-    // miss the first round if its UART is not fully up, so re-send the
-    // version mask and re-run discovery until chips answer rather than
-    // failing the whole board on a single silent window.
-    const DISCOVERY_ATTEMPTS: usize = 5;
-    let mut chip_infos = Vec::new();
-    for attempt in 1..=DISCOVERY_ATTEMPTS {
-        debug!("Sending version mask configuration (3 times)");
-        for i in 1..=3 {
-            trace!("Version mask send {}/3", i);
-            let version_cmd = Command::WriteRegister {
-                broadcast: true,
-                chip_address: 0x00,
-                register: bm13xx::protocol::Register::VersionMask(
-                    bm13xx::protocol::VersionMask::full_rolling(),
-                ),
-            };
-            data_writer
-                .send(version_cmd)
-                .await
-                .context("failed to send config command")?;
-            time::sleep(Duration::from_millis(5)).await;
-        }
-
-        time::sleep(Duration::from_millis(10)).await;
-
-        match discover_chips(&mut data_reader, &mut data_writer).await {
-            Ok(chips) => {
-                chip_infos = chips;
-                break;
-            }
-            Err(e) if attempt < DISCOVERY_ATTEMPTS => {
-                warn!(
-                    "Chip discovery attempt {attempt}/{DISCOVERY_ATTEMPTS} failed: {e}; retrying"
-                );
-                time::sleep(Duration::from_millis(200)).await;
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    let chip_infos = discover_chain(&mut data_reader, &mut data_writer).await?;
 
     debug!(count = chip_infos.len(), "Discovered chips");
 
@@ -218,7 +183,9 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         data_writer,
         peripherals,
         thread_shutdown_rx,
+        chip_infos.len(),
     );
+    let freq_control = thread.frequency_control();
     let threads: Vec<Box<dyn HashThread>> = vec![Box::new(thread)];
 
     debug!("Bitaxe board initialized with {} chips", chip_infos.len());
@@ -230,7 +197,10 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         name: board_name.clone(),
         model: "Bitaxe Gamma".into(),
         serial: serial.clone(),
+        chip_model: Some("BM1370".into()),
+        chip_count: Some(chip_infos.len() as u32),
         frequency_mhz: Some(bm13xx::thread::TARGET_FREQUENCY_MHZ),
+        thread_count: threads.len() as u32,
         ..Default::default()
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
@@ -249,13 +219,23 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         board_name,
         board_model: "Bitaxe Gamma",
         board_serial: serial,
+        chip_model: "BM1370",
+        chip_count: chip_infos.len() as u32,
+        thread_count: threads.len() as u32,
+        fan: FanController::default(),
+        freq_control,
+        current_freq_mhz: bm13xx::thread::TARGET_FREQUENCY_MHZ,
         over_temp_count: 0,
         sensor_fault_count: 0,
         asic_enable: asic_enable_monitor,
     };
 
+    // Runtime command channel (fan control, etc.). Small buffer: commands
+    // are rare, human-driven API calls.
+    let (command_tx, command_rx) = mpsc::channel::<BoardCommand>(8);
+
     let cancel = CancellationToken::new();
-    let monitor_handle = tokio::spawn(bitaxe.run_monitor(telemetry_tx, cancel.clone()));
+    let monitor_handle = tokio::spawn(bitaxe.run_monitor(telemetry_tx, command_rx, cancel.clone()));
 
     let shutdown = Box::pin(async move {
         cancel.cancel();
@@ -266,9 +246,21 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         info,
         threads,
         telemetry_rx,
+        command_tx: Some(command_tx),
         shutdown: Some(shutdown),
     })
 }
+
+/// Lowest core voltage accepted from a runtime tuning request, in mV.
+/// Aliases the BM1370 entry in [`bm13xx::chip_profile`], the single
+/// source of truth for chip envelopes.
+const MIN_CORE_VOLTAGE_MV: u16 = bm13xx::chip_profile::BM1370.min_voltage_mv;
+/// Highest core voltage accepted from a runtime tuning request, in mV.
+/// The BM1370 should not run above ~1300 mV sustained.
+const MAX_CORE_VOLTAGE_MV: u16 = bm13xx::chip_profile::BM1370.max_voltage_mv;
+
+/// Board monitor tick period. Also the fan controller's integral dt.
+const MONITOR_TICK: Duration = Duration::from_secs(2);
 
 /// Internal state owned by the board monitor task.
 ///
@@ -280,6 +272,21 @@ struct Bitaxe {
     board_name: String,
     board_model: &'static str,
     board_serial: Option<String>,
+    /// ASIC chip model, for `chip_profile` lookups (tuning bounds, target
+    /// mode UI ranges). Bitaxe boards are single-chain BM1370.
+    chip_model: &'static str,
+    /// Number of ASIC chips discovered on this board's chain.
+    chip_count: u32,
+    /// Number of hash threads handed to the backplane. Fixed for the
+    /// board's lifetime; re-sent on every telemetry update so the field
+    /// does not decay to the `Default` zero after the first snapshot.
+    thread_count: u32,
+    /// Fan control policy and its PI state, evaluated each monitor cycle.
+    fan: FanController,
+    /// Handle for retuning the ASIC hash clock at runtime.
+    freq_control: FrequencyControl,
+    /// Last hash clock commanded to the ASIC, in MHz. Reported in telemetry.
+    current_freq_mhz: f32,
     /// Consecutive readings at or above the emergency temperature.
     /// Triggers a fast thermal shutdown.
     over_temp_count: u32,
@@ -295,9 +302,10 @@ impl Bitaxe {
     async fn run_monitor(
         mut self,
         telemetry_tx: watch::Sender<BoardTelemetry>,
+        mut command_rx: mpsc::Receiver<BoardCommand>,
         cancel: CancellationToken,
     ) {
-        let mut tick = time::interval(Duration::from_secs(2));
+        let mut tick = time::interval(MONITOR_TICK);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut last_log = Instant::now();
 
@@ -310,6 +318,9 @@ impl Bitaxe {
                         return;
                     }
                 }
+                Some(cmd) = command_rx.recv() => {
+                    self.handle_command(cmd).await;
+                }
                 _ = cancel.cancelled() => {
                     self.shutdown().await;
                     if let Err(e) = self.emc2101.set_fan_speed(Percent::new_clamped(25)).await {
@@ -317,6 +328,50 @@ impl Bitaxe {
                     }
                     return;
                 }
+            }
+        }
+    }
+
+    /// Apply a runtime command.
+    ///
+    /// Fan changes take effect on the next monitor tick; voltage and
+    /// frequency are applied immediately to the hardware here.
+    async fn handle_command(&mut self, cmd: BoardCommand) {
+        match cmd {
+            BoardCommand::SetFanControl { update, reply } => {
+                self.fan.update(update);
+                info!(policy = ?self.fan.control(), "Fan control updated");
+                let _ = reply.send(Ok(()));
+            }
+            BoardCommand::SetCoreVoltage { millivolts, reply } => {
+                let clamped = millivolts.clamp(MIN_CORE_VOLTAGE_MV, MAX_CORE_VOLTAGE_MV);
+                let volts = clamped as f32 / 1000.0;
+                let result = self.regulator.lock().await.set_vout(volts).await;
+                match &result {
+                    Ok(()) => info!(millivolts = clamped, "Core voltage set"),
+                    Err(e) => warn!(error = %e, "Failed to set core voltage"),
+                }
+                let _ = reply.send(result);
+            }
+            BoardCommand::SetFrequency { mhz, reply } => {
+                // A live PLL ramp takes seconds. Run it in a detached task so
+                // the monitor loop keeps calling monitor_tick — the thermal
+                // watchdog must not be starved while the clock is changing.
+                // Reflect the requested (clamped) clock in telemetry now; the
+                // thread owns the actual ramp.
+                self.current_freq_mhz = mhz.clamp(
+                    bm13xx::thread::MIN_FREQUENCY_MHZ,
+                    bm13xx::thread::MAX_FREQUENCY_MHZ,
+                );
+                let freq_control = self.freq_control.clone();
+                tokio::spawn(async move {
+                    let result = freq_control.set(mhz).await;
+                    match &result {
+                        Ok(()) => info!(mhz, "Hash clock retune complete"),
+                        Err(e) => warn!(error = %e, "Failed to set hash clock"),
+                    }
+                    let _ = reply.send(result);
+                });
             }
         }
     }
@@ -459,17 +514,41 @@ impl Bitaxe {
             );
         }
 
+        // Apply the fan control policy. In manual mode the operator's duty
+        // cycle is held and the PI state is reset so a later switch back to
+        // automatic starts clean rather than resuming a stale integral. In
+        // automatic mode the raw reading is EMA-filtered and fed to the PI
+        // curve; when the temperature is unreadable we leave the fan where
+        // it is rather than guess (the emergency and sensor-fault paths
+        // above own the sustained-failure cases), and the filter/integral
+        // simply hold at their last value until a reading returns.
+        let commanded_percent = self.fan.tick(asic_temp, MONITOR_TICK.as_secs_f32());
+        if let Some(percent) = commanded_percent
+            && let Err(e) = self
+                .emc2101
+                .set_fan_speed(Percent::new_clamped(percent))
+                .await
+        {
+            warn!("Failed to set fan speed: {}", e);
+        }
+
         // Publish telemetry
         let _ = tx.send(BoardTelemetry {
             name: self.board_name.clone(),
             model: self.board_model.into(),
             serial: self.board_serial.clone(),
-            frequency_mhz: Some(bm13xx::thread::TARGET_FREQUENCY_MHZ),
+            chip_model: Some(self.chip_model.into()),
+            chip_count: Some(self.chip_count),
+            frequency_mhz: Some(self.current_freq_mhz),
+            thread_count: self.thread_count,
             fans: vec![Fan {
                 name: "fan".into(),
                 rpm: fan_rpm,
                 percent: fan_percent,
-                target_percent: None,
+                target_percent: commanded_percent,
+                auto: Some(self.fan.control().is_auto()),
+                target_c: self.fan.control().target_c(),
+                min_percent: self.fan.control().min_percent(),
             }],
             temperatures: vec![
                 TemperatureSensor {
@@ -507,6 +586,7 @@ impl Bitaxe {
                 serial = ?self.board_serial,
                 asic_temp_c = ?asic_temp,
                 fan_percent = ?fan_percent,
+                fan_target_percent = ?commanded_percent,
                 fan_rpm = ?fan_rpm,
                 vr_temp_c = ?vr_temp,
                 power_w = ?power_mw.map(|mw| mw as f32 / 1000.0),
@@ -598,7 +678,7 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
 
     time::sleep(Duration::from_millis(100)).await;
 
-    const DEFAULT_VOUT: f32 = 1.15;
+    const DEFAULT_VOUT: f32 = bm13xx::chip_profile::BM1370.default_voltage_mv as f32 / 1000.0;
     tps546
         .set_vout(DEFAULT_VOUT)
         .await
@@ -619,10 +699,41 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
     Ok(tps546)
 }
 
-async fn discover_chips(
+/// Discard any frames already sitting in the reader.
+///
+/// Used to make each discovery attempt independent of the last. Stops at
+/// the first quiet moment rather than reading for a fixed period, so it
+/// costs nothing on the common path where nothing is pending.
+async fn drain_pending(reader: &mut FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>) {
+    /// How long to wait for a straggler before calling the line quiet.
+    const QUIET: Duration = Duration::from_millis(20);
+
+    // Ends on a quiet line or a closed stream; either way there is nothing
+    // stale left to confuse the caller.
+    let mut dropped = 0usize;
+    while let Ok(Some(_)) = time::timeout(QUIET, reader.next()).await {
+        dropped += 1;
+    }
+    if dropped > 0 {
+        debug!(dropped, "Discarded stale frames before chip discovery");
+    }
+}
+
+pub(crate) async fn discover_chips(
     reader: &mut FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>,
     writer: &mut FramedWrite<SerialWriter, bm13xx::FrameCodec>,
 ) -> Result<Vec<ChipInfo>> {
+    // Drop anything already buffered before asking.
+    //
+    // A discovery attempt that times out does not cancel the chips'
+    // replies -- they simply arrive after the window closed and sit in the
+    // reader. The next attempt would then count them *plus* its own,
+    // reporting twice the real chip count. Observed on a 4-chip chain as
+    // "discovered 8": the first attempt was too early, and the second saw
+    // both sets. A single chip answers fast enough that this rarely shows
+    // up on the Bitaxe, which is why it survived this long.
+    drain_pending(reader).await;
+
     let discover_cmd = BM13xxProtocol::discover_chips();
 
     writer
@@ -674,6 +785,56 @@ async fn discover_chips(
     Ok(chip_infos)
 }
 
+/// Bring a freshly-reset BM13xx chain up to the point of enumeration.
+///
+/// The caller must have already released the ASIC(s) from reset. This waits
+/// for the chip UARTs to boot, broadcasts the version-mask configuration the
+/// chips need before they will answer, then discovers them — retrying the
+/// whole preamble because a cold ASIC can miss the first round while its
+/// UART is still coming up. Shared by every BM13xx board (Bitaxe, NerdQAxe++)
+/// so the proven timing lives in one place.
+pub(crate) async fn discover_chain(
+    reader: &mut FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>,
+    writer: &mut FramedWrite<SerialWriter, bm13xx::FrameCodec>,
+) -> Result<Vec<ChipInfo>> {
+    time::sleep(Duration::from_millis(500)).await;
+
+    const DISCOVERY_ATTEMPTS: usize = 5;
+    for attempt in 1..=DISCOVERY_ATTEMPTS {
+        debug!("Sending version mask configuration (3 times)");
+        for i in 1..=3 {
+            trace!("Version mask send {}/3", i);
+            let version_cmd = Command::WriteRegister {
+                broadcast: true,
+                chip_address: 0x00,
+                register: bm13xx::protocol::Register::VersionMask(
+                    bm13xx::protocol::VersionMask::full_rolling(),
+                ),
+            };
+            writer
+                .send(version_cmd)
+                .await
+                .context("failed to send config command")?;
+            time::sleep(Duration::from_millis(5)).await;
+        }
+
+        time::sleep(Duration::from_millis(10)).await;
+
+        match discover_chips(reader, writer).await {
+            Ok(chips) => return Ok(chips),
+            Err(e) if attempt < DISCOVERY_ATTEMPTS => {
+                warn!(
+                    "Chip discovery attempt {attempt}/{DISCOVERY_ATTEMPTS} failed: {e}; retrying"
+                );
+                time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    unreachable!("loop returns on the final attempt")
+}
+
 /// GPIO-based ASIC reset control that records when the ASIC was
 /// last enabled.
 #[derive(Clone)]
@@ -721,13 +882,13 @@ impl AsicEnable for BitaxeAsicEnable {
 }
 
 /// A wrapper around AsyncRead that traces raw bytes as they're read.
-struct TracingReader<R> {
+pub(crate) struct TracingReader<R> {
     inner: R,
     name: &'static str,
 }
 
 impl<R: AsyncRead + Unpin> TracingReader<R> {
-    fn new(inner: R, name: &'static str) -> Self {
+    pub(crate) fn new(inner: R, name: &'static str) -> Self {
         Self { inner, name }
     }
 }

@@ -304,6 +304,13 @@ impl fmt::Debug for HashTask {
 /// which source owns the channel that delivered this share.
 #[derive(Debug, Clone)]
 pub struct Share {
+    /// Which chip on the chain found this nonce, when the chain says so.
+    ///
+    /// `None` on single-chip boards, and on any thread whose silicon does
+    /// not identify the producing chip. A chain that leaves this `None`
+    /// simply reports no per-ASIC breakdown.
+    pub chip: Option<u8>,
+
     /// Winning nonce
     pub nonce: u32,
 

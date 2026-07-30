@@ -145,6 +145,13 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         name: board_name,
         model: info.model.clone(),
         serial: info.serial_number.clone(),
+        // TODO(emberone00): this board has no command channel yet (see
+        // `command_tx: None` below) and no BoardCommand::SetFrequency
+        // handling, so tuning is inert here -- chip_profile::profile_for
+        // ("BM1362") is populated and ready for whoever wires up the
+        // actuator once hashing is implemented on this board.
+        chip_model: Some("BM1362".into()),
+        chip_count: Some(12),
         ..Default::default()
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_telemetry);
@@ -166,10 +173,15 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 
     warn!("emberOne/00 hash threads not yet implemented");
 
+    // TODO(emberone00): no command channel means BoardCommand::SetFrequency/
+    // SetCoreVoltage (used by both manual tuning and the autotuner) can
+    // never reach this board. Wire one up alongside hash thread support,
+    // reusing bm13xx::thread's PLL ramp helpers for the actuator.
     Ok(BackplaneConnector {
         info,
         threads: Vec::new(),
         telemetry_rx,
+        command_tx: None,
         shutdown: Some(shutdown),
     })
 }
