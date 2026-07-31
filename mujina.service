@@ -1,0 +1,22 @@
+[Unit]
+Description=Mujina Bitcoin Mining Rig (daemon + dashboard + e-paper display)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=mujina
+WorkingDirectory=/home/mujina/mujina
+ExecStart=/bin/bash /home/mujina/mujina/start-all.sh
+ExecStop=/bin/bash /home/mujina/mujina/stop-mujina.sh
+Restart=on-failure
+RestartSec=10
+
+# Give the daemon time to cleanly shut down ASICs and serial ports
+TimeoutStopSec=30
+
+# Environment
+Environment=MUJINA_LOG=info
+
+[Install]
+WantedBy=multi-user.target
