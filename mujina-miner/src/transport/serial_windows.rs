@@ -231,6 +231,31 @@ impl SerialStream {
         })
     }
 
+    /// Write the level of the Data Terminal Ready (DTR) line.
+    pub fn write_data_terminal_ready(&self, level: bool) -> Result<(), SerialError> {
+        use tokio_serial::SerialPort;
+        let stream = self.inner.stream.write();
+        // Since we store RwLockWriteGuard, it allows interior mutability without mut binding
+        let mut guard = stream;
+        guard.write_data_terminal_ready(level).map_err(|e| SerialError::ConfigError(e.to_string()))
+    }
+
+    /// Write the level of the Request To Send (RTS) line.
+    pub fn write_request_to_send(&self, level: bool) -> Result<(), SerialError> {
+        use tokio_serial::SerialPort;
+        let stream = self.inner.stream.write();
+        let mut guard = stream;
+        guard.write_request_to_send(level).map_err(|e| SerialError::ConfigError(e.to_string()))
+    }
+
+    /// Clear the serial port buffers.
+    pub fn clear(&self, buffer: tokio_serial::ClearBuffer) -> Result<(), SerialError> {
+        use tokio_serial::SerialPort;
+        let stream = self.inner.stream.write();
+        let mut guard = stream;
+        guard.clear(buffer).map_err(|e| SerialError::ConfigError(e.to_string()))
+    }
+
     /// Split the stream into reader, writer, and control handles.
     ///
     /// This allows concurrent reading and writing while maintaining the

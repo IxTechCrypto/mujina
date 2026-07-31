@@ -259,6 +259,57 @@ impl SerialStream {
         })
     }
 
+    /// Write the level of the Data Terminal Ready (DTR) line.
+    pub fn write_data_terminal_ready(&self, level: bool) -> Result<(), SerialError> {
+        let fd = self.inner.fd.as_raw_fd();
+        let pin = libc::TIOCM_DTR;
+        let cmd = if level { libc::TIOCMBIS } else { libc::TIOCMBIC };
+        unsafe {
+            if libc::ioctl(fd, cmd, &pin) < 0 {
+                return Err(SerialError::ConfigError(format!(
+                    "ioctl TIOCM_DTR failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the level of the Request To Send (RTS) line.
+    pub fn write_request_to_send(&self, level: bool) -> Result<(), SerialError> {
+        let fd = self.inner.fd.as_raw_fd();
+        let pin = libc::TIOCM_RTS;
+        let cmd = if level { libc::TIOCMBIS } else { libc::TIOCMBIC };
+        unsafe {
+            if libc::ioctl(fd, cmd, &pin) < 0 {
+                return Err(SerialError::ConfigError(format!(
+                    "ioctl TIOCM_RTS failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear the serial port buffers.
+    pub fn clear(&self, buffer: tokio_serial::ClearBuffer) -> Result<(), SerialError> {
+        let fd = self.inner.fd.as_raw_fd();
+        let cmd = match buffer {
+            tokio_serial::ClearBuffer::Input => libc::TCIFLUSH,
+            tokio_serial::ClearBuffer::Output => libc::TCOFLUSH,
+            tokio_serial::ClearBuffer::All => libc::TCIOFLUSH,
+        };
+        unsafe {
+            if libc::tcflush(fd, cmd) < 0 {
+                return Err(SerialError::ConfigError(format!(
+                    "tcflush failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Split the stream into reader, writer, and control handles.
     ///
     /// This allows concurrent reading and writing while maintaining the ability
