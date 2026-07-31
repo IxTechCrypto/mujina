@@ -30,7 +30,6 @@ try:
 except ImportError:
     print(f"Error: Could not import waveshare_epd.{EPD_MODEL}")
     print("Please make sure waveshare-epd is installed or the waveshare_epd folder is present.")
-    print("Install via: pip3 install waveshare-epd")
     sys.exit(1)
 
 def main():
@@ -41,11 +40,12 @@ def main():
 
     # Load standard DejaVu Sans fonts available on Raspberry Pi OS
     try:
-        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 13)
-        font_body = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
+        font_lg = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 26)
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 11)
+        font_body = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
         font_sm = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 9)
     except IOError:
-        font_title = font_body = font_sm = ImageFont.load_default()
+        font_lg = font_title = font_body = font_sm = ImageFont.load_default()
 
     # Get dimensions (waveshare drivers automatically swap width/height if landscape-oriented)
     width = epd.width
@@ -93,40 +93,82 @@ def main():
                         pool = pool[len("stratum+tcp://"):]
                 else:
                     pool = "N/A"
-                
-                if len(pool) > 24:
-                    pool = pool[:22] + "..."
         except Exception:
-            status_text = "DAEMON OFFLINE"
+            status_text = "OFFLINE"
+
+        # Separate hashrate value and unit
+        val_str = hashrate.split()[0]
+        unit_str = "TH/s"
+
+        # Truncate pool name for layout fit
+        if len(pool) > 16:
+            pool = pool[:14] + ".."
 
         # Adaptive layout rendering depending on display aspect ratio orientation
         is_landscape = width > height
         if is_landscape:
-            # Header
-            draw.rectangle((0, 0, width, 18), fill=0) # Black title bar
-            draw.text((4, 2), "MUJINA // FLEET STATUS", font=font_title, fill=255)
+            # Cyberpunk landscape layout (250x122)
+            # Solid black title bar
+            draw.rectangle((0, 0, width, 16), fill=0)
+            draw.text((6, 2), "// MUJINA_SYS // v0.1.0", font=font_title, fill=255)
+            
+            # System status badge
+            if status_text == "ONLINE":
+                draw.rectangle((175, 2, 244, 14), fill=255)
+                draw.text((184, 3), "[ ACTIVE_ON ]", font=font_sm, fill=0)
+            else:
+                draw.rectangle((175, 2, 244, 14), fill=255)
+                draw.text((184, 3), "[ STBY_ERR ]", font=font_sm, fill=0)
 
-            # Details
-            draw.text((4, 22), f"Daemon:  {status_text}", font=font_body, fill=0)
-            draw.text((4, 38), f"IP Addr: {ip_addr}", font=font_body, fill=0)
-            draw.text((4, 54), f"Hashrate: {hashrate}", font=font_body, fill=0)
-            draw.text((4, 70), f"Boards:  {boards_online} Active", font=font_body, fill=0)
-            draw.text((4, 86), f"Uptime:  {uptime}", font=font_body, fill=0)
+            # Sep line
+            draw.line((0, 18, width, 18), fill=0)
+            
+            # Vertical divider
+            draw.line((95, 18, 95, 104), fill=0)
+
+            # Left block: Hashrate
+            draw.text((6, 22), "SPEED :", font=font_sm, fill=0)
+            draw.text((6, 36), val_str, font=font_lg, fill=0)
+            draw.rectangle((6, 75, 55, 87), fill=0)
+            draw.text((12, 76), unit_str, font=font_sm, fill=255)
+
+            # Right block: Stats
+            draw.text((102, 22), f"NET  [ {ip_addr} ]", font=font_body, fill=0)
+            draw.text((102, 42), f"NODE [ {boards_online:02d} ACTIVE ]", font=font_body, fill=0)
+            draw.text((102, 62), f"TIME [ {uptime} ]", font=font_body, fill=0)
+            draw.text((102, 82), f"POOL [ {pool} ]", font=font_body, fill=0)
+
+            # Footer sep
+            draw.line((0, 104, width, 104), fill=0)
+            # Footer details
+            draw.text((6, 107), "PORT: 7785 // SEC_CONN // HASH_STREAM", font=font_sm, fill=0)
+
+        else:
+            # Cyberpunk portrait layout (122x250)
+            draw.rectangle((0, 0, width, 18), fill=0)
+            draw.text((4, 3), "// MUJINA_OS", font=font_title, fill=255)
+            
+            draw.line((0, 19, width, 19), fill=0)
+
+            # Upper block: Hashrate
+            draw.text((4, 24), "SPEED:", font=font_sm, fill=0)
+            draw.text((4, 36), val_str, font=font_lg, fill=0)
+            draw.rectangle((4, 72, 50, 84), fill=0)
+            draw.text((10, 73), unit_str, font=font_sm, fill=255)
+
+            # Divider
+            draw.line((0, 92, width, 92), fill=0)
+
+            # Lower block: Stats
+            draw.text((4, 98), f"ST: [ {status_text} ]", font=font_body, fill=0)
+            draw.text((4, 118), f"IP: {ip_addr}", font=font_body, fill=0)
+            draw.text((4, 138), f"BD: [ {boards_online:02d} ]", font=font_body, fill=0)
+            draw.text((4, 158), f"UP: {uptime}", font=font_body, fill=0)
+            draw.text((4, 178), f"PL: {pool}", font=font_sm, fill=0)
 
             # Footer
-            draw.line((0, 103, width, 103), fill=0)
-            draw.text((4, 105), f"Pool: {pool}", font=font_sm, fill=0)
-        else:
-            # Portrait layout
-            draw.rectangle((0, 0, width, 18), fill=0)
-            draw.text((2, 2), "MUJINA", font=font_title, fill=255)
-
-            draw.text((2, 24), f"ST: {status_text}", font=font_body, fill=0)
-            draw.text((2, 40), f"IP: {ip_addr}", font=font_body, fill=0)
-            draw.text((2, 56), f"HR: {hashrate}", font=font_body, fill=0)
-            draw.text((2, 72), f"BD: {boards_online}", font=font_body, fill=0)
-            draw.text((2, 88), f"UP: {uptime}", font=font_body, fill=0)
-            draw.text((2, 105), f"PL: {pool}", font=font_sm, fill=0)
+            draw.line((0, 232, width, 232), fill=0)
+            draw.text((4, 235), "SYS_ON // SPI", font=font_sm, fill=0)
 
         # Draw buffer to screen
         try:
