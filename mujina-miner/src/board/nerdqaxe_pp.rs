@@ -27,7 +27,6 @@ use tokio::{
     sync::{Mutex, mpsc, watch},
     time::{self, Instant},
 };
-use tokio_serial::SerialPortBuilderExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 

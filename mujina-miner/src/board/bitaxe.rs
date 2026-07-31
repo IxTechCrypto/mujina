@@ -12,7 +12,6 @@ use tokio::{
     sync::{Mutex, mpsc, watch},
     time::{self, Instant, MissedTickBehavior},
 };
-use tokio_serial::{SerialPort, SerialPortBuilderExt};
 use tokio_stream::StreamExt;
 use tokio_util::{
     codec::{FramedRead, FramedWrite},
@@ -78,29 +77,10 @@ inventory::submit! {
     }
 }
 
-// Register NerdQAxe++ with the inventory system
-inventory::submit! {
-    crate::board::BoardDescriptor {
-        pattern: crate::board::pattern::BoardPattern {
-            vid: Match::Specific(0xc0de),
-            pid: Match::Specific(0xcaf1),
-            bcd_device: Match::Any,
-            manufacturer: Match::Any,
-            product: Match::Any,
-            serial_pattern: Match::Any,
-        },
-        name: "NerdQAxe++",
-        create_fn: |device| Box::pin(create_from_usb(device)),
-    }
-}
 
 /// Create a Bitaxe board from USB device info.
 async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
-    let (model, prefix) = if device.pid == 0xcaf1 {
-        ("NerdQAxe++", "nerdqaxe")
-    } else {
-        ("Bitaxe Gamma", "bitaxe")
-    };
+    let (model, prefix) = ("Bitaxe Gamma", "bitaxe");
 
     let serial_ports = device.get_serial_ports(2).await?;
 
@@ -140,11 +120,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 
     let control_channel = ControlChannel::new(control_port, ResponseFormat::V0);
     let mut i2c = BitaxeRawI2c::new(control_channel.clone());
-    println!("DEBUG: create_from_usb: pid = {:04x}", device.pid);
-    if device.pid == 0xcaf1 {
-        println!("DEBUG: create_from_usb: activating mock mode");
-        i2c.set_mock(true);
-    }
+
 
     const ASIC_RESET_PIN: u8 = 0;
     let mut gpio_controller = BitaxeRawGpioController::new(control_channel);

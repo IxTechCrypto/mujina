@@ -913,6 +913,7 @@ struct SavedProfile {
     enabled: bool,
     /// Fallback/legacy field: the profile in effect, or `TuneProfile`'s
     /// default when the tuner was actually in target mode (see `target`).
+    #[serde(default)]
     profile: TuneProfile,
     /// Set when the tuner was in target mode when saved. Older state files
     /// predate this field and simply lack it (`#[serde(default)]`), which
