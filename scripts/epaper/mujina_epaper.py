@@ -72,16 +72,28 @@ def main():
                 data = r.json()
                 status_text = "ONLINE"
                 
-                # Fetch fleet hashrate if multi-board, else single board fallback
-                if "fleet" in data:
-                    hashrate = f"{data['fleet'].get('hashrate_ths', 0.0):.2f} TH/s"
-                    boards_online = data["fleet"].get("boards_online", 0)
-                elif "hashrate_ths" in data:
-                    hashrate = f"{data.get('hashrate_ths', 0.0):.2f} TH/s"
-                    boards_online = 1
+                # Convert raw H/s hashrate to TH/s (1 TH/s = 1e12 hashes/sec)
+                raw_hashrate = data.get("hashrate", 0)
+                hashrate = f"{raw_hashrate / 1000000000000.0:.2f} TH/s"
                 
-                uptime = data.get("uptime", "0h 0m")
-                pool = data.get("pool_name", "N/A")
+                # Count boards online from the active boards list
+                boards_online = len(data.get("boards", []))
+                
+                # Convert uptime_secs to a readable format
+                uptime_secs = data.get("uptime_secs", 0)
+                hours = uptime_secs // 3600
+                minutes = (uptime_secs % 3600) // 60
+                uptime = f"{hours}h {minutes}m"
+                
+                # Get the active pool URL from the first job source
+                sources = data.get("sources", [])
+                if sources:
+                    pool = sources[0].get("pool_url", "N/A")
+                    if pool.startswith("stratum+tcp://"):
+                        pool = pool[len("stratum+tcp://"):]
+                else:
+                    pool = "N/A"
+                
                 if len(pool) > 24:
                     pool = pool[:22] + "..."
         except Exception:
