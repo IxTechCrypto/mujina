@@ -25,3 +25,10 @@ done
 echo "Graceful shutdown timed out. Falling back to force-kill (SIGKILL)..."
 kill -KILL "$pid"
 echo "Force-stopped Mujina (PID $pid)."
+
+# --- Stop E-Paper Monitor ---
+epaper_pid=$(pgrep -f "python3.*mujina_epaper.py")
+if [ -n "$epaper_pid" ]; then
+    echo "Stopping E-Paper Display Monitor (PID $epaper_pid)..."
+    kill "$epaper_pid" 2>/dev/null
+fi

@@ -47,3 +47,16 @@ proc_pid=$!
 echo "Started Mujina (PID $proc_pid)."
 echo "  Pool: $pool_desc"
 echo "  API : http://0.0.0.0:7785/api/v0/miner"
+
+# --- Start E-Paper Monitor ---
+if pgrep -f "python3.*mujina_epaper.py" >/dev/null; then
+    echo "E-paper monitor is already running."
+else
+    # Check if waveshare library is linked in our script folder
+    if [ -d "$here/scripts/epaper/waveshare_epd" ]; then
+        echo "Starting E-Paper Display Monitor..."
+        nohup python3 "$here/scripts/epaper/mujina_epaper.py" > "$here/epaper.log" 2> "$here/epaper.log.err" &
+    else
+        echo "Note: Waveshare drivers not linked at $here/scripts/epaper/waveshare_epd yet. E-paper monitor startup skipped."
+    fi
+fi
