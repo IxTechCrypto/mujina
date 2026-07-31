@@ -88,7 +88,7 @@ def main():
                 # Get the active pool URL from the first job source
                 sources = data.get("sources", [])
                 if sources:
-                    pool = sources[0].get("pool_url", "N/A")
+                    pool = sources[0].get("url", "N/A")
                     if pool.startswith("stratum+tcp://"):
                         pool = pool[len("stratum+tcp://"):]
                 else:
