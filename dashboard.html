@@ -356,18 +356,40 @@
     
     @media(max-width: 640px) {
       .wrap { padding: 18px 12px 32px; }
-      .top { flex-wrap: wrap; gap: 6px; }
+      .top { flex-wrap: wrap; gap: 10px; align-items: center; }
       h1 { font-size: 20px; letter-spacing: .08em; }
       .grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
       .card { padding: 12px 13px; }
       .card .val { font-size: 20px; }
       .hero { grid-column: span 2; grid-row: auto; }
-      .hero .val { font-size: 38px; }
+      .hero .val { font-size: 32px; }
       .herobody { flex-direction: column; align-items: stretch; gap: 12px; }
       .heroside { padding-left: 0; border-left: none; border-top: 1px solid rgba(0,240,255,.18); padding-top: 12px; }
       .span2 { grid-column: span 2; }
+      .span4 { grid-column: span 2; }
       .pool .val { font-size: 14px; }
       .dual .dcell+.dcell { margin-left: 10px; padding-left: 10px; }
+      .board-summary-grid { grid-template-columns: 1fr; }
+      .btab-tune-btn { margin-left: 0; width: 100%; justify-content: center; margin-top: 4px; }
+      #statuspath { display: none; }
+    }
+
+    @media(max-width: 480px) {
+      .grid { grid-template-columns: 1fr; }
+      .span2, .span4, .hero { grid-column: 1 / -1; }
+      .row { flex-direction: column; align-items: stretch; gap: 6px; }
+      .row label { margin-bottom: 2px; }
+      .row input[type=text],
+      .row input[type=password],
+      .row input[type=number],
+      .row select {
+        width: 100% !important;
+        max-width: 100% !important;
+        text-align: left !important;
+      }
+      .fvgroup { flex-direction: column; }
+      .fvdiv { height: 1px; width: 100%; }
+      .sheet { padding: 16px 16px 14px; }
     }
 
     /* Minimal Theme (Liquid Glassmorphism) overrides */
@@ -1880,6 +1902,9 @@ $('clearLogBtn').addEventListener('click', () => {
   $('logFeed').innerHTML = '<div style="color:var(--dim)">Log view cleared.</div>';
 });
 
+window.addEventListener('resize', () => {
+  if (LAST) render(LAST);
+});
 tick(); setInterval(tick, 2000);
 </script>
 </body>
