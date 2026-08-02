@@ -362,6 +362,9 @@ pub struct AutoTuner {
     /// telemetry each cycle by the supervisor. `None` clamps to the
     /// conservative global `MIN/MAX_FREQ_MHZ` fallback.
     chip: Option<chip_profile::ChipProfile>,
+    /// Count of chips on the board this tuner is driving, updated from
+    /// telemetry each cycle. Defaults to 1.
+    chip_count: u32,
     phase: TunePhase,
     /// Cycles since the last applied change (settle gate).
     cycles_since_change: u32,
@@ -415,6 +418,7 @@ impl Default for AutoTuner {
             enabled: false,
             mode: TuneMode::default(),
             chip: None,
+            chip_count: 1,
             phase: TunePhase::Disabled,
             cycles_since_change: 0,
             best: None,
@@ -476,6 +480,24 @@ impl AutoTuner {
     /// `MIN/MAX_FREQ_MHZ` in that case.
     pub fn set_chip(&mut self, chip: Option<chip_profile::ChipProfile>) {
         self.chip = chip;
+    }
+
+    /// Update the chip count for the board this tuner is driving, looked up
+    /// by the supervisor from the board's telemetry each cycle.
+    pub fn set_chip_count(&mut self, count: u32) {
+        self.chip_count = count;
+    }
+
+    /// Retrieve the safety caps for the current mode, scaled dynamically
+    /// by the board's chip count.
+    fn caps(&self) -> Caps {
+        let mut caps = self.mode.caps();
+        // Scale profile caps and default hashrate target ceiling by chip count.
+        // Power target mode is already board-wide and does not scale.
+        if !matches!(self.mode, TuneMode::Target(TuneTarget::Power(_))) {
+            caps.power_w *= self.chip_count as f32;
+        }
+        caps
     }
 
     /// Disable tuning. The board keeps whatever setpoint it is at,
@@ -547,7 +569,7 @@ impl AutoTuner {
         self.last_efficiency = efficiency_j_th(m.power_w, m.hashrate_ths);
         self.cycles_since_change += 1;
 
-        let caps = self.mode.caps();
+        let caps = self.caps();
 
         // 1. Safety: over a hard cap -> back off on a fast cadence that does
         //    NOT wait for the long tuning settle (temperature and power are
@@ -1019,6 +1041,7 @@ struct BoardSnapshot {
     metrics: Metrics,
     sender: mpsc::Sender<BoardCommand>,
     chip: Option<chip_profile::ChipProfile>,
+    chip_count: u32,
 }
 
 /// Per-board bookkeeping the supervisor carries between ticks.
@@ -1103,6 +1126,7 @@ fn snapshot_boards(
                 .chip_model
                 .as_deref()
                 .and_then(chip_profile::profile_for),
+            chip_count: board.chip_count.unwrap_or(1),
             name: board.name.clone(),
             serial: board.serial.clone(),
             sender,
@@ -1176,14 +1200,16 @@ fn tune_one_board(
         metrics,
         sender,
         chip,
+        chip_count,
     } = snapshot;
     let book = bookkeeping.entry(name.clone()).or_default();
 
-    tuners
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_mut(name)
-        .set_chip(*chip);
+    {
+        let mut all = tuners.lock().unwrap_or_else(|e| e.into_inner());
+        let t = all.get_mut(name);
+        t.set_chip(*chip);
+        t.set_chip_count(*chip_count);
+    }
 
     // Boot-time resume: if this board was actively auto-tuning when it was
     // last saved, re-enable its tuner so it converges again. We do NOT
@@ -1819,5 +1845,24 @@ mod tests {
         let legacy: SavedProfile = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(legacy.target, None);
         assert_eq!(legacy.profile, TuneProfile::Balanced);
+    }
+
+    #[test]
+    fn multi_chip_power_caps_scale_correctly() {
+        let mut t = AutoTuner::default();
+        t.set_chip_count(4);
+        t.enable_profile(TuneProfile::MaxHash); // base cap 22W * 4 = 88W
+
+        // 60 W is under the 88W cap, should not trigger breach on evaluation.
+        let action = t.evaluate(&m(55.0, 60.0, 4.0, 525.0, 1150));
+        assert_eq!(action, None);
+        assert_eq!(t.phase, TunePhase::Warmup);
+
+        // Reset cycles_since_change to 0.
+        t.enable_profile(TuneProfile::MaxHash);
+        // 90 W is over the 88W cap, should trigger a safety breach and back off.
+        let action = safety_step(&mut t, &m(55.0, 90.0, 4.0, 525.0, 1150));
+        assert_eq!(t.phase, TunePhase::BackedOff);
+        assert_eq!(action, Some(TuneAction::SetFrequency(500.0)));
     }
 }
