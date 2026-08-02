@@ -625,6 +625,15 @@ impl Bitaxe {
 async fn init_fan_controller(i2c: BitaxeRawI2c) -> Result<Emc2101<BitaxeRawI2c>> {
     let mut fan = Emc2101::new(i2c);
     fan.init().await.context("EMC2101 init failed")?;
+
+    // Calibrate remote diode junction parameters for BM1370 ASIC
+    fan.set_ideality_factor(0x24)
+        .await
+        .context("failed to set EMC2101 ideality factor")?;
+    fan.set_beta_compensation(0x00)
+        .await
+        .context("failed to set EMC2101 beta compensation")?;
+
     fan.set_fan_speed(Percent::FULL)
         .await
         .context("failed to set initial fan speed")?;

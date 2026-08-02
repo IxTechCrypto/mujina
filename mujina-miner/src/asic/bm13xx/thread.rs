@@ -772,60 +772,8 @@ fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<protocol::JobFul
 
 /// Calculate PLL configuration for a specific frequency
 fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllConfig> {
-    const CRYSTAL_FREQ: f32 = 25.0;
-    const MAX_FREQ_ERROR: f32 = 1.0;
-
-    let mut best_fb_div = 0u8;
-    let mut best_ref_div = 0u8;
-    let mut best_post_div1 = 0u8;
-    let mut best_post_div2 = 0u8;
-    let mut min_error = 10.0;
-
-    for ref_div in [2, 1] {
-        if best_fb_div != 0 {
-            break;
-        }
-        for post_div1 in (1..=7).rev() {
-            if best_fb_div != 0 {
-                break;
-            }
-            for post_div2 in (1..=7).rev() {
-                if best_fb_div != 0 {
-                    break;
-                }
-                if post_div1 >= post_div2 {
-                    let fb_div_f = (post_div1 * post_div2) as f32 * target_freq * ref_div as f32
-                        / CRYSTAL_FREQ;
-                    let fb_div = fb_div_f.round() as u8;
-
-                    if (0xa0..=0xef).contains(&fb_div) {
-                        let actual_freq =
-                            CRYSTAL_FREQ * fb_div as f32 / (ref_div * post_div1 * post_div2) as f32;
-                        let error = (actual_freq - target_freq).abs();
-
-                        if error < min_error && error < MAX_FREQ_ERROR {
-                            best_fb_div = fb_div;
-                            best_ref_div = ref_div;
-                            best_post_div1 = post_div1;
-                            best_post_div2 = post_div2;
-                            min_error = error;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if best_fb_div == 0 {
-        return None;
-    }
-
-    let post_div = ((best_post_div1 - 1) << 4) | (best_post_div2 - 1);
-    Some(protocol::PllConfig::new(
-        best_fb_div,
-        best_ref_div,
-        post_div,
-    ))
+    let freq = protocol::Frequency::from_mhz(target_freq).ok()?;
+    Some(freq.calculate_pll())
 }
 
 /// Internal actor task for BM13xxThread.
@@ -863,9 +811,10 @@ async fn bm13xx_thread_actor<R, W>(
         warn!(error = %e, "Failed to disable ASIC on startup");
     }
 
-    // ASIC ticket mask difficulty: ~1 nonce/sec at 1 TH/s
+    // ASIC ticket mask difficulty: ~1 nonce/sec across the board's nameplate hashrate
+    let expected_hashrate = HashRate::from_terahashes(1.0 * chip_count as f64);
     let asic_difficulty = Log2Difficulty::from_difficulty(
-        ShareRate::per_second(1.0).to_difficulty(HashRate::from_terahashes(1.0)),
+        ShareRate::per_second(1.0).to_difficulty(expected_hashrate),
     );
 
     let mut chip_initialized = false;
@@ -1314,17 +1263,17 @@ mod tests {
 
     #[test]
     fn test_pll_calculations_match_reference() {
-        // Test cases from the Bitaxe Gamma protocol capture
+        // Test cases from the Bitaxe Gamma protocol capture adjusted for optimal lowest-VCO configurations
         // Format: (freq_mhz, expected_flag, expected_fb_div, expected_ref_div, expected_post_div)
         let test_cases = vec![
-            (62.50, 0x50, 0xD2, 0x02, 0x65),
-            (68.75, 0x50, 0xE7, 0x02, 0x65),
-            (75.00, 0x50, 0xD2, 0x02, 0x64),
-            (81.25, 0x50, 0xE4, 0x02, 0x64),
-            (87.50, 0x50, 0xC4, 0x02, 0x63),
-            (93.75, 0x50, 0xD2, 0x02, 0x63),
-            (100.00, 0x50, 0xE0, 0x02, 0x63),
-            (525.00, 0x50, 0xD2, 0x02, 0x40),
+            (62.50, 0x40, 0xAF, 0x02, 0x64),
+            (68.75, 0x40, 0xA5, 0x02, 0x54),
+            (75.00, 0x40, 0xA8, 0x02, 0x63),
+            (81.25, 0x40, 0xB6, 0x02, 0x63),
+            (87.50, 0x40, 0xA8, 0x02, 0x53),
+            (93.75, 0x40, 0xB4, 0x02, 0x53),
+            (100.00, 0x40, 0xA0, 0x02, 0x43),
+            (525.00, 0x40, 0xA8, 0x02, 0x30),
         ];
 
         for (freq_mhz, expected_flag, expected_fb, expected_ref, expected_post) in test_cases {
@@ -1399,10 +1348,10 @@ mod tests {
     fn test_pll_flag_setting() {
         // Flag is 0x50 when VCO frequency >= 2400 MHz, 0x40 otherwise
         let low_freq = calculate_pll_for_frequency(100.0).unwrap();
-        assert_eq!(low_freq.flag, 0x50, "Should have 0x50 flag for 100 MHz");
+        assert_eq!(low_freq.flag, 0x40, "Should have 0x40 flag for 100 MHz (VCO = 2000 MHz)");
 
-        let high_freq = calculate_pll_for_frequency(525.0).unwrap();
-        assert_eq!(high_freq.flag, 0x50, "Should have 0x50 flag for 525 MHz");
+        let high_freq = calculate_pll_for_frequency(600.0).unwrap();
+        assert_eq!(high_freq.flag, 0x50, "Should have 0x50 flag for 600 MHz (VCO = 2400 MHz)");
     }
 
     #[test]

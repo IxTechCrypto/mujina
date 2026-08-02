@@ -68,34 +68,45 @@ impl Frequency {
         let target_freq = self.mhz;
         let mut best_config = PllConfig::new(0xa0, 2, 0x55); // Default
         let mut min_error = f32::MAX;
+        let mut min_vco_freq = f32::MAX;
+        let mut min_post_div_product = u32::MAX;
 
         // Search for optimal PLL settings
         // ref_divider: 1 or 2
-        // post_divider1: 1-7, must be >= post_divider2
+        // post_divider1: 1-7, must be > post_divider2 (strictly greater to maintain lock stability)
         // post_divider2: 1-7
         // fb_divider: 0xa0-0xef (160-239)
+        const EPSILON: f32 = 0.0001;
 
         for ref_div in [2, 1] {
             for post_div1 in (1..=7).rev() {
                 for post_div2 in (1..=7).rev() {
-                    if post_div1 >= post_div2 {
-                        // Calculate required feedback divider
-                        let fb_div_f =
-                            (post_div1 * post_div2) as f32 * target_freq * ref_div as f32
-                                / Self::CRYSTAL_MHZ;
+                    // ESP-Miner strictly requires post_div1 > post_div2
+                    if post_div1 > post_div2 {
+                        let divider = ref_div * post_div1 * post_div2;
+                        let fb_div_f = (divider as f32 * target_freq) / Self::CRYSTAL_MHZ;
                         let fb_div = fb_div_f.round() as u8;
 
                         if (0xa0..=0xef).contains(&fb_div) {
-                            // Calculate actual frequency with these settings
-                            let actual_freq = Self::CRYSTAL_MHZ * fb_div as f32
-                                / (ref_div as f32 * post_div1 as f32 * post_div2 as f32);
+                            let actual_freq = Self::CRYSTAL_MHZ * fb_div as f32 / divider as f32;
                             let error = (target_freq - actual_freq).abs();
+                            let vco_freq = Self::CRYSTAL_MHZ * fb_div as f32 / ref_div as f32;
+                            let post_div_product = post_div1 * post_div2;
 
-                            if error < min_error && error < 1.0 {
+                            // Select settings matching ESP-Miner priorities:
+                            // 1. Closest frequency (minimize error)
+                            // 2. Lowest VCO frequency (minimize power/heat)
+                            // 3. Lowest post-divider product
+                            let is_better = error < min_error - EPSILON
+                                || ( (error - min_error).abs() < EPSILON && vco_freq < min_vco_freq - EPSILON )
+                                || ( (error - min_error).abs() < EPSILON && (vco_freq - min_vco_freq).abs() < EPSILON && post_div_product < min_post_div_product );
+
+                            if is_better {
                                 min_error = error;
-                                // Encode post dividers as per hardware format
-                                let post_div = ((post_div1 - 1) << 4) | (post_div2 - 1);
-                                best_config = PllConfig::new(fb_div, ref_div, post_div);
+                                min_vco_freq = vco_freq;
+                                min_post_div_product = post_div_product;
+                                let post_div = (((post_div1 - 1) as u8) << 4) | ((post_div2 - 1) as u8);
+                                best_config = PllConfig::new(fb_div, ref_div as u8, post_div);
                             }
                         }
                     }

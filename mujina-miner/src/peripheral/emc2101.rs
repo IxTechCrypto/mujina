@@ -69,6 +69,10 @@ pub mod regs {
     pub const EXTERNAL_TEMP_HIGH: u8 = 0x01;
     /// External temperature reading low byte
     pub const EXTERNAL_TEMP_LOW: u8 = 0x10;
+    /// Ideality factor register
+    pub const IDEALITY_FACTOR: u8 = 0x17;
+    /// Beta compensation register
+    pub const BETA_COMPENSATION: u8 = 0x18;
     /// Configuration register
     pub const CONFIG: u8 = 0x03;
     /// Conversion rate register
@@ -293,6 +297,16 @@ impl<I: I2c> Emc2101<I> {
         }
 
         Ok(rpm)
+    }
+
+    /// Set the diode ideality factor
+    pub async fn set_ideality_factor(&mut self, ideality: u8) -> Result<()> {
+        self.write_register(regs::IDEALITY_FACTOR, ideality).await
+    }
+
+    /// Set the beta compensation value
+    pub async fn set_beta_compensation(&mut self, beta: u8) -> Result<()> {
+        self.write_register(regs::BETA_COMPENSATION, beta).await
     }
 
     // Helper methods for register access

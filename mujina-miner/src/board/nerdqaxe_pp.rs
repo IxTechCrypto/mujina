@@ -661,7 +661,13 @@ impl NerdQaxePp {
             ("vr", &mut self.sensors.temp_vr)
         };
         match sensor.read().await {
-            Ok(reading) => Some(Temperature::from_celsius(reading.as_degrees_c())),
+            Ok(reading) => {
+                let mut temp_c = reading.as_degrees_c();
+                if asic {
+                    temp_c += 10.0;
+                }
+                Some(Temperature::from_celsius(temp_c))
+            }
             Err(e) => {
                 warn!(sensor = label, error = %e, "TMP1075 read failed");
                 None
