@@ -803,6 +803,14 @@
       color: var(--mag) !important;
       border-radius: 0 !important;
     }
+    body.theme-parasite .at-console {
+      background: #000000 !important;
+      border: 1px solid #ffffff !important;
+      border-radius: 0 !important;
+    }
+    body.theme-parasite .at-console-header {
+      border-bottom-color: #ffffff !important;
+    }
   </style>
 </head>
 <body>
@@ -1176,6 +1184,7 @@ function drawFleetChart(canvasId, boards, fleetSeries) {
   const x = c.getContext('2d'); x.scale(dpr, dpr); x.clearRect(0, 0, w, h);
   
   const isMinimal = document.body.classList.contains('theme-minimal');
+  const isParasite = document.body.classList.contains('theme-parasite');
   x.strokeStyle = isMinimal ? 'rgba(0,0,0,.08)' : 'rgba(0,240,255,.08)'; x.lineWidth = 1;
   for (let gy = 0; gy <= 4; gy++) { const yy = gy * h / 4; x.beginPath(); x.moveTo(0, yy); x.lineTo(w, yy); x.stroke(); }
   if (!fleetSeries || fleetSeries.length < 2) {
@@ -1237,10 +1246,10 @@ function drawFleetChart(canvasId, boards, fleetSeries) {
     });
     const hx = px(closestIdx), hy = py(fleetSeries[closestIdx]);
 
-    x.strokeStyle = isMinimal ? 'rgba(0,102,204,.5)' : 'rgba(255,46,151,.7)'; x.lineWidth = 1; x.setLineDash([3, 3]);
+    x.strokeStyle = isParasite ? 'rgba(255,255,255,.5)' : (isMinimal ? 'rgba(0,102,204,.5)' : 'rgba(255,46,151,.7)'); x.lineWidth = 1; x.setLineDash([3, 3]);
     x.beginPath(); x.moveTo(hx, 0); x.lineTo(hx, h); x.moveTo(0, hy); x.lineTo(w, hy); x.stroke(); x.setLineDash([]);
 
-    x.fillStyle = isMinimal ? '#c65b7c' : '#ff2e97'; x.shadowColor = isMinimal ? 'rgba(198,91,124,.4)' : '#ff2e97'; x.shadowBlur = isMinimal ? 2 : 10;
+    x.fillStyle = isParasite ? '#ffffff' : (isMinimal ? '#c65b7c' : '#ff2e97'); x.shadowColor = isParasite ? 'rgba(255,255,255,.4)' : (isMinimal ? 'rgba(198,91,124,.4)' : '#ff2e97'); x.shadowBlur = isParasite ? 2 : (isMinimal ? 2 : 10);
     x.beginPath(); x.arc(hx, hy, 4, 0, Math.PI * 2); x.fill(); x.shadowBlur = 0;
 
     let tipText = `Fleet: ${fmtGh(fleetSeries[closestIdx])}`;
@@ -1254,9 +1263,9 @@ function drawFleetChart(canvasId, boards, fleetSeries) {
     const tw = x.measureText(tipText).width + 14;
     const tx = Math.min(Math.max(hx - tw / 2, 4), w - tw - 4);
     const ty = Math.max(hy - 24, 16);
-    x.fillStyle = isMinimal ? '#ffffff' : '#0a0f1c'; x.strokeStyle = isMinimal ? 'rgba(0,0,0,.1)' : '#ff2e97'; x.lineWidth = 1;
+    x.fillStyle = isParasite ? '#000000' : (isMinimal ? '#ffffff' : '#0a0f1c'); x.strokeStyle = isParasite ? '#ffffff' : (isMinimal ? 'rgba(0,0,0,.1)' : '#ff2e97'); x.lineWidth = isParasite ? 2 : 1;
     x.fillRect(tx, ty - 12, tw, 18); x.strokeRect(tx, ty - 12, tw, 18);
-    x.fillStyle = isMinimal ? '#1d1d1f' : '#fff'; x.textAlign = 'center'; x.fillText(tipText, tx + tw / 2, ty + 1);
+    x.fillStyle = isParasite ? '#ffffff' : (isMinimal ? '#1d1d1f' : '#fff'); x.textAlign = 'center'; x.fillText(tipText, tx + tw / 2, ty + 1);
   } else {
     const lastV = fleetSeries[fleetSeries.length - 1], lx = px(fleetSeries.length - 1), ly2 = py(lastV);
     x.fillStyle = isMinimal ? '#0066cc' : '#00f0ff'; x.shadowColor = isMinimal ? 'rgba(0,102,204,.2)' : '#00f0ff'; x.shadowBlur = isMinimal ? 2 : 8;
@@ -1273,6 +1282,7 @@ function drawChart(canvasId, series, color = '#00f0ff') {
   const x = c.getContext('2d'); x.scale(dpr, dpr); x.clearRect(0, 0, w, h);
   
   const isMinimal = document.body.classList.contains('theme-minimal');
+  const isParasite = document.body.classList.contains('theme-parasite');
   x.strokeStyle = isMinimal ? 'rgba(0,0,0,.08)' : 'rgba(0,240,255,.08)'; x.lineWidth = 1;
   for (let gy = 0; gy <= 4; gy++) { const yy = gy * h / 4; x.beginPath(); x.moveTo(0, yy); x.lineTo(w, yy); x.stroke(); }
   if (series.length < 2) {
@@ -1313,10 +1323,10 @@ function drawChart(canvasId, series, color = '#00f0ff') {
     });
     const hx = px(closestIdx), hy = py(series[closestIdx]);
     
-    x.strokeStyle = isMinimal ? 'rgba(0,102,204,.5)' : 'rgba(255,46,151,.7)'; x.lineWidth = 1; x.setLineDash([3, 3]);
+    x.strokeStyle = isParasite ? 'rgba(255,255,255,.5)' : (isMinimal ? 'rgba(0,102,204,.5)' : 'rgba(255,46,151,.7)'); x.lineWidth = 1; x.setLineDash([3, 3]);
     x.beginPath(); x.moveTo(hx, 0); x.lineTo(hx, h); x.moveTo(0, hy); x.lineTo(w, hy); x.stroke(); x.setLineDash([]);
 
-    x.fillStyle = isMinimal ? '#c65b7c' : '#ff2e97'; x.shadowColor = isMinimal ? 'rgba(198,91,124,.4)' : '#ff2e97'; x.shadowBlur = isMinimal ? 2 : 10;
+    x.fillStyle = isParasite ? '#ffffff' : (isMinimal ? '#c65b7c' : '#ff2e97'); x.shadowColor = isParasite ? 'rgba(255,255,255,.4)' : (isMinimal ? 'rgba(198,91,124,.4)' : '#ff2e97'); x.shadowBlur = isParasite ? 2 : (isMinimal ? 2 : 10);
     x.beginPath(); x.arc(hx, hy, 4, 0, Math.PI * 2); x.fill(); x.shadowBlur = 0;
 
     const tipText = fmtGh(series[closestIdx]);
@@ -1324,9 +1334,9 @@ function drawChart(canvasId, series, color = '#00f0ff') {
     const tw = x.measureText(tipText).width + 12;
     const tx = Math.min(Math.max(hx - tw / 2, 4), w - tw - 4);
     const ty = Math.max(hy - 24, 16);
-    x.fillStyle = isMinimal ? '#ffffff' : '#0a0f1c'; x.strokeStyle = isMinimal ? 'rgba(0,0,0,.1)' : '#ff2e97'; x.lineWidth = 1;
+    x.fillStyle = isParasite ? '#000000' : (isMinimal ? '#ffffff' : '#0a0f1c'); x.strokeStyle = isParasite ? '#ffffff' : (isMinimal ? 'rgba(0,0,0,.1)' : '#ff2e97'); x.lineWidth = isParasite ? 2 : 1;
     x.fillRect(tx, ty - 12, tw, 18); x.strokeRect(tx, ty - 12, tw, 18);
-    x.fillStyle = isMinimal ? '#1d1d1f' : '#fff'; x.textAlign = 'center'; x.fillText(tipText, tx + tw / 2, ty + 1);
+    x.fillStyle = isParasite ? '#ffffff' : (isMinimal ? '#1d1d1f' : '#fff'); x.textAlign = 'center'; x.fillText(tipText, tx + tw / 2, ty + 1);
   } else {
     const lastV = series[series.length - 1], lx = px(series.length - 1), ly2 = py(lastV);
     x.fillStyle = color; x.shadowColor = color; x.shadowBlur = isMinimal ? 2 : 8;

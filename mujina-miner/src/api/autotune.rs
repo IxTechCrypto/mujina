@@ -250,6 +250,8 @@ pub struct Metrics {
     pub hashrate_ths: f32,
     pub frequency_mhz: f32,
     pub core_voltage_mv: u16,
+    pub fan_min_percent: Option<u8>,
+    pub fan_auto: Option<bool>,
 }
 
 /// A change the tuner wants applied to the board.
@@ -265,6 +267,9 @@ pub enum TuneAction {
     /// Restore the fan to its automatic default curve once a
     /// temperature-cap breach has cleared.
     RestoreFanAuto,
+    /// Slowly adjust the minimum fan speed in automatic mode to find a
+    /// stable cooling state.
+    SetFanMinPercent(u8),
 }
 
 /// Where the tuner is in its search.
@@ -403,6 +408,7 @@ pub struct AutoTuner {
     /// back-off episode; restored to automatic once temperature clears the
     /// cap.
     fan_forced_full: bool,
+    last_commanded_fan_min_pct: Option<u8>,
     last_efficiency: Option<f32>,
     /// Target mode: consecutive settled cycles pinned at the chip's
     /// frequency limit with the setpoint still unreached. Two consecutive
@@ -427,6 +433,7 @@ impl Default for AutoTuner {
             probe_floor_mv: 0,
             last_commanded_voltage_mv: None,
             fan_forced_full: false,
+            last_commanded_fan_min_pct: None,
             last_efficiency: None,
             stuck_at_limit_cycles: 0,
             log: VecDeque::with_capacity(LOG_CAPACITY),
@@ -457,6 +464,7 @@ impl AutoTuner {
         self.pending_reject_mhz = None;
         self.probe_floor_mv = 0;
         self.last_commanded_voltage_mv = None;
+        self.last_commanded_fan_min_pct = None;
         self.stuck_at_limit_cycles = 0;
         self.log.clear();
     }
@@ -585,17 +593,45 @@ impl AutoTuner {
             // tuner should not sacrifice clock while the fan still has more
             // to give. Power breaches skip this: more airflow doesn't reduce
             // watts drawn.
-            if m.asic_temp_c > caps.temp_c && !self.fan_forced_full {
-                self.fan_forced_full = true;
-                self.cycles_since_change = 0;
-                self.log_event(
-                    format!(
-                        "temp {:.1}C over {:.0}C cap: forcing fan to 100%",
-                        m.asic_temp_c, caps.temp_c
-                    ),
-                    m,
-                );
-                return Some(TuneAction::SetFanFull);
+            // If the fan is in automatic mode, we slowly increase the min fan
+            // speed first to find a stable speed, avoiding thermal oscillation.
+            if m.asic_temp_c > caps.temp_c {
+                let mut fan_adjusted = false;
+                if m.fan_auto == Some(true) {
+                    if let Some(min_pct) = m.fan_min_percent {
+                        if min_pct < 100 {
+                            fan_adjusted = true;
+                            let new_min = (min_pct + 5).min(100);
+                            if self.last_commanded_fan_min_pct != Some(new_min)
+                                || self.cycles_since_change >= SAFETY_SETTLE_CYCLES
+                            {
+                                self.last_commanded_fan_min_pct = Some(new_min);
+                                self.cycles_since_change = 0;
+                                self.log_event(
+                                    format!(
+                                        "temp {:.1}C over {:.0}C cap: slowly increasing fan min to {new_min}%",
+                                        m.asic_temp_c, caps.temp_c
+                                    ),
+                                    m,
+                                );
+                                return Some(TuneAction::SetFanMinPercent(new_min));
+                            }
+                        }
+                    }
+                }
+
+                if !fan_adjusted && !self.fan_forced_full {
+                    self.fan_forced_full = true;
+                    self.cycles_since_change = 0;
+                    self.log_event(
+                        format!(
+                            "temp {:.1}C over {:.0}C cap: forcing fan to 100%",
+                            m.asic_temp_c, caps.temp_c
+                        ),
+                        m,
+                    );
+                    return Some(TuneAction::SetFanFull);
+                }
             }
 
             if self.cycles_since_change < SAFETY_SETTLE_CYCLES {
@@ -1114,6 +1150,8 @@ fn snapshot_boards(
         let (Some(power_w), Some(voltage_v)) = (core.power_w, core.voltage_v) else {
             continue;
         };
+        let fan_min_percent = board.fans.first().and_then(|f| f.min_percent);
+        let fan_auto = board.fans.first().and_then(|f| f.auto);
         snapshots.push(BoardSnapshot {
             metrics: Metrics {
                 asic_temp_c: temp,
@@ -1121,6 +1159,8 @@ fn snapshot_boards(
                 hashrate_ths: board_hashrate_ths(&board),
                 frequency_mhz: freq,
                 core_voltage_mv: (voltage_v * 1000.0).round() as u16,
+                fan_min_percent,
+                fan_auto,
             },
             chip: board
                 .chip_model
@@ -1347,6 +1387,20 @@ fn tune_one_board(
                     "fan auto".to_string(),
                 )
             }
+            TuneAction::SetFanMinPercent(new_min) => {
+                let (tx, _rx) = oneshot::channel();
+                (
+                    BoardCommand::SetFanControl {
+                        update: FanControlUpdate {
+                            auto: true,
+                            min_percent: Some(new_min),
+                            ..Default::default()
+                        },
+                        reply: tx,
+                    },
+                    format!("fan auto min {new_min}%"),
+                )
+            }
         };
         // Best-effort: a full command buffer just means we retry next cycle.
         if let Err(e) = sender.try_send(cmd) {
@@ -1368,6 +1422,8 @@ mod tests {
             hashrate_ths: hash_ths,
             frequency_mhz: freq,
             core_voltage_mv: volt,
+            fan_min_percent: None,
+            fan_auto: None,
         }
     }
 
@@ -1865,4 +1921,43 @@ mod tests {
         assert_eq!(t.phase, TunePhase::BackedOff);
         assert_eq!(action, Some(TuneAction::SetFrequency(500.0)));
     }
+
+    #[test]
+    fn fan_auto_slowly_ramps_instead_of_forcing_100() {
+        let mut t = AutoTuner::default();
+        t.enable_profile(TuneProfile::Balanced); // temp cap 62
+        
+        // Metrics with fan in Auto mode and min_percent at 33%
+        let hot_metrics = Metrics {
+            asic_temp_c: 70.0,
+            power_w: 14.0,
+            hashrate_ths: 1.3,
+            frequency_mhz: 550.0,
+            core_voltage_mv: 1150,
+            fan_min_percent: Some(33),
+            fan_auto: Some(true),
+        };
+
+        // First breach should slowly increase the fan minimum instead of forcing 100%
+        assert_eq!(t.evaluate(&hot_metrics), Some(TuneAction::SetFanMinPercent(38)));
+        assert_eq!(t.phase, TunePhase::BackedOff);
+        assert!(!t.fan_forced_full);
+
+        // Next evaluation within safety settle cycles returns None
+        assert_eq!(t.evaluate(&hot_metrics), None);
+
+        // Advance past safety settle cycles
+        for _ in 1..SAFETY_SETTLE_CYCLES {
+            t.evaluate(&hot_metrics);
+        }
+
+        // Under second breach with new telemetry min_percent at 38%, it should increment again to 43%
+        let hot_metrics_updated = Metrics {
+            fan_min_percent: Some(38),
+            ..hot_metrics
+        };
+        assert_eq!(t.evaluate(&hot_metrics_updated), Some(TuneAction::SetFanMinPercent(43)));
+        assert!(!t.fan_forced_full);
+    }
 }
+
