@@ -1255,9 +1255,9 @@ fn tune_one_board(
     // last saved, re-enable its tuner so it converges again. We do NOT
     // blindly re-apply a stored setpoint — a board left on manual control
     // keeps its manual settings.
-    if let Some(serial) = serial.as_ref()
-        && resumed.insert(serial.clone())
-        && let Some(saved) = load_saved().get(serial).cloned()
+    let key = serial.as_deref().unwrap_or(name);
+    if resumed.insert(key.to_string())
+        && let Some(saved) = load_saved().get(key).cloned()
         && saved.enabled
     {
         let mut all = tuners.lock().unwrap_or_else(|e| e.into_inner());
@@ -1285,7 +1285,7 @@ fn tune_one_board(
     };
 
     // Persist a freshly-locked best-known-good point (once).
-    if let (Some(best), Some(serial)) = (locked_best, serial.as_ref())
+    if let Some(best) = locked_best
         && book.saved_best != Some(best)
     {
         book.saved_best = Some(best);
@@ -1296,7 +1296,7 @@ fn tune_one_board(
             .mode;
         let (profile, target) = saved_profile_fields(mode);
         save_profile(
-            serial,
+            key,
             SavedProfile {
                 enabled: true,
                 profile,
@@ -1316,9 +1316,7 @@ fn tune_one_board(
         let t = all.get_mut(name);
         (t.enabled, t.mode, t.best.map(|(setpoint, ..)| setpoint))
     };
-    if let Some(serial) = serial.as_ref()
-        && book.last_persisted != Some((enabled_now, mode_now))
-    {
+    if book.last_persisted != Some((enabled_now, mode_now)) {
         book.last_persisted = Some((enabled_now, mode_now));
         let setpoint = best_now.unwrap_or(TuneSetpoint {
             frequency_mhz: metrics.frequency_mhz,
@@ -1326,7 +1324,7 @@ fn tune_one_board(
         });
         let (profile, target) = saved_profile_fields(mode_now);
         save_profile(
-            serial,
+            key,
             SavedProfile {
                 enabled: enabled_now,
                 profile,
