@@ -465,6 +465,7 @@ def read_state():
         "best_diff": fmt_diff(display_diff),
         "uptime": fmt_uptime(m.get("uptime_secs")),
         "paused": m.get("paused"),
+        "html_path": os.path.abspath(HTML_PATH),
         # The name the daemon is actually running under. A rename saved but
         # not yet restarted into deliberately does not show up here.
         "miner_name": m.get("name"),

@@ -1665,6 +1665,9 @@ async function tick() {
     const fleetLabel = 'FLEET MONITOR — ' + d.fleet.boards_online + ' BOARD' + (d.fleet.boards_online === 1 ? '' : 'S');
     $('tagline').textContent = d.miner_name ? (d.miner_name + ' — ' + fleetLabel) : fleetLabel;
     $('statusuptime').textContent = d.uptime ? ('uptime ' + d.uptime) : '—';
+    if (d.html_path) {
+      $('statuspath').textContent = d.html_path + ' (Live Disk Reload Enabled)';
+    }
     render(d);
     const live = d.fleet.hashrate_ghs > 0 && !d.paused;
     const st = d.paused ? 'paused' : (d.fleet.hashrate_ghs > 0 ? 'mining' : 'idle');
