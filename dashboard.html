@@ -1900,6 +1900,9 @@ async function fetchLogs() {
         } else {
           feed.innerHTML += linesHtml;
         }
+        while (feed.children.length > 500) {
+          feed.removeChild(feed.firstChild);
+        }
         feed.scrollTop = feed.scrollHeight;
       }
     }
