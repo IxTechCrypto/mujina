@@ -89,6 +89,15 @@ can't find openssl; see the
 [openssl crate's macOS notes](https://docs.rs/openssl/latest/openssl/#automatic)
 for the supported installation and environment options.
 
+### Windows
+
+Windows is fully supported.
+
+- **Pre-built binary (No compilation required)**: Download or locate `mujina-minerd.exe` in the repository root and run `.\start-all.ps1` in PowerShell to launch both the miner daemon and web dashboard. No Rust toolchain or Visual Studio setup is required.
+- **Building from source**: Install the [Rust toolchain](https://rustup.rs) via `rustup-init.exe` (`x86_64-pc-windows-msvc`) and **Build Tools for Visual Studio** (with the "Desktop development with C++" workload). Python 3 is required for the web dashboard.
+
+See the detailed [Windows Setup Guide](docs/windows-setup.md) for full COM port drivers, gotchas, pre-built launcher usage, and PowerShell scripts.
+
 ## Building
 
 mujina-miner is a cargo workspace. Build and test it the usual way:
@@ -219,6 +228,10 @@ GitHub.
   component interaction
 - [REST API](docs/api.md): endpoints, conventions, and OpenAPI spec
 - [CPU Mining](docs/cpu-mining.md): the CPU backend in detail
+- [Windows Setup Guide](docs/windows-setup.md): Windows build instructions,
+  COM port drivers, gotchas, and PowerShell scripts
+- [Raspberry Pi Setup Guide](docs/raspberry-pi-setup.md): Raspberry Pi
+  deployment, systemd auto-start, and Waveshare e-paper setup
 - [Container Image](docs/container.md): build and run Mujina as a
   container
 

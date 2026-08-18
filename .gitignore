@@ -6,4 +6,5 @@ __pycache__/
 *.log
 *.log.err
 .DS_Store
+graphify-out/
 
