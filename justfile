@@ -21,6 +21,14 @@ test:
 run:
     cargo run --bin mujina-minerd
 
+# Quick mining check on an attached Bitaxe Gamma; pass "baseline" for
+# the full check with the hashrate band; needs the board powered;
+# set MUJINA_POOL_URL/MUJINA_POOL_USER to mine to a pool, or leave
+# them unset to mine to the daemon's dummy source
+[group('hw')]
+test-bitaxe-gamma tier='smoke':
+    cargo test --test bitaxe_gamma -- --ignored --nocapture --test-threads=1 {{tier}}
+
 BUILD_IMAGE := "mujina-build"
 # Tag with a content hash of the Containerfile so we can detect
 # staleness without rebuilding. This matters in CI where podman
