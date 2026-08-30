@@ -714,8 +714,9 @@ impl<I2C: I2c> Tps546<I2C> {
             critical_faults.push(format!("CML fault: {}", desc.join(", ")));
         }
 
-        // Check if unit is OFF (critical - means power has shut down)
-        if status_flags.contains(pmbus::StatusWord::OFF) {
+        // The chip sets OFF whenever the output is off, commanded off
+        // included, so OFF is a fault only while OPERATION is on.
+        if status_flags.contains(pmbus::StatusWord::OFF) && self.output_enabled().await? {
             error!(
                 "CRITICAL: Power controller is OFF - Reading all status registers for diagnostics"
             );
@@ -1263,3 +1264,4 @@ impl<I2C: I2c> Tps546<I2C> {
         Ok(vout_mode.decode_linear16(value))
     }
 }
+
