@@ -57,7 +57,7 @@ def patch_fan(board, payload):
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with urllib.request.urlopen(req, timeout=12) as r:
             return True, r.status
     except Exception as e:
         return False, str(e)

@@ -1781,14 +1781,48 @@ async function saveMinerSettings() {
 async function saveBoardSettings() {
   const d = activeBoard();
   if (!d) { $('bmsg').textContent = 'no board selected'; $('bmsg').className = 'msg'; return; }
+
+  // 1. Fan settings check
   const auto = $('fauto').checked;
+  const currAuto = (d.fan_auto != null) ? d.fan_auto : true;
+  const currTargetC = (d.fan_target_c != null) ? Math.round(d.fan_target_c) : 60;
+  const currMinPct = (d.fan_min_pct != null) ? d.fan_min_pct : 25;
+  const currManualPct = (d.fan_target_pct != null) ? d.fan_target_pct : (d.fan_pct != null ? d.fan_pct : 50);
+
+  let fanChanged = (auto !== currAuto);
+  if (auto) {
+    if (+$('ftarget').value !== currTargetC || +$('fmin').value !== currMinPct) fanChanged = true;
+  } else {
+    if (+$('fmanual').value !== currManualPct) fanChanged = true;
+  }
+
   const fan = { board_name: d.board_name, auto: auto };
   if (auto) { fan.target_c = +$('ftarget').value; fan.min_percent = +$('fmin').value; }
   else { fan.percent = +$('fmanual').value; }
+
+  // 2. Auto-tuning check
   const atOn = $('vauto').checked;
+  const currAt = d.autotune || {};
+  const currAtOn = !!currAt.enabled;
+  const currAtMode = currAt.target ? 'target' : 'profile';
+  const currAtProfile = currAt.profile || 'balanced';
+  const currAtTargetVal = currAt.target ? currAt.target.value : null;
+  const currAtTargetAxis = currAt.target ? currAt.target.axis : 'power';
+
+  let atChanged = (atOn !== currAtOn);
+  if (atOn) {
+    if ($('vmode').value !== currAtMode) atChanged = true;
+    if ($('vmode').value === 'profile' && $('vprofile').value !== currAtProfile) atChanged = true;
+    if ($('vmode').value === 'target') {
+      if (+$('vtargetval').value !== currAtTargetVal || TARGET_AXIS !== currAtTargetAxis) atChanged = true;
+    }
+  }
+
   const at = { board_name: d.board_name, enabled: atOn };
   if ($('vmode').value === 'target') { at.target = { axis: TARGET_AXIS, value: +$('vtargetval').value }; }
   else { at.profile = $('vprofile').value; }
+
+  // 3. Manual frequency/voltage check
   const tune = { board_name: d.board_name };
   if (!atOn) {
     const f = +$('vfreq').value, mv = +$('vvolt').value;
@@ -1796,15 +1830,39 @@ async function saveBoardSettings() {
     if (d.core_v == null || Math.round(d.core_v * 1000) !== mv) tune.core_voltage_mv = mv;
   }
   const hasTune = ('frequency_mhz' in tune) || ('core_voltage_mv' in tune);
+
   $('bmsg').textContent = hasTune ? 'applying (retuning may take a few seconds)…' : 'applying…'; $('bmsg').className = 'msg';
   try {
-    const jf = await post('/settings', fan);
-    const ja = await post('/autotune', at);
+    let jf = { ok: true };
+    if (fanChanged) {
+      jf = await post('/settings', fan);
+    }
+    let ja = { ok: true };
+    if (atChanged) {
+      ja = await post('/autotune', at);
+    }
     let jt = { ok: true };
-    if (hasTune) jt = await post('/tuning', tune);
-    if (jf.ok && ja.ok && jt.ok) { $('bmsg').textContent = 'saved ✓'; $('bmsg').className = 'msg ok'; setTimeout(closeBoardControlModal, 800); tick(); }
-    else { $('bmsg').textContent = 'failed: ' + (jf.detail || ja.detail || jt.detail || 'error'); $('bmsg').className = 'msg'; }
-  } catch (e) { $('bmsg').textContent = 'failed: ' + e; $('bmsg').className = 'msg'; }
+    if (hasTune) {
+      jt = await post('/tuning', tune);
+    }
+
+    if (jf.ok && ja.ok && jt.ok) {
+      $('bmsg').textContent = 'saved ✓';
+      $('bmsg').className = 'msg ok';
+      setTimeout(closeBoardControlModal, 800);
+      tick();
+    } else {
+      const err = (!jf.ok ? `fan: ${jf.detail || 'error'}` : '') ||
+                  (!ja.ok ? `autotune: ${ja.detail || 'error'}` : '') ||
+                  (!jt.ok ? `tuning: ${jt.detail || 'error'}` : '') ||
+                  'error';
+      $('bmsg').textContent = 'failed: ' + err;
+      $('bmsg').className = 'msg';
+    }
+  } catch (e) {
+    $('bmsg').textContent = 'failed: ' + e;
+    $('bmsg').className = 'msg';
+  }
 }
 
 $('gear').addEventListener('click', openSettings);
