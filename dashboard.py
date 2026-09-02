@@ -508,8 +508,12 @@ def load_page_html():
 def read_logs(offset):
     r"""Read new log entries from D:\mujina-run\mujina.log since client's last offset.
     Returns (new_offset, lines_list)."""
-    log_path = os.path.join(HERE, "mujina.log")
-    if not os.path.exists(log_path):
+    candidates = [
+        r"D:\mujina-run\mujina.log",
+        os.path.join(HERE, "mujina.log"),
+    ]
+    log_path = next((c for c in candidates if os.path.exists(c)), None)
+    if not log_path:
         return 0, []
 
     try:
