@@ -629,7 +629,13 @@ impl Scheduler {
                         "Failed to submit share to source"
                     );
                 } else {
-                    debug!(source = %source.name, "Share submitted to source");
+                    info!(
+                        source = %source.name,
+                        nonce = format!("{:#010x}", nonce),
+                        diff = format!("{:.1}", diff),
+                        shares = self.stats.shares_submitted,
+                        "Share found -> submitting to pool"
+                    );
                 }
             } else {
                 error!(source_id = ?task_entry.source_id, "Share for unknown source");
@@ -1208,10 +1214,16 @@ impl MiningStats {
             hashrate.to_human_readable()
         };
 
+        let best_diff_str = self
+            .best_share
+            .map(|d| format!("{:.1}", d))
+            .unwrap_or_else(|| "--".to_string());
+
         info!(
             uptime = %format_duration(elapsed.as_secs()),
             hashrate = %hashrate_str,
             shares = self.shares_submitted,
+            best_diff = %best_diff_str,
             "Mining status."
         );
     }

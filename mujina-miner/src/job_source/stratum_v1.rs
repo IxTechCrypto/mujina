@@ -310,7 +310,7 @@ impl StratumV1Source {
 
             ClientEvent::DifficultyChanged(diff) => {
                 let difficulty = Difficulty::from_f64(diff);
-                debug!(difficulty = %difficulty, "Pool difficulty changed");
+                info!(difficulty = %difficulty, "Pool difficulty set");
                 if let Some(state) = &mut self.state {
                     state.share_difficulty = Some(difficulty);
                 }
@@ -324,28 +324,22 @@ impl StratumV1Source {
             }
 
             ClientEvent::ShareAccepted { job_id, nonce } => {
-                if !self.first_share_logged {
-                    self.first_share_logged = true;
-                    info!(
-                        pool = %self.config.url,
-                        user = %self.config.username,
-                        nonce = format!("{:#x}", nonce),
-                        job_id = %job_id,
-                        "First share accepted."
-                    );
-                } else {
-                    debug!(
-                        pool = %self.config.url,
-                        user = %self.config.username,
-                        nonce = format!("{:#x}", nonce),
-                        job_id = %job_id,
-                        "Share accepted."
-                    );
-                }
+                self.first_share_logged = true;
+                info!(
+                    pool = %self.config.url,
+                    nonce = format!("{:#010x}", nonce),
+                    job_id = %job_id,
+                    "Share ACCEPTED by pool"
+                );
             }
 
             ClientEvent::ShareRejected { job_id, reason } => {
-                warn!(job_id = %job_id, reason = %reason, "Share rejected by pool");
+                warn!(
+                    pool = %self.config.url,
+                    job_id = %job_id,
+                    reason = %reason,
+                    "Share REJECTED by pool"
+                );
             }
 
             ClientEvent::Disconnected => {
