@@ -7,4 +7,5 @@ __pycache__/
 *.log.err
 .DS_Store
 graphify-out/
-
+mujina-autotune.json
+mujina-settings.json
