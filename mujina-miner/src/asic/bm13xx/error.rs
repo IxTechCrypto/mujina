@@ -11,14 +11,14 @@ pub enum ProtocolError {
     InvalidResponseType(u8),
 
     #[error("Cannot write to read-only register: {0:?}")]
-    ReadOnlyRegister(super::protocol::RegisterAddress),
+    ReadOnlyRegister(super::register::RegisterAddress),
 
     #[error("Invalid frame format")]
     InvalidFrame,
 
+    #[error("Unknown chip id: {:02x}{:02x}", .0[0], .0[1])]
+    UnknownChipId([u8; 2]),
+
     #[error("Buffer too small: need {need} bytes, have {have}")]
     BufferTooSmall { need: usize, have: usize },
-
-    #[error("Invalid frequency: {mhz} MHz (must be between 50-800 MHz)")]
-    InvalidFrequency { mhz: u32 },
 }

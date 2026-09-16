@@ -17,9 +17,11 @@ bitflags = { workspace = true }
 bitvec = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
+derive_more = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 inventory = { workspace = true }
+num_enum = { workspace = true }
 nusb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

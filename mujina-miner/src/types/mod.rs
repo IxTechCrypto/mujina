@@ -7,10 +7,13 @@
 mod bitcoin_impls;
 mod debounced_alarm;
 mod difficulty;
+mod frequency;
 mod hash_rate;
 mod hashrate_estimator;
+mod ratio;
 mod share_rate;
 mod temperature;
+mod voltage;
 
 use std::time::Duration;
 
@@ -19,10 +22,13 @@ pub use bitcoin::block::Header as BlockHeader;
 pub use bitcoin::{Amount, BlockHash, Network, Target, Transaction, TxOut, Work};
 pub use debounced_alarm::{AlarmStatus, DebouncedAlarm};
 pub use difficulty::Difficulty;
+pub use frequency::Frequency;
 pub use hash_rate::HashRate;
 pub use hashrate_estimator::HashrateEstimator;
+pub use ratio::Ratio;
 pub use share_rate::ShareRate;
 pub use temperature::Temperature;
+pub use voltage::Voltage;
 
 /// Calculate expected time between shares at given difficulty and hashrate.
 ///

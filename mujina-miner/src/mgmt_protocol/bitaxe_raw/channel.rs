@@ -3,7 +3,6 @@
 //! This module provides a control channel abstraction that handles
 //! packet ID management and request/response correlation.
 
-use crate::tracing::prelude::*;
 use futures::SinkExt;
 use std::io;
 use std::sync::Arc;

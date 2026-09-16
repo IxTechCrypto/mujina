@@ -1,6 +1,5 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
-use futures::sink::SinkExt;
 use std::{
     pin::Pin,
     sync::{Arc, Mutex as StdMutex},
@@ -12,7 +11,6 @@ use tokio::{
     sync::{Mutex, mpsc, watch},
     time::{self, Instant, MissedTickBehavior},
 };
-use tokio_stream::StreamExt;
 use tokio_util::{
     codec::{FramedRead, FramedWrite},
     sync::CancellationToken,
@@ -22,13 +20,14 @@ use crate::{
     api::BoardCommand,
     api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
     asic::{
-        ChipInfo,
         bm13xx::{
-            self, BM13xxProtocol,
-            protocol::Command,
+            self, chip_config,
+            peripherals::{BoardPeripherals, ResetLine},
+            register::ChipModel,
             thread::{BM13xxThread, FrequencyControl},
+            topology::TopologySpec,
         },
-        hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
+        hash_thread::HashThread,
     },
     board::fan_control::FanController,
     hw_trait::{
@@ -45,14 +44,14 @@ use crate::{
     },
     peripheral::{
         emc2101::{Emc2101, Percent},
-        tps546::{Tps546, Tps546Config},
+        tps546::{Tps546, Tps546Config, Tps546Regulator},
     },
     tracing::prelude::*,
     transport::{
         UsbDeviceInfo,
-        serial::{SerialReader, SerialStream, SerialWriter},
+        serial::SerialStream,
     },
-    types::Temperature,
+    types::{Ratio, Temperature, Voltage},
 };
 
 use super::{BackplaneConnector, BoardInfo, pattern::Match};
@@ -142,8 +141,8 @@ async fn create_from_usb(device: UsbDeviceInfo, firmware: Firmware) -> Result<Ba
         .context("failed to open data port")?;
     let (data_reader, data_writer, _data_control) = data_stream.split();
     let tracing_reader = TracingReader::new(data_reader, "Data");
-    let mut data_reader = FramedRead::new(tracing_reader, bm13xx::FrameCodec);
-    let mut data_writer = FramedWrite::new(data_writer, bm13xx::FrameCodec);
+    let data_reader = FramedRead::new(tracing_reader, bm13xx::FrameCodec::new(ChipModel::BM1370));
+    let data_writer = FramedWrite::new(data_writer, bm13xx::FrameCodec::new(ChipModel::BM1370));
 
     // Brief pause to let Windows composite USB driver settle both COM port handles
     time::sleep(Duration::from_millis(50)).await;
@@ -178,65 +177,37 @@ async fn create_from_usb(device: UsbDeviceInfo, firmware: Firmware) -> Result<Ba
     let emc2101 = init_fan_controller(i2c.clone()).await?;
     let regulator = Arc::new(Mutex::new(init_power_controller(i2c.clone()).await?));
 
-    time::sleep(Duration::from_millis(500)).await;
+    let reset_line = BitaxeResetLine {
+        nrst_pin: reset_pin,
+        released_since: Arc::new(StdMutex::new(None)),
+    };
 
-    // Release ASIC from reset for discovery. The BM1370 needs time to boot
-    // its UART before it will answer; give it the same ~500ms the reference
-    // Bitaxe firmware allows rather than a marginal 200ms.
-    debug!("De-asserting ASIC nRST");
-    reset_pin.write(PinValue::High).await?;
+    let voltage_regulator = Tps546Regulator::new(regulator.clone());
+    let peripherals = BoardPeripherals {
+        reset_line: Box::new(reset_line.clone()),
+        voltage_regulator: Box::new(voltage_regulator),
+    };
 
-    let chip_infos = discover_chain(&mut data_reader, &mut data_writer).await?;
-
-    debug!(count = chip_infos.len(), "Discovered chips");
-
-    // Verify expected BM1370 chip
-    const EXPECTED_CHIP_ID: [u8; 2] = [0x13, 0x70];
-    if let Some(first_chip) = chip_infos.first()
-        && first_chip.chip_id != EXPECTED_CHIP_ID
-    {
-        bail!(
-            "wrong chip type for {model}: expected BM1370 ({:02x}{:02x}), found {:02x}{:02x}",
-            EXPECTED_CHIP_ID[0],
-            EXPECTED_CHIP_ID[1],
-            first_chip.chip_id[0],
-            first_chip.chip_id[1]
-        );
-    }
-
-    // Put chip back in reset before handing off to hash thread
-    reset_pin.write(PinValue::Low).await?;
-
-    // Create hash thread
-    let (thread_shutdown_tx, thread_shutdown_rx) = watch::channel(ThreadRemovalSignal::Running);
+    let (thread_shutdown_tx, thread_shutdown_rx) = watch::channel(());
 
     let thread_name = match &device.serial_number {
         Some(serial) => format!("{}-{}", model.replace(' ', "-"), &serial[..8.min(serial.len())]),
         None => model.replace(' ', "-"),
     };
 
-    let asic_enable = BitaxeAsicEnable {
-        nrst_pin: reset_pin,
-        enabled_since: Arc::new(StdMutex::new(None)),
-    };
-    let asic_enable_monitor = asic_enable.clone();
-    let peripherals = BoardPeripherals {
-        asic_enable: Some(Box::new(asic_enable)),
-        voltage_regulator: None,
-    };
-
     let thread = BM13xxThread::new(
         thread_name,
+        chip_config::bm1370(),
+        TopologySpec::single_domain(1),
         data_reader,
         data_writer,
         peripherals,
         thread_shutdown_rx,
-        chip_infos.len(),
     );
     let freq_control = thread.frequency_control();
     let threads: Vec<Box<dyn HashThread>> = vec![Box::new(thread)];
 
-    debug!("{model} board initialized with {} chips", chip_infos.len());
+    debug!("{model} board initialized");
 
     // Telemetry channel seeded with board identity
     let serial = device.serial_number.clone();
@@ -246,7 +217,7 @@ async fn create_from_usb(device: UsbDeviceInfo, firmware: Firmware) -> Result<Ba
         model: model.to_string(),
         serial: serial.clone(),
         chip_model: Some("BM1370".into()),
-        chip_count: Some(chip_infos.len() as u32),
+        chip_count: Some(1),
         frequency_mhz: Some(bm13xx::thread::TARGET_FREQUENCY_MHZ),
         thread_count: threads.len() as u32,
         ..Default::default()
@@ -268,14 +239,14 @@ async fn create_from_usb(device: UsbDeviceInfo, firmware: Firmware) -> Result<Ba
         board_model: model,
         board_serial: serial,
         chip_model: "BM1370",
-        chip_count: chip_infos.len() as u32,
+        chip_count: 1,
         thread_count: threads.len() as u32,
         fan: FanController::default(),
         freq_control,
         current_freq_mhz: bm13xx::thread::TARGET_FREQUENCY_MHZ,
         over_temp_count: 0,
         sensor_fault_count: 0,
-        asic_enable: asic_enable_monitor,
+        reset_line,
     };
 
     // Runtime command channel (fan control, etc.). Small buffer: commands
@@ -316,7 +287,7 @@ const MONITOR_TICK: Duration = Duration::from_secs(2);
 struct Bitaxe {
     emc2101: Emc2101<BitaxeRawI2c>,
     regulator: Arc<Mutex<Tps546<BitaxeRawI2c>>>,
-    thread_shutdown: watch::Sender<ThreadRemovalSignal>,
+    thread_shutdown: watch::Sender<()>,
     board_name: String,
     board_model: &'static str,
     board_serial: Option<String>,
@@ -343,7 +314,7 @@ struct Bitaxe {
     /// over-temp because it is usually a transient control-bus desync,
     /// but still shuts the board down if the sensor stays unreadable.
     sensor_fault_count: u32,
-    asic_enable: BitaxeAsicEnable,
+    reset_line: BitaxeResetLine,
 }
 
 impl Bitaxe {
@@ -393,8 +364,8 @@ impl Bitaxe {
             }
             BoardCommand::SetCoreVoltage { millivolts, reply } => {
                 let clamped = millivolts.clamp(MIN_CORE_VOLTAGE_MV, MAX_CORE_VOLTAGE_MV);
-                let volts = clamped as f32 / 1000.0;
-                let result = self.regulator.lock().await.set_vout(volts).await;
+                let voltage = Voltage::from_mv(clamped as i32);
+                let result = self.regulator.lock().await.set_vout_target(voltage).await;
                 match &result {
                     Ok(()) => info!(millivolts = clamped, "Core voltage set"),
                     Err(e) => warn!(error = %e, "Failed to set core voltage"),
@@ -453,7 +424,7 @@ impl Bitaxe {
         let fan_percent = self.emc2101.get_fan_speed().await.ok().map(u8::from);
         let fan_rpm = self.emc2101.get_rpm().await.ok();
 
-        let (vin_mv, vout_mv, iout_ma, power_mw, vr_temp) = {
+        let (vin, vout, iout_ma, power_mw, vr_temp) = {
             let mut reg = self.regulator.lock().await;
 
             if let Err(e) = reg.check_status().await {
@@ -487,9 +458,9 @@ impl Bitaxe {
         // Wait for the measurement to settle before trusting readings.
         const DIODE_SETTLE: Duration = Duration::from_millis(500);
         let diode_ready = self
-            .asic_enable
-            .enabled_since()
-            .context("failed to read ASIC enable state")?
+            .reset_line
+            .released_since()
+            .context("failed to read ASIC reset line state")?
             .is_some_and(|since| since.elapsed() >= DIODE_SETTLE);
         let asic_temp = if diode_ready {
             match raw_temp {
@@ -611,13 +582,13 @@ impl Bitaxe {
             powers: vec![
                 PowerMeasurement {
                     name: "input".into(),
-                    voltage_v: vin_mv.map(|mv| mv as f32 / 1000.0),
+                    voltage_v: vin.map(|v| v.volts()),
                     current_a: None,
                     power_w: None,
                 },
                 PowerMeasurement {
                     name: "core".into(),
-                    voltage_v: vout_mv.map(|mv| mv as f32 / 1000.0),
+                    voltage_v: vout.map(|v| v.volts()),
                     current_a: iout_ma.map(|ma| ma as f32 / 1000.0),
                     power_w: power_mw.map(|mw| mw as f32 / 1000.0),
                 },
@@ -639,8 +610,8 @@ impl Bitaxe {
                 vr_temp_c = ?vr_temp,
                 power_w = ?power_mw.map(|mw| mw as f32 / 1000.0),
                 current_a = ?iout_ma.map(|ma| ma as f32 / 1000.0),
-                vin_v = ?vin_mv.map(|mv| mv as f32 / 1000.0),
-                vout_v = ?vout_mv.map(|mv| mv as f32 / 1000.0),
+                vin_v = ?vin.map(|v| v.volts()),
+                vout_v = ?vout.map(|v| v.volts()),
                 "Board status"
             );
         }
@@ -653,7 +624,7 @@ impl Bitaxe {
         // disabling the chain, so closed() means it has finished.
         // A failed send means it is already gone.
         const THREAD_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
-        let _ = self.thread_shutdown.send(ThreadRemovalSignal::Shutdown);
+        let _ = self.thread_shutdown.send(());
         if time::timeout(THREAD_EXIT_TIMEOUT, self.thread_shutdown.closed())
             .await
             .is_err()
@@ -661,11 +632,11 @@ impl Bitaxe {
             warn!("Timed out waiting for thread to exit");
         }
 
-        if let Err(e) = self.asic_enable.disable().await {
+        if let Err(e) = self.reset_line.assert().await {
             warn!("Failed to hold chips in reset: {}", e);
         }
 
-        match self.regulator.lock().await.set_vout(0.0).await {
+        match self.regulator.lock().await.disable_output().await {
             Ok(()) => debug!("Core voltage turned off"),
             Err(e) => warn!("Failed to turn off core voltage: {}", e),
         }
@@ -696,23 +667,23 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
         phase: 0x00,
         frequency_switch_khz: 650,
 
-        vin_on: 4.8,
-        vin_off: 4.5,
-        vin_uv_warn_limit: 0.0, // Disabled due to TI bug
-        vin_ov_fault_limit: 6.5,
+        vin_on: Voltage::from_volts(4.8),
+        vin_off: Voltage::from_volts(4.5),
+        vin_uv_warn_limit: Voltage::from_volts(0.0), // Disabled due to TI bug
+        vin_ov_fault_limit: Voltage::from_volts(6.5),
         vin_ov_fault_response: 0xB7,
 
         vout_scale_loop: 0.25,
-        vout_min: 1.0,
-        vout_max: 2.0,
-        vout_command: 1.15,
+        vout_min: Voltage::from_volts(1.0),
+        vout_max: Voltage::from_volts(2.0),
+        vout_command: Voltage::from_volts(1.15),
 
-        vout_ov_fault_limit: 1.25,
-        vout_ov_warn_limit: 1.16,
-        vout_margin_high: 1.10,
-        vout_margin_low: 0.90,
-        vout_uv_warn_limit: 0.90,
-        vout_uv_fault_limit: 0.75,
+        vout_ov_fault_limit: Ratio::from_factor(1.25),
+        vout_ov_warn_limit: Ratio::from_factor(1.16),
+        vout_margin_high: Ratio::from_factor(1.10),
+        vout_margin_low: Ratio::from_factor(0.90),
+        vout_uv_warn_limit: Ratio::from_factor(0.90),
+        vout_uv_fault_limit: Ratio::from_factor(0.75),
 
         iout_oc_warn_limit: 25.0,
         iout_oc_fault_limit: 30.0,
@@ -741,17 +712,20 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
 
     time::sleep(Duration::from_millis(100)).await;
 
-    const DEFAULT_VOUT: f32 = bm13xx::chip_profile::BM1370.default_voltage_mv as f32 / 1000.0;
+    const DEFAULT_VOUT: Voltage = Voltage::from_volts(1.15);
     tps546
-        .set_vout(DEFAULT_VOUT)
+        .set_vout_target(DEFAULT_VOUT)
         .await
-        .context("failed to set core voltage")?;
-    debug!("Core voltage set to {DEFAULT_VOUT}V");
+        .context("failed to set core voltage target")?;
+    tps546
+        .clear_faults()
+        .await
+        .context("failed to clear faults")?;
 
     time::sleep(Duration::from_millis(500)).await;
 
     match tps546.get_vout().await {
-        Ok(mv) => debug!("Core voltage readback: {:.3}V", mv as f32 / 1000.0),
+        Ok(v) => debug!("Core voltage readback: {:.3}V", v.volts()),
         Err(e) => warn!("Failed to read core voltage: {}", e),
     }
 
@@ -762,184 +736,46 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
     Ok(tps546)
 }
 
-/// Discard any frames already sitting in the reader.
-///
-/// Used to make each discovery attempt independent of the last. Stops at
-/// the first quiet moment rather than reading for a fixed period, so it
-/// costs nothing on the common path where nothing is pending.
-async fn drain_pending(reader: &mut FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>) {
-    /// How long to wait for a straggler before calling the line quiet.
-    const QUIET: Duration = Duration::from_millis(20);
-
-    // Ends on a quiet line or a closed stream; either way there is nothing
-    // stale left to confuse the caller.
-    let mut dropped = 0usize;
-    while let Ok(Some(_)) = time::timeout(QUIET, reader.next()).await {
-        dropped += 1;
-    }
-    if dropped > 0 {
-        debug!(dropped, "Discarded stale frames before chip discovery");
-    }
-}
-
-pub(crate) async fn discover_chips(
-    reader: &mut FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>,
-    writer: &mut FramedWrite<SerialWriter, bm13xx::FrameCodec>,
-) -> Result<Vec<ChipInfo>> {
-    // Drop anything already buffered before asking.
-    //
-    // A discovery attempt that times out does not cancel the chips'
-    // replies -- they simply arrive after the window closed and sit in the
-    // reader. The next attempt would then count them *plus* its own,
-    // reporting twice the real chip count. Observed on a 4-chip chain as
-    // "discovered 8": the first attempt was too early, and the second saw
-    // both sets. A single chip answers fast enough that this rarely shows
-    // up on the Bitaxe, which is why it survived this long.
-    drain_pending(reader).await;
-
-    let discover_cmd = BM13xxProtocol::discover_chips();
-
-    writer
-        .send(discover_cmd)
-        .await
-        .context("failed to send chip discovery command")?;
-
-    let mut chip_infos = Vec::new();
-    let timeout = Duration::from_millis(500);
-    let deadline = Instant::now() + timeout;
-
-    while Instant::now() < deadline {
-        tokio::select! {
-            response = reader.next() => {
-                match response {
-                    Some(Ok(bm13xx::Response::ReadRegister {
-                        chip_address: _,
-                        register: bm13xx::Register::ChipId { chip_type, core_count, address }
-                    })) => {
-                        let chip_id = chip_type.id_bytes();
-                        debug!("Discovered chip {:?} ({:02x}{:02x}) at address {address}",
-                                     chip_type, chip_id[0], chip_id[1]);
-
-                        chip_infos.push(ChipInfo {
-                            chip_id,
-                            core_count: core_count.into(),
-                            address,
-                            supports_version_rolling: true,
-                        });
-                    }
-                    Some(Ok(_)) => {
-                        warn!("Unexpected response during chip discovery");
-                    }
-                    Some(Err(e)) => {
-                        error!("Error during chip discovery: {e}");
-                    }
-                    None => break,
-                }
-            }
-            _ = time::sleep_until(deadline) => {
-                break;
-            }
-        }
-    }
-
-    if chip_infos.is_empty() {
-        bail!("no chips discovered");
-    }
-    Ok(chip_infos)
-}
-
-/// Bring a freshly-reset BM13xx chain up to the point of enumeration.
-///
-/// The caller must have already released the ASIC(s) from reset. This waits
-/// for the chip UARTs to boot, broadcasts the version-mask configuration the
-/// chips need before they will answer, then discovers them — retrying the
-/// whole preamble because a cold ASIC can miss the first round while its
-/// UART is still coming up. Shared by every BM13xx board (Bitaxe, NerdQAxe++)
-/// so the proven timing lives in one place.
-pub(crate) async fn discover_chain(
-    reader: &mut FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>,
-    writer: &mut FramedWrite<SerialWriter, bm13xx::FrameCodec>,
-) -> Result<Vec<ChipInfo>> {
-    time::sleep(Duration::from_millis(500)).await;
-
-    const DISCOVERY_ATTEMPTS: usize = 5;
-    for attempt in 1..=DISCOVERY_ATTEMPTS {
-        debug!("Sending version mask configuration (3 times)");
-        for i in 1..=3 {
-            trace!("Version mask send {}/3", i);
-            let version_cmd = Command::WriteRegister {
-                broadcast: true,
-                chip_address: 0x00,
-                register: bm13xx::protocol::Register::VersionMask(
-                    bm13xx::protocol::VersionMask::full_rolling(),
-                ),
-            };
-            writer
-                .send(version_cmd)
-                .await
-                .context("failed to send config command")?;
-            time::sleep(Duration::from_millis(5)).await;
-        }
-
-        time::sleep(Duration::from_millis(10)).await;
-
-        match discover_chips(reader, writer).await {
-            Ok(chips) => return Ok(chips),
-            Err(e) if attempt < DISCOVERY_ATTEMPTS => {
-                warn!(
-                    "Chip discovery attempt {attempt}/{DISCOVERY_ATTEMPTS} failed: {e}; retrying"
-                );
-                time::sleep(Duration::from_millis(200)).await;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    unreachable!("loop returns on the final attempt")
-}
-
-/// GPIO-based ASIC reset control that records when the ASIC was
-/// last enabled.
+/// GPIO-driven chip reset line that records when reset was last released.
 #[derive(Clone)]
-struct BitaxeAsicEnable {
+struct BitaxeResetLine {
     nrst_pin: BitaxeRawGpioPin,
-    enabled_since: Arc<StdMutex<Option<Instant>>>,
+    released_since: Arc<StdMutex<Option<Instant>>>,
 }
 
-impl BitaxeAsicEnable {
-    /// When the ASIC was last taken out of reset, or `None` if it
-    /// is currently in reset. Safe to call from another task.
-    fn enabled_since(&self) -> Result<Option<Instant>> {
-        self.enabled_since
+impl BitaxeResetLine {
+    /// When reset was last released, or `None` while reset is asserted.
+    fn released_since(&self) -> Result<Option<Instant>> {
+        self.released_since
             .lock()
             .map(|guard| *guard)
-            .map_err(|_| anyhow!("ASIC enable state lock poisoned"))
+            .map_err(|_| anyhow!("reset line state lock poisoned"))
     }
 }
 
 #[async_trait]
-impl AsicEnable for BitaxeAsicEnable {
-    async fn enable(&mut self) -> Result<()> {
-        self.nrst_pin
-            .write(PinValue::High)
-            .await
-            .map_err(|e| anyhow!("failed to release reset: {}", e))?;
-        *self
-            .enabled_since
-            .lock()
-            .map_err(|_| anyhow!("ASIC enable state lock poisoned"))? = Some(Instant::now());
-        Ok(())
-    }
-
-    async fn disable(&mut self) -> Result<()> {
+impl ResetLine for BitaxeResetLine {
+    async fn assert(&mut self) -> Result<()> {
         self.nrst_pin
             .write(PinValue::Low)
             .await
             .map_err(|e| anyhow!("failed to assert reset: {}", e))?;
         *self
-            .enabled_since
+            .released_since
             .lock()
-            .map_err(|_| anyhow!("ASIC enable state lock poisoned"))? = None;
+            .map_err(|_| anyhow!("reset line state lock poisoned"))? = None;
+        Ok(())
+    }
+
+    async fn release(&mut self) -> Result<()> {
+        self.nrst_pin
+            .write(PinValue::High)
+            .await
+            .map_err(|e| anyhow!("failed to release reset: {}", e))?;
+        *self
+            .released_since
+            .lock()
+            .map_err(|_| anyhow!("reset line state lock poisoned"))? = Some(Instant::now());
         Ok(())
     }
 }

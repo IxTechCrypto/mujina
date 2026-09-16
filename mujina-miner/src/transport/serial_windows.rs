@@ -252,7 +252,7 @@ impl SerialStream {
     pub fn clear(&self, buffer: tokio_serial::ClearBuffer) -> Result<(), SerialError> {
         use tokio_serial::SerialPort;
         let stream = self.inner.stream.write();
-        let mut guard = stream;
+        let guard = stream;
         guard.clear(buffer).map_err(|e| SerialError::ConfigError(e.to_string()))
     }
 

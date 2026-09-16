@@ -9,6 +9,7 @@ pub mod emc2101;
 pub mod emc2302;
 pub mod led;
 pub mod pmbus;
+pub mod regulator;
 pub mod tmp1075;
 pub mod tmp451;
 pub mod tps53647;

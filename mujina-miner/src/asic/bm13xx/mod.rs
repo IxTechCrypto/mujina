@@ -3,11 +3,20 @@
 //! This module provides protocol implementation and utilities for
 //! communicating with BM13xx series mining chips (BM1366, BM1370, etc).
 
+pub mod chain;
+pub mod chip_config;
 pub mod chip_profile;
+pub mod codec;
+pub mod command;
 pub mod crc;
 pub mod error;
-pub mod protocol;
+pub mod peripherals;
+pub mod reader;
+pub mod register;
+pub mod register_client;
+pub mod response;
 pub mod thread;
+pub mod topology;
 
 #[cfg(test)]
 mod reference_tests;
@@ -15,7 +24,6 @@ mod reference_tests;
 pub mod test_data;
 
 // Re-export commonly used types
-pub use protocol::{FrameCodec, Register, Response};
-
-// Re-export the protocol handler
-pub use protocol::BM13xxProtocol;
+pub use codec::FrameCodec;
+pub use register::Register;
+pub use response::Response;

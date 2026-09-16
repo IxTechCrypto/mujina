@@ -1,16 +1,22 @@
-//! TPS546D24A Power Management Controller Driver
+//! TPS546 Power Management Controller Driver
 //!
-//! This module provides a driver for the Texas Instruments TPS546D24A
-//! synchronous buck converter with PMBus interface.
+//! This module provides a driver for the Texas Instruments TPS546
+//! family of synchronous buck converters with PMBus interface.
 //!
 //! Datasheet: <https://www.ti.com/lit/ds/symlink/tps546d24a.pdf>
 
+use std::sync::Arc;
+
 use crate::tracing::prelude::*;
 use anyhow::{Result, bail};
+use async_trait::async_trait;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 use super::pmbus::{self, PmbusCommand, StatusDecoder, VoutMode, linear11};
+use super::regulator::VoltageRegulator;
 use crate::hw_trait::I2c;
+use crate::types::{Ratio, Voltage};
 
 /// Constants for TPS546 device identification
 pub mod constants {
@@ -36,40 +42,43 @@ pub struct Tps546Config {
     pub frequency_switch_khz: i32,
 
     // Input voltage thresholds
-    /// Input voltage turn-on threshold (V)
-    pub vin_on: f32,
-    /// Input voltage turn-off threshold (V)
-    pub vin_off: f32,
-    /// Input undervoltage warning limit (V)
-    pub vin_uv_warn_limit: f32,
-    /// Input overvoltage fault limit (V)
-    pub vin_ov_fault_limit: f32,
+    /// Input voltage turn-on threshold.
+    pub vin_on: Voltage,
+    /// Input voltage turn-off threshold.
+    pub vin_off: Voltage,
+    /// Input undervoltage warning limit.
+    pub vin_uv_warn_limit: Voltage,
+    /// Input overvoltage fault limit.
+    pub vin_ov_fault_limit: Voltage,
     /// Input overvoltage fault response byte
     pub vin_ov_fault_response: u8,
 
     // Output voltage configuration
     /// Output voltage scale factor
     pub vout_scale_loop: f32,
-    /// Minimum output voltage (V)
-    pub vout_min: f32,
-    /// Maximum output voltage (V)
-    pub vout_max: f32,
-    /// Initial output voltage command (V)
-    pub vout_command: f32,
+    /// Minimum output voltage.
+    pub vout_min: Voltage,
+    /// Maximum output voltage.
+    pub vout_max: Voltage,
+    /// Initial output voltage command.
+    pub vout_command: Voltage,
 
-    // Output voltage protection (relative to vout_command)
-    /// Output overvoltage fault limit (relative, e.g., 1.25 = 125%)
-    pub vout_ov_fault_limit: f32,
-    /// Output overvoltage warning limit (relative, e.g., 1.16 = 116%)
-    pub vout_ov_warn_limit: f32,
-    /// Margin high voltage (relative, e.g., 1.10 = 110%)
-    pub vout_margin_high: f32,
-    /// Margin low voltage (relative, e.g., 0.90 = 90%)
-    pub vout_margin_low: f32,
-    /// Output undervoltage warning limit (relative, e.g., 0.90 = 90%)
-    pub vout_uv_warn_limit: f32,
-    /// Output undervoltage fault limit (relative, e.g., 0.75 = 75%)
-    pub vout_uv_fault_limit: f32,
+    // Output voltage protection and margining. Each value is a
+    // ratio of VOUT_COMMAND. The REL bit in VOUT_MODE is set on
+    // this part, so the chip scales these thresholds with the set
+    // point.
+    /// Output overvoltage fault limit.
+    pub vout_ov_fault_limit: Ratio,
+    /// Output overvoltage warning limit.
+    pub vout_ov_warn_limit: Ratio,
+    /// Margin high level.
+    pub vout_margin_high: Ratio,
+    /// Margin low level.
+    pub vout_margin_low: Ratio,
+    /// Output undervoltage warning limit.
+    pub vout_uv_warn_limit: Ratio,
+    /// Output undervoltage fault limit.
+    pub vout_uv_fault_limit: Ratio,
 
     // Output current protection
     /// Output current overcurrent warning limit (A)
@@ -115,9 +124,11 @@ pub enum Tps546Error {
     VoltageOutOfRange(f32, f32, f32),
     #[error("PMBus fault detected: {0}")]
     FaultDetected(String),
+    #[error("OPERATION reads back 0x{readback:02x} after commanding 0x{commanded:02x}")]
+    OperationNotAccepted { commanded: u8, readback: u8 },
 }
 
-/// TPS546D24A driver
+/// TPS546 driver
 pub struct Tps546<I2C> {
     i2c: I2C,
     config: Tps546Config,
@@ -137,7 +148,7 @@ impl<I2C: I2c> Tps546<I2C> {
 
     /// Initialize the TPS546
     pub async fn init(&mut self) -> Result<()> {
-        debug!("Initializing TPS546D24A power regulator");
+        debug!("Initializing TPS546 power regulator");
 
         // First verify device ID to ensure I2C communication is working
         self.verify_device_id().await?;
@@ -222,39 +233,39 @@ impl<I2C: I2c> Tps546<I2C> {
         .await?;
 
         // Input voltage thresholds (handle UV_WARN_LIMIT bug like esp-miner)
-        if self.config.vin_uv_warn_limit > 0.0 {
+        if self.config.vin_uv_warn_limit.volts() > 0.0 {
             trace!(
                 "Setting VIN_UV_WARN_LIMIT: {:.2}V",
-                self.config.vin_uv_warn_limit
+                self.config.vin_uv_warn_limit.volts()
             );
             self.write_word(
                 PmbusCommand::VinUvWarnLimit,
-                self.float_to_slinear11(self.config.vin_uv_warn_limit),
+                self.float_to_slinear11(self.config.vin_uv_warn_limit.volts()),
             )
             .await?;
         }
 
-        trace!("Setting VIN_ON: {:.2}V", self.config.vin_on);
+        trace!("Setting VIN_ON: {:.2}V", self.config.vin_on.volts());
         self.write_word(
             PmbusCommand::VinOn,
-            self.float_to_slinear11(self.config.vin_on),
+            self.float_to_slinear11(self.config.vin_on.volts()),
         )
         .await?;
 
-        trace!("Setting VIN_OFF: {:.2}V", self.config.vin_off);
+        trace!("Setting VIN_OFF: {:.2}V", self.config.vin_off.volts());
         self.write_word(
             PmbusCommand::VinOff,
-            self.float_to_slinear11(self.config.vin_off),
+            self.float_to_slinear11(self.config.vin_off.volts()),
         )
         .await?;
 
         trace!(
             "Setting VIN_OV_FAULT_LIMIT: {:.2}V",
-            self.config.vin_ov_fault_limit
+            self.config.vin_ov_fault_limit.volts()
         );
         self.write_word(
             PmbusCommand::VinOvFaultLimit,
-            self.float_to_slinear11(self.config.vin_ov_fault_limit),
+            self.float_to_slinear11(self.config.vin_ov_fault_limit.volts()),
         )
         .await?;
 
@@ -276,65 +287,82 @@ impl<I2C: I2c> Tps546<I2C> {
         )
         .await?;
 
-        trace!("Setting VOUT_COMMAND: {:.2}V", self.config.vout_command);
-        let vout_command = self.encode_voltage(self.config.vout_command).await?;
+        trace!(
+            "Setting VOUT_COMMAND: {:.2}V",
+            self.config.vout_command.volts()
+        );
+        let vout_command = self
+            .encode_voltage(self.config.vout_command.volts())
+            .await?;
         self.write_word(PmbusCommand::VoutCommand, vout_command)
             .await?;
 
-        trace!("Setting VOUT_MAX: {:.2}V", self.config.vout_max);
-        let vout_max = self.encode_voltage(self.config.vout_max).await?;
+        trace!("Setting VOUT_MAX: {:.2}V", self.config.vout_max.volts());
+        let vout_max = self.encode_voltage(self.config.vout_max.volts()).await?;
         self.write_word(PmbusCommand::VoutMax, vout_max).await?;
 
-        trace!("Setting VOUT_MIN: {:.2}V", self.config.vout_min);
-        let vout_min = self.encode_voltage(self.config.vout_min).await?;
+        trace!("Setting VOUT_MIN: {:.2}V", self.config.vout_min.volts());
+        let vout_min = self.encode_voltage(self.config.vout_min.volts()).await?;
         self.write_word(PmbusCommand::VoutMin, vout_min).await?;
 
-        // Output voltage protection (relative to vout_command)
+        // Output voltage protection (ratios of VOUT_COMMAND)
         trace!(
             "Setting VOUT_OV_FAULT_LIMIT: {:.2}",
-            self.config.vout_ov_fault_limit
+            self.config.vout_ov_fault_limit.factor()
         );
-        let vout_ov_fault = self.encode_voltage(self.config.vout_ov_fault_limit).await?;
+        let vout_ov_fault = self
+            .encode_voltage(self.config.vout_ov_fault_limit.factor())
+            .await?;
         self.write_word(PmbusCommand::VoutOvFaultLimit, vout_ov_fault)
             .await?;
 
         trace!(
             "Setting VOUT_OV_WARN_LIMIT: {:.2}",
-            self.config.vout_ov_warn_limit
+            self.config.vout_ov_warn_limit.factor()
         );
-        let vout_ov_warn = self.encode_voltage(self.config.vout_ov_warn_limit).await?;
+        let vout_ov_warn = self
+            .encode_voltage(self.config.vout_ov_warn_limit.factor())
+            .await?;
         self.write_word(PmbusCommand::VoutOvWarnLimit, vout_ov_warn)
             .await?;
 
         trace!(
             "Setting VOUT_MARGIN_HIGH: {:.2}",
-            self.config.vout_margin_high
+            self.config.vout_margin_high.factor()
         );
-        let vout_margin_high = self.encode_voltage(self.config.vout_margin_high).await?;
+        let vout_margin_high = self
+            .encode_voltage(self.config.vout_margin_high.factor())
+            .await?;
         self.write_word(PmbusCommand::VoutMarginHigh, vout_margin_high)
             .await?;
 
         trace!(
             "Setting VOUT_MARGIN_LOW: {:.2}",
-            self.config.vout_margin_low
+            self.config.vout_margin_low.factor()
         );
-        let vout_margin_low = self.encode_voltage(self.config.vout_margin_low).await?;
+        let vout_margin_low = self
+            .encode_voltage(self.config.vout_margin_low.factor())
+            .await?;
         self.write_word(PmbusCommand::VoutMarginLow, vout_margin_low)
             .await?;
 
         trace!(
             "Setting VOUT_UV_WARN_LIMIT: {:.2}",
-            self.config.vout_uv_warn_limit
+            self.config.vout_uv_warn_limit.factor()
         );
-        let vout_uv_warn = self.encode_voltage(self.config.vout_uv_warn_limit).await?;
+        let vout_uv_warn = self
+            .encode_voltage(self.config.vout_uv_warn_limit.factor())
+            .await?;
         self.write_word(PmbusCommand::VoutUvWarnLimit, vout_uv_warn)
             .await?;
 
         trace!(
             "Setting VOUT_UV_FAULT_LIMIT: {:.2}",
-            self.config.vout_uv_fault_limit
+            self.config.vout_uv_fault_limit.factor()
         );
-        let vout_uv_fault = self.encode_voltage(self.config.vout_uv_fault_limit).await?;
+        let vout_uv_fault = self
+            .encode_voltage(self.config.vout_uv_fault_limit.factor())
+            .await?;
         self.write_word(PmbusCommand::VoutUvFaultLimit, vout_uv_fault)
             .await?;
 
@@ -495,86 +523,82 @@ impl<I2C: I2c> Tps546<I2C> {
         Ok(())
     }
 
-    /// Set output voltage
-    pub async fn set_vout(&mut self, volts: f32) -> Result<()> {
-        if volts == 0.0 {
-            // Turn off output
-            self.write_byte(
-                PmbusCommand::Operation,
-                pmbus::Operation::OffImmediate.as_u8(),
-            )
-            .await?;
-            debug!("Output voltage turned off");
-        } else {
-            // Check voltage range
-            if volts < self.config.vout_min || volts > self.config.vout_max {
-                bail!(Tps546Error::VoltageOutOfRange(
-                    volts,
-                    self.config.vout_min,
-                    self.config.vout_max
-                ));
-            }
-
-            // Set voltage
-            let value = self.encode_voltage(volts).await?;
-            self.write_word(PmbusCommand::VoutCommand, value).await?;
-            debug!("Output voltage set to {:.2}V", volts);
-
-            // Clear any faults before turning on
-            self.clear_faults().await?;
-            debug!("Cleared faults before turn-on");
-
-            // Turn on output
-            self.write_byte(PmbusCommand::Operation, pmbus::Operation::On.as_u8())
-                .await?;
-
-            // Verify operation
-            let op_val = self.read_byte(PmbusCommand::Operation).await?;
-            if op_val != pmbus::Operation::On.as_u8() {
-                error!("Failed to turn on output, OPERATION = 0x{:02X}", op_val);
-            } else {
-                debug!("Power turned ON successfully, OPERATION = 0x{:02X}", op_val);
-            }
-
-            // Check immediate status after turn-on
-            let status = self.read_word(PmbusCommand::StatusWord).await?;
-            if pmbus::StatusWord::from_bits_truncate(status).contains(pmbus::StatusWord::OFF) {
-                error!(
-                    "WARNING: Power is still OFF after turn-on command! STATUS_WORD = 0x{:04X}",
-                    status
-                );
-                // Read all status registers to understand why
-                if let Ok(vout_status) = self.read_byte(PmbusCommand::StatusVout).await {
-                    error!("  STATUS_VOUT: 0x{:02X}", vout_status);
-                }
-                if let Ok(iout_status) = self.read_byte(PmbusCommand::StatusIout).await {
-                    error!("  STATUS_IOUT: 0x{:02X}", iout_status);
-                }
-            } else {
-                debug!("Power is ON, STATUS_WORD = 0x{:04X}", status);
-            }
+    /// Sets the target voltage without changing the output state.
+    pub async fn set_vout_target(&mut self, voltage: Voltage) -> Result<()> {
+        if voltage < self.config.vout_min || voltage > self.config.vout_max {
+            bail!(Tps546Error::VoltageOutOfRange(
+                voltage.volts(),
+                self.config.vout_min.volts(),
+                self.config.vout_max.volts()
+            ));
         }
+
+        let value = self.encode_voltage(voltage.volts()).await?;
+        self.write_word(PmbusCommand::VoutCommand, value).await?;
+        debug!("VOUT_COMMAND set to {:.2}V", voltage.volts());
         Ok(())
     }
 
-    /// Read input voltage in millivolts
-    pub async fn get_vin(&mut self) -> Result<u32> {
-        let value = self.read_word(PmbusCommand::ReadVin).await?;
-        let volts = self.slinear11_to_float(value);
-        Ok((volts * 1000.0) as u32)
+    /// Reads the target voltage (VOUT_COMMAND), independent of the
+    /// output state.
+    pub async fn get_vout_target(&mut self) -> Result<Voltage> {
+        let value = self.read_word(PmbusCommand::VoutCommand).await?;
+        let volts = self.decode_voltage(value).await?;
+        Ok(Voltage::from_volts(volts))
     }
 
-    /// Read output voltage in millivolts
-    pub async fn get_vout(&mut self) -> Result<u32> {
-        let value = self.read_word(PmbusCommand::ReadVout).await?;
-        let volts = self.decode_voltage(value).await?;
-        Ok((volts * 1000.0) as u32)
+    /// Enables the output (OPERATION = ON).
+    ///
+    /// Fails unless the command reads back from the device.
+    pub async fn enable_output(&mut self) -> Result<()> {
+        self.write_operation(pmbus::Operation::On).await?;
+        debug!("Output enabled");
+        Ok(())
+    }
+
+    /// Disables the output immediately (OPERATION = OFF).
+    ///
+    /// Fails unless the command reads back from the device.
+    pub async fn disable_output(&mut self) -> Result<()> {
+        self.write_operation(pmbus::Operation::OffImmediate).await?;
+        debug!("Output disabled");
+        Ok(())
     }
 
     /// Whether the output is commanded on (OPERATION bit 7).
     pub async fn output_enabled(&mut self) -> Result<bool> {
         let op = self.read_byte(PmbusCommand::Operation).await?;
         Ok(op & pmbus::Operation::On.as_u8() != 0)
+    }
+
+    /// Writes OPERATION and confirms the device accepted it.
+    ///
+    /// A PMBus write can be acknowledged on the bus yet ignored by
+    /// the device, so read the register back and fail on mismatch.
+    async fn write_operation(&mut self, op: pmbus::Operation) -> Result<()> {
+        self.write_byte(PmbusCommand::Operation, op.as_u8()).await?;
+        let readback = self.read_byte(PmbusCommand::Operation).await?;
+        if readback != op.as_u8() {
+            bail!(Tps546Error::OperationNotAccepted {
+                commanded: op.as_u8(),
+                readback,
+            });
+        }
+        Ok(())
+    }
+
+    /// Reads the measured input voltage.
+    pub async fn get_vin(&mut self) -> Result<Voltage> {
+        let value = self.read_word(PmbusCommand::ReadVin).await?;
+        let volts = self.slinear11_to_float(value);
+        Ok(Voltage::from_volts(volts))
+    }
+
+    /// Reads the measured output voltage.
+    pub async fn get_vout(&mut self) -> Result<Voltage> {
+        let value = self.read_word(PmbusCommand::ReadVout).await?;
+        let volts = self.decode_voltage(value).await?;
+        Ok(Voltage::from_volts(volts))
     }
 
     /// Read output current in milliamps
@@ -595,9 +619,9 @@ impl<I2C: I2c> Tps546<I2C> {
 
     /// Calculate power in milliwatts
     pub async fn get_power(&mut self) -> Result<u32> {
-        let vout_mv = self.get_vout().await?;
+        let vout = self.get_vout().await?;
         let iout_ma = self.get_iout().await?;
-        let power_mw = (vout_mv as u64 * iout_ma as u64) / 1000;
+        let power_mw = (vout.mv() as u64 * iout_ma as u64) / 1000;
         Ok(power_mw as u32)
     }
 
@@ -765,14 +789,14 @@ impl<I2C: I2c> Tps546<I2C> {
             }
 
             // Also read current telemetry
-            if let Ok(vout_mv) = self.get_vout().await {
-                error!("  Current VOUT: {:.3}V", vout_mv as f32 / 1000.0);
+            if let Ok(vout) = self.get_vout().await {
+                error!("  Current VOUT: {:.3}V", vout.volts());
             }
             if let Ok(iout_ma) = self.get_iout().await {
                 error!("  Current IOUT: {:.2}A", iout_ma as f32 / 1000.0);
             }
-            if let Ok(vin_mv) = self.get_vin().await {
-                error!("  Current VIN: {:.2}V", vin_mv as f32 / 1000.0);
+            if let Ok(vin) = self.get_vin().await {
+                error!("  Current VIN: {:.2}V", vin.volts());
             }
             if let Ok(temp) = self.get_temperature().await {
                 error!("  Current Temperature: {} degC", temp);
@@ -791,7 +815,7 @@ impl<I2C: I2c> Tps546<I2C> {
 
     /// Dump the complete TPS546 configuration for debugging
     pub async fn dump_configuration(&mut self) -> Result<()> {
-        debug!("=== TPS546D24A Configuration Dump ===");
+        debug!("=== TPS546 Configuration Dump ===");
 
         // Voltage Configuration
         debug!("--- Voltage Configuration ---");
@@ -844,7 +868,7 @@ impl<I2C: I2c> Tps546<I2C> {
         let vout_ov_fault_v = self.decode_voltage(vout_ov_fault).await?;
         debug!(
             "VOUT_OV_FAULT_LIMIT: {:.2}V (raw: 0x{:04X})",
-            vout_ov_fault_v * self.config.vout_command,
+            vout_ov_fault_v * self.config.vout_command.volts(),
             vout_ov_fault
         );
 
@@ -852,7 +876,7 @@ impl<I2C: I2c> Tps546<I2C> {
         let vout_ov_warn_v = self.decode_voltage(vout_ov_warn).await?;
         debug!(
             "VOUT_OV_WARN_LIMIT: {:.2}V (raw: 0x{:04X})",
-            vout_ov_warn_v * self.config.vout_command,
+            vout_ov_warn_v * self.config.vout_command.volts(),
             vout_ov_warn
         );
 
@@ -860,7 +884,7 @@ impl<I2C: I2c> Tps546<I2C> {
         let vout_margin_high_v = self.decode_voltage(vout_margin_high).await?;
         debug!(
             "VOUT_MARGIN_HIGH: {:.2}V (raw: 0x{:04X})",
-            vout_margin_high_v * self.config.vout_command,
+            vout_margin_high_v * self.config.vout_command.volts(),
             vout_margin_high
         );
 
@@ -875,7 +899,7 @@ impl<I2C: I2c> Tps546<I2C> {
         let vout_margin_low_v = self.decode_voltage(vout_margin_low).await?;
         debug!(
             "VOUT_MARGIN_LOW: {:.2}V (raw: 0x{:04X})",
-            vout_margin_low_v * self.config.vout_command,
+            vout_margin_low_v * self.config.vout_command.volts(),
             vout_margin_low
         );
 
@@ -883,7 +907,7 @@ impl<I2C: I2c> Tps546<I2C> {
         let vout_uv_warn_v = self.decode_voltage(vout_uv_warn).await?;
         debug!(
             "VOUT_UV_WARN_LIMIT: {:.2}V (raw: 0x{:04X})",
-            vout_uv_warn_v * self.config.vout_command,
+            vout_uv_warn_v * self.config.vout_command.volts(),
             vout_uv_warn
         );
 
@@ -891,7 +915,7 @@ impl<I2C: I2c> Tps546<I2C> {
         let vout_uv_fault_v = self.decode_voltage(vout_uv_fault).await?;
         debug!(
             "VOUT_UV_FAULT_LIMIT: {:.2}V (raw: 0x{:04X})",
-            vout_uv_fault_v * self.config.vout_command,
+            vout_uv_fault_v * self.config.vout_command.volts(),
             vout_uv_fault
         );
 
@@ -1271,3 +1295,171 @@ impl<I2C: I2c> Tps546<I2C> {
     }
 }
 
+/// Consumer handle on a shared TPS546.
+pub struct Tps546Regulator<I2C: I2c> {
+    tps546: Arc<Mutex<Tps546<I2C>>>,
+}
+
+impl<I2C: I2c> Tps546Regulator<I2C> {
+    pub fn new(tps546: Arc<Mutex<Tps546<I2C>>>) -> Self {
+        Self { tps546 }
+    }
+}
+
+#[async_trait]
+impl<I2C: I2c + Send> VoltageRegulator for Tps546Regulator<I2C> {
+    async fn enable(&mut self) -> Result<()> {
+        self.tps546.lock().await.enable_output().await
+    }
+
+    async fn disable(&mut self) -> Result<()> {
+        self.tps546.lock().await.disable_output().await
+    }
+
+    async fn is_enabled(&mut self) -> Result<bool> {
+        self.tps546.lock().await.output_enabled().await
+    }
+
+    async fn set_voltage(&mut self, voltage: Voltage) -> Result<()> {
+        self.tps546.lock().await.set_vout_target(voltage).await
+    }
+
+    async fn get_voltage(&mut self) -> Result<Voltage> {
+        self.tps546.lock().await.get_vout_target().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hw_trait::{HwError, Result as HwResult};
+    use std::collections::HashMap;
+
+    /// Mock I2C bus backed by a table of PMBus registers.
+    ///
+    /// Reads of registers not in the table fail, and every register
+    /// read is recorded.
+    struct RegisterTable {
+        registers: HashMap<u8, Vec<u8>>,
+        reads: Vec<u8>,
+    }
+
+    impl RegisterTable {
+        fn new(registers: &[(PmbusCommand, &[u8])]) -> Self {
+            Self {
+                registers: registers
+                    .iter()
+                    .map(|(cmd, bytes)| (cmd.as_u8(), bytes.to_vec()))
+                    .collect(),
+                reads: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl I2c for RegisterTable {
+        async fn write(&mut self, _addr: u8, _data: &[u8]) -> HwResult<()> {
+            Ok(())
+        }
+
+        async fn read(&mut self, _addr: u8, _buffer: &mut [u8]) -> HwResult<()> {
+            Err(HwError::NotSupported("plain read".into()))
+        }
+
+        async fn write_read(&mut self, _addr: u8, write: &[u8], read: &mut [u8]) -> HwResult<()> {
+            let command = write[0];
+            self.reads.push(command);
+            let bytes = self
+                .registers
+                .get(&command)
+                .ok_or_else(|| HwError::Other(format!("no register 0x{command:02x}")))?;
+            read.copy_from_slice(&bytes[..read.len()]);
+            Ok(())
+        }
+
+        async fn set_frequency(&mut self, _hz: u32) -> HwResult<()> {
+            Ok(())
+        }
+    }
+
+    fn config() -> Tps546Config {
+        Tps546Config {
+            phase: 0x00,
+            frequency_switch_khz: 650,
+            vin_on: Voltage::from_volts(4.8),
+            vin_off: Voltage::from_volts(4.5),
+            vin_uv_warn_limit: Voltage::from_volts(0.0),
+            vin_ov_fault_limit: Voltage::from_volts(6.5),
+            vin_ov_fault_response: 0xB7,
+            vout_scale_loop: 0.25,
+            vout_min: Voltage::from_volts(1.0),
+            vout_max: Voltage::from_volts(2.0),
+            vout_command: Voltage::from_volts(1.15),
+            vout_ov_fault_limit: Ratio::from_factor(1.25),
+            vout_ov_warn_limit: Ratio::from_factor(1.16),
+            vout_margin_high: Ratio::from_factor(1.10),
+            vout_margin_low: Ratio::from_factor(0.90),
+            vout_uv_warn_limit: Ratio::from_factor(0.90),
+            vout_uv_fault_limit: Ratio::from_factor(0.75),
+            iout_oc_warn_limit: 25.0,
+            iout_oc_fault_limit: 30.0,
+            iout_oc_fault_response: 0xC0,
+            ot_warn_limit: 105,
+            ot_fault_limit: 145,
+            ot_fault_response: 0xB7,
+            ton_delay: 0,
+            ton_rise: 3,
+            ton_max_fault_limit: 0,
+            ton_max_fault_response: 0x3B,
+            toff_delay: 0,
+            toff_fall: 0,
+            pin_detect_override: 0xFFFF,
+        }
+    }
+
+    /// STATUS_WORD with only PGOOD and OFF set, as the chip reports
+    /// it while the output is commanded off and no fault is latched.
+    const OFF_STATUS: [u8; 2] = [0x40, 0x08];
+
+    #[tokio::test]
+    async fn output_off_as_commanded_is_not_a_fault() {
+        let table = RegisterTable::new(&[
+            (PmbusCommand::StatusWord, &OFF_STATUS),
+            (
+                PmbusCommand::Operation,
+                &[pmbus::Operation::OffImmediate.as_u8()],
+            ),
+        ]);
+        let mut tps = Tps546::new(table, config());
+
+        tps.check_status()
+            .await
+            .expect("commanded-off output is not a fault");
+
+        // Reading only STATUS_WORD and OPERATION proves check_status
+        // never reached the per-register diagnostic reads.
+        assert_eq!(
+            tps.i2c.reads,
+            vec![
+                PmbusCommand::StatusWord.as_u8(),
+                PmbusCommand::Operation.as_u8()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn output_off_while_commanded_on_is_a_fault() {
+        let table = RegisterTable::new(&[
+            (PmbusCommand::StatusWord, &OFF_STATUS),
+            (PmbusCommand::Operation, &[pmbus::Operation::On.as_u8()]),
+        ]);
+        let mut tps = Tps546::new(table, config());
+
+        let err = tps
+            .check_status()
+            .await
+            .expect_err("commanded-on output that is off");
+
+        assert!(err.to_string().contains("Power controller is OFF"), "{err}");
+    }
+}

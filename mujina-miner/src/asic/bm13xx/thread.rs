@@ -8,115 +8,46 @@
 //! chip responses, filters shares, and manages work assignment.
 
 use std::cmp::max;
+use std::ops::{ControlFlow, RangeInclusive};
 use std::sync::{Arc, RwLock};
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use bitcoin::block::Header as BlockHeader;
-use futures::{SinkExt, sink::Sink, stream::Stream};
+use futures::{SinkExt, stream::Stream};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio_stream::StreamExt;
+use tokio::time::{self, Duration, MissedTickBehavior};
 
+use super::chain::Chain;
+use super::chip_config::ChipConfig;
+use super::command::{
+    ChainInactive, ChipCommandSink, Destination, JobCommand, JobFullFormat, RegisterCommand,
+    SetChipAddress, SinkError, WriteRegister,
+};
+use super::peripherals::BoardPeripherals;
+use super::reader::{Reader, ReaderChannels};
+use super::register::{
+    AdcCtrl1, CoreCommand, CoreRegister, IoDriverStrength, Log2Difficulty, MidstateConfig,
+    PllDivider, Register, RegisterAddress, TicketMask,
+};
+use super::register_client::RegisterClient;
+use super::response::{NonceResponse, RegisterResponse, Response};
 use super::chip_profile;
-use super::protocol::{self, Log2Difficulty, TicketMask};
+use super::topology::TopologySpec;
 use crate::{
     asic::hash_thread::{
-        BoardPeripherals, HashTask, HashThread, HashThreadCapabilities, HashThreadEvent,
-        HashThreadStatus, Share, ThreadRemovalSignal,
+        HashTask, HashThread, HashThreadCapabilities, HashThreadEvent, HashThreadStatus, Share,
     },
     tracing::prelude::*,
-    types::{Difficulty, HashRate, ShareRate},
+    types::{Difficulty, Frequency, ShareRate},
 };
 
-/// Target hash clock the chip is ramped to during initialization, in MHz.
-/// Boards report this as their operating frequency in telemetry.
-///
-/// This module is shared across the BM13xx family (BM1362, BM1366,
-/// BM1370), but these three constants are only used by the BM1370-based
-/// Bitaxe boards today, so they alias the BM1370 entry in
-/// [`chip_profile`] -- the single source of truth for chip envelopes.
-/// A board carrying a different chip should look up its own model via
-/// `chip_profile::profile_for` instead of these constants.
-pub const TARGET_FREQUENCY_MHZ: f32 = chip_profile::BM1370.default_freq_mhz;
-
 /// Lowest hash clock accepted from a runtime tuning request, in MHz.
-/// Below this the chip does not usefully hash.
 pub const MIN_FREQUENCY_MHZ: f32 = chip_profile::BM1370.min_freq_mhz;
 /// Highest hash clock accepted from a runtime tuning request, in MHz.
-/// A conservative BM1370 ceiling; exceptional chips go higher but that is
-/// not safe as an unattended default.
 pub const MAX_FREQUENCY_MHZ: f32 = chip_profile::BM1370.max_freq_mhz;
-
-/// Tracks tasks sent to chip hardware, indexed by chip_job_id.
-///
-/// BM13xx chips use 4-bit job IDs. This tracker maintains snapshots of
-/// HashTasks sent to the chip so we can match nonce responses back to the
-/// correct task context (EN2, ntime, etc.).
-struct ChipJobTracker {
-    tasks: [Option<HashTask>; 16],
-    next_id: u8,
-}
-
-impl ChipJobTracker {
-    fn new() -> Self {
-        Self {
-            tasks: Default::default(),
-            next_id: 0,
-        }
-    }
-
-    fn insert(&mut self, task: HashTask) -> u8 {
-        let chip_job_id = self.next_id;
-        self.tasks[chip_job_id as usize] = Some(task);
-        self.next_id = (self.next_id + 1) % (self.tasks.len() as u8);
-        chip_job_id
-    }
-
-    fn get(&self, chip_job_id: u8) -> Option<&HashTask> {
-        self.tasks
-            .get(chip_job_id as usize)
-            .and_then(|t| t.as_ref())
-    }
-
-    fn clear(&mut self) {
-        self.tasks = Default::default();
-    }
-}
-
-/// Command messages sent from scheduler to thread
-#[derive(Debug)]
-enum ThreadCommand {
-    /// Declare expected hashrate and ready the thread for work
-    Configure,
-
-    /// Update task (old shares still valid)
-    UpdateTask {
-        new_task: HashTask,
-        response_tx: oneshot::Sender<Result<Option<HashTask>>>,
-    },
-
-    /// Replace task (old shares invalid)
-    ReplaceTask {
-        new_task: HashTask,
-        response_tx: oneshot::Sender<Result<Option<HashTask>>>,
-    },
-
-    /// Go idle (stop hashing, low power)
-    GoIdle {
-        response_tx: oneshot::Sender<Result<Option<HashTask>>>,
-    },
-
-    /// Set the hash clock, in MHz. Ramps from the current frequency and
-    /// updates the target used on (re)initialization.
-    SetFrequency {
-        mhz: f32,
-        response_tx: oneshot::Sender<Result<()>>,
-    },
-
-    /// Shutdown the thread
-    #[expect(unused)]
-    Shutdown,
-}
+/// Default target frequency in MHz.
+pub const TARGET_FREQUENCY_MHZ: f32 = chip_profile::BM1370.default_freq_mhz;
 
 /// Cloneable handle for adjusting a running thread's hash clock.
 ///
@@ -145,7 +76,7 @@ impl FrequencyControl {
 ///
 /// Represents a chain of BM13xx chips as a schedulable worker. The thread
 /// manages serial communication with chips, filters shares, and reports events.
-/// Chip initialization happens lazily when first work is assigned.
+/// Chain initialization happens lazily when first work is assigned.
 pub struct BM13xxThread {
     /// Human-readable name for logging
     name: String,
@@ -166,55 +97,53 @@ pub struct BM13xxThread {
 impl BM13xxThread {
     /// Create a new BM13xx thread with Stream/Sink for chip communication
     ///
-    /// Thread starts with chip disabled. Chip will be initialized when first
-    /// work is assigned.
+    /// Thread starts with the chips held in reset. The chain will be
+    /// initialized when first work is assigned.
     ///
     /// # Arguments
     /// * `name` - Human-readable name for logging (e.g., "Bitaxe Gamma (e2f56f9b)")
+    /// * `config` - Chip model configuration (identity, PLL parameters)
+    /// * `topology` - The board's declared chip wiring
     /// * `chip_responses` - Stream of decoded responses from chips
     /// * `chip_commands` - Sink for sending encoded commands to chips
-    /// * `peripherals` - Hardware interfaces from board (enable, regulator, etc.)
-    /// * `removal_rx` - Watch channel for board-triggered removal
-    /// * `chip_count` - Chips discovered on the chain; determines the
-    ///   addresses assigned during bring-up
+    /// * `peripherals` - Hardware interfaces from board (reset line, regulator, etc.)
+    /// * `shutdown_rx` - Shutdown signal from the board; a send or a
+    ///   dropped sender requests shutdown
     pub fn new<R, W>(
         name: String,
+        config: ChipConfig,
+        topology: TopologySpec,
         chip_responses: R,
         chip_commands: W,
         peripherals: BoardPeripherals,
-        removal_rx: watch::Receiver<ThreadRemovalSignal>,
-        chip_count: usize,
+        shutdown_rx: watch::Receiver<()>,
     ) -> Self
     where
-        R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin + Send + 'static,
-        W: Sink<protocol::Command> + Unpin + Send + 'static,
-        W::Error: std::fmt::Debug,
+        R: Stream<Item = Result<Response, std::io::Error>> + Unpin + Send + 'static,
+        W: ChipCommandSink + Unpin + Send + 'static,
+        SinkError<W>: std::error::Error + Send + Sync + 'static,
     {
-        let (cmd_tx, cmd_rx) = mpsc::channel(10);
-        let (evt_tx, evt_rx) = mpsc::channel(100);
+        let (command_tx, command_rx) = mpsc::channel(10);
+        let (event_tx, event_rx) = mpsc::channel(100);
 
         let status = Arc::new(RwLock::new(HashThreadStatus::default()));
-        let status_clone = Arc::clone(&status);
 
-        // Spawn the actor task
-        tokio::spawn(async move {
-            bm13xx_thread_actor(
-                cmd_rx,
-                evt_tx,
-                removal_rx,
-                status_clone,
-                chip_responses,
-                chip_commands,
-                peripherals,
-                chip_count,
-            )
-            .await;
-        });
+        let (reader, channels) = Reader::spawn(chip_responses);
+        let actor = Actor::new(
+            config,
+            topology,
+            event_tx,
+            Arc::clone(&status),
+            chip_commands,
+            peripherals,
+            reader,
+        );
+        tokio::spawn(actor.run(command_rx, shutdown_rx, channels));
 
         Self {
             name,
-            command_tx: cmd_tx,
-            event_rx: Some(evt_rx),
+            command_tx,
+            event_rx: Some(event_rx),
             capabilities: HashThreadCapabilities::default(),
             status,
         }
@@ -299,436 +228,874 @@ impl HashThread for BM13xxThread {
     }
 }
 
-/// Chip addresses for a chain of `chip_count` chips.
-///
-/// Addresses are spread evenly over the 8-bit address space rather than
-/// packed from zero: the interval is `256 / chip_count` rounded up to a
-/// power of two, so a 4-chip chain is addressed 0x00, 0x40, 0x80, 0xC0.
-/// This matches the reference BM1370 firmware, and the chips derive their
-/// share of the nonce space from the address spacing — there is no
-/// separate per-chip nonce-range write.
-///
-/// A single-chip chain yields just `[0x00]`, identical to the address the
-/// pre-chain code hardcoded.
-///
-/// The address space is 8-bit, so 256 chips is the hard ceiling. Longer
-/// chains are truncated rather than wrapped: handing back duplicate
-/// addresses would configure two chips as one and be far harder to
-/// diagnose than a short address list.
-fn chain_addresses(chip_count: usize) -> Vec<u8> {
-    const MAX_CHIPS: usize = 256;
+/// Command messages sent from scheduler to thread
+#[derive(Debug)]
+enum ThreadCommand {
+    /// Declare expected hashrate and ready the thread for work
+    Configure,
 
-    let chips = chip_count.clamp(1, MAX_CHIPS);
-    let slots = chips.next_power_of_two();
-    let interval = MAX_CHIPS / slots;
-    (0..chips).map(|i| (i * interval) as u8).collect()
+    /// Update task (old shares still valid)
+    UpdateTask {
+        new_task: HashTask,
+        response_tx: oneshot::Sender<Result<Option<HashTask>>>,
+    },
+
+    /// Replace task (old shares invalid)
+    ReplaceTask {
+        new_task: HashTask,
+        response_tx: oneshot::Sender<Result<Option<HashTask>>>,
+    },
+
+    /// Go idle (stop hashing, low power)
+    GoIdle {
+        response_tx: oneshot::Sender<Result<Option<HashTask>>>,
+    },
+
+    /// Retune hash frequency at runtime
+    SetFrequency {
+        mhz: f32,
+        response_tx: oneshot::Sender<Result<()>>,
+    },
 }
 
-/// Which chip on the chain produced a nonce.
+/// Internal actor for BM13xxThread.
 ///
-/// BM13xx chips stamp their own address into the nonce they return, in
-/// the byte at bits 24:17 of the big-endian value. Dividing by the same
-/// interval [`chain_addresses`] hands out gives the chip's index.
-///
-/// Returns `None` for a single-chip chain, where the field carries no
-/// address and the answer would always be a meaningless zero.
-fn chip_index_from_nonce(nonce: u32, chip_count: usize) -> Option<u8> {
-    if chip_count <= 1 {
-        return None;
-    }
-    let slots = chip_count.min(256).next_power_of_two();
-    let interval = (256 / slots) as u8;
-    let address = (nonce.swap_bytes() >> 17) as u8;
-    let index = address / interval;
-    // A chip beyond the chain length means the field was not an address:
-    // report nothing rather than inventing a chip that is not there.
-    (usize::from(index) < chip_count).then_some(index)
-}
+/// The channels the select loop awaits are `run` parameters rather
+/// than fields, so the loop can borrow them independently of the
+/// actor state.
+struct Actor<W> {
+    /// Chip model configuration (identity, PLL parameters).
+    config: ChipConfig,
 
-/// Initialize a BM13xx chain for mining.
-///
-/// Enables the chips, assigns chip addresses, configures all registers,
-/// and ramps frequency to target.
-///
-/// Register writes are either broadcast to the whole chain or addressed to
-/// one chip at a time; the per-chip block is repeated for every address.
-/// With one chip this emits exactly the same command stream as the
-/// single-chip code it replaced.
-async fn initialize_chain<W>(
-    chip_commands: &mut W,
-    peripherals: &mut BoardPeripherals,
+    /// Live model of the chip chain, built from the board's declared
+    /// topology.
+    chain: Chain,
+
+    /// Event channel to the scheduler.
+    event_tx: mpsc::Sender<HashThreadEvent>,
+
+    /// Shared status, read by the handle.
+    status: Arc<RwLock<HashThreadStatus>>,
+
+    /// Sink for sending encoded commands to chips.
+    chip_commands: W,
+
+    /// Hardware interfaces from the board (reset line, regulator, etc.).
+    peripherals: BoardPeripherals,
+
+    /// Owner of the response demux task. Held only so the task is
+    /// aborted, releasing the serial stream, when the actor exits.
+    _reader: Reader,
+
+    /// ASIC ticket mask difficulty.
     asic_difficulty: Log2Difficulty,
-    target_mhz: f32,
-    chip_count: usize,
-) -> Result<()>
+
+    /// Whether lazy chain initialization has run.
+    chain_initialized: bool,
+
+    /// The task currently being hashed.
+    current_task: Option<HashTask>,
+
+    /// Tasks sent to the chip, by chip job id.
+    chip_jobs: ChipJobTracker,
+
+    /// Currently tracked frequency.
+    current_freq: Frequency,
+}
+
+impl<W> Actor<W>
 where
-    W: Sink<protocol::Command> + Unpin,
-    W::Error: std::fmt::Debug,
+    W: ChipCommandSink + Unpin,
+    SinkError<W>: std::error::Error + Send + Sync + 'static,
 {
-    use protocol::{Command, Register};
+    fn new(
+        config: ChipConfig,
+        topology: TopologySpec,
+        event_tx: mpsc::Sender<HashThreadEvent>,
+        status: Arc<RwLock<HashThreadStatus>>,
+        chip_commands: W,
+        peripherals: BoardPeripherals,
+        reader: Reader,
+    ) -> Self {
+        // ASIC ticket mask difficulty: ~1 nonce/sec at nameplate rate
+        let asic_difficulty = Log2Difficulty::from_difficulty(
+            ShareRate::per_second(1.0).to_difficulty(config.nameplate),
+        );
+        let default_freq = config.default_freq;
 
-    let addresses = chain_addresses(chip_count);
-    debug!(
-        chips = addresses.len(),
-        addresses = ?addresses.iter().map(|a| format!("0x{a:02x}")).collect::<Vec<_>>(),
-        "Initializing chain"
-    );
+        Self {
+            config,
+            chain: Chain::from_topology(&topology),
+            event_tx,
+            status,
+            chip_commands,
+            peripherals,
+            _reader: reader,
+            asic_difficulty,
+            chain_initialized: false,
+            current_task: None,
+            chip_jobs: ChipJobTracker::new(),
+            current_freq: default_freq,
+        }
+    }
 
-    // Enable the ASIC
-    if let Some(ref mut asic_enable) = peripherals.asic_enable {
-        debug!("Enabling ASIC");
-        asic_enable
+    /// Runs the actor loop until shutdown or channel closure.
+    ///
+    /// Handles commands from the scheduler (update/replace work, go
+    /// idle), the shutdown signal from the board (USB unplug,
+    /// fault, etc.), and the demuxed chip responses from the reader.
+    /// Reset is asserted on startup to establish known state; the
+    /// chain is initialized lazily when the scheduler assigns first
+    /// work.
+    async fn run(
+        mut self,
+        mut command_rx: mpsc::Receiver<ThreadCommand>,
+        mut shutdown_rx: watch::Receiver<()>,
+        channels: ReaderChannels,
+    ) {
+        let ReaderChannels {
+            mut nonces,
+            mut register_responses,
+        } = channels;
+
+        // Assert reset on startup to establish known state
+        if let Err(e) = self.peripherals.reset_line.assert().await {
+            warn!(error = %e, "Failed to assert chip reset on startup");
+        }
+
+        let mut ntime_ticker = time::interval(Duration::from_secs(1));
+        ntime_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                // Shutdown signal (highest priority); an error means
+                // the board dropped the sender, which requests
+                // shutdown too
+                _ = shutdown_rx.changed() => {
+                    self.set_active(false);
+
+                    // Exit actor loop (channel closure signals exit to the scheduler)
+                    break;
+                }
+
+                // Commands from scheduler
+                cmd = command_rx.recv() => {
+                    let Some(cmd) = cmd else {
+                        debug!("Thread handle dropped");
+                        break;
+                    };
+                    match cmd {
+                        ThreadCommand::Configure => self.configure().await,
+
+                        ThreadCommand::UpdateTask { new_task, response_tx } => {
+                            let flow = self
+                                .assign_task(new_task, response_tx, false, &mut shutdown_rx, &mut register_responses)
+                                .await;
+                            if flow.is_break() {
+                                break;
+                            }
+                        }
+
+                        ThreadCommand::ReplaceTask { new_task, response_tx } => {
+                            let flow = self
+                                .assign_task(new_task, response_tx, true, &mut shutdown_rx, &mut register_responses)
+                                .await;
+                            if flow.is_break() {
+                                break;
+                            }
+                        }
+
+                        ThreadCommand::GoIdle { response_tx } => {
+                            debug!("Going idle");
+
+                            let old_task = self.current_task.take();
+                            self.set_active(false);
+                            response_tx.send(Ok(old_task)).ok();
+                        }
+
+                        ThreadCommand::SetFrequency { mhz, response_tx } => {
+                            let min_freq = *self.config.freq_range.start();
+                            let max_freq = *self.config.freq_range.end();
+                            let target = Frequency::from_mhz(mhz).clamp(min_freq, max_freq);
+                            self.config.default_freq = target;
+                            if self.chain_initialized {
+                                let from = self.current_freq;
+                                match self.ramp_frequency(target).await {
+                                    Ok(()) => {
+                                        info!(
+                                            from_mhz = from.mhz(),
+                                            to_mhz = self.current_freq.mhz(),
+                                            "Retuned hash clock"
+                                        );
+                                        let _ = response_tx.send(Ok(()));
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            error = %e,
+                                            stopped_at_mhz = self.current_freq.mhz(),
+                                            "Live frequency retune failed"
+                                        );
+                                        let _ = response_tx.send(Err(e));
+                                    }
+                                }
+                            } else {
+                                let _ = response_tx.send(Ok(()));
+                            }
+                        }
+                    }
+                }
+
+                // Nonce reports from the chips
+                nonce = nonces.recv() => {
+                    let Some(nonce) = nonce else {
+                        warn!("Chip response stream ended");
+                        break;
+                    };
+                    self.handle_nonce(nonce).await;
+                }
+
+                // Replies to register conversations; nothing asks
+                // yet, so log and discard
+                response = register_responses.recv() => {
+                    let Some(response) = response else {
+                        warn!("Chip response stream ended");
+                        break;
+                    };
+                    trace!(
+                        chip_address = %format!("0x{:02x}", response.chip_address),
+                        register = ?response.register,
+                        "Register read response"
+                    );
+                }
+
+                // ntime rolling timer (roll forward every second)
+                _ = ntime_ticker.tick(), if self.current_task.is_some() => {
+                    self.roll_ntime().await;
+                }
+            }
+        }
+
+        self.disable_chain().await;
+        debug!("BM13xx thread actor exiting");
+    }
+
+    /// Asserts the chips' reset, then disables the core rail.
+    /// Idempotent, and safe before bring-up. On an unplugged
+    /// board both writes fail; the warnings are all that can be
+    /// done.
+    async fn disable_chain(&mut self) {
+        if let Err(e) = self.peripherals.reset_line.assert().await {
+            warn!(error = %e, "Failed to assert chip reset on exit");
+        }
+        if let Err(e) = self.peripherals.voltage_regulator.disable().await {
+            warn!(error = %e, "Failed to disable core voltage on exit");
+        }
+    }
+
+    /// Declares the thread's expected hashrate to the scheduler.
+    async fn configure(&mut self) {
+        // Nameplate rate for one chip; a rough stand-in for a real
+        // frequency-derived estimate.
+        let expected = self.config.nameplate;
+        if self
+            .event_tx
+            .send(HashThreadEvent::ExpectedHashRate(expected))
+            .await
+            .is_err()
+        {
+            debug!("Event channel closed during configure");
+        }
+    }
+
+    /// Takes a new task and sends its first job to the chip,
+    /// initializing the chain on the first assignment. `replace`
+    /// forgets prior jobs, invalidating their shares. Returns
+    /// `Break` when the actor must exit because the board's
+    /// shutdown signal cut bring-up short.
+    async fn assign_task(
+        &mut self,
+        new_task: HashTask,
+        response_tx: oneshot::Sender<Result<Option<HashTask>>>,
+        replace: bool,
+        shutdown_rx: &mut watch::Receiver<()>,
+        register_responses: &mut mpsc::Receiver<RegisterResponse>,
+    ) -> ControlFlow<()> {
+        let verb = if replace { "Replacing" } else { "Updating" };
+        if let Some(ref old) = self.current_task {
+            debug!(
+                old_job = %old.template.id,
+                new_job = %new_task.template.id,
+                "{verb} work"
+            );
+        } else {
+            debug!(new_job = %new_task.template.id, "{verb} work from idle");
+        }
+
+        // The select watches for shutdown while bring-up runs, so
+        // every await point in bring-up is an abort point.
+        // Dropping the half-done future is safe because the actor
+        // disables the chain on exit whatever the bring-up
+        // progress.
+        tokio::select! {
+            result = self.ensure_chain_initialized(register_responses) => {
+                if let Err(e) = result {
+                    error!(error = %e, "Chain initialization failed");
+                    response_tx.send(Err(e)).ok();
+                    return ControlFlow::Continue(());
+                }
+            }
+
+            _ = shutdown_rx.changed() => {
+                debug!("Shutdown requested during bring-up");
+                response_tx.send(Err(anyhow!("shut down during bring-up"))).ok();
+                return ControlFlow::Break(());
+            }
+        }
+
+        if replace {
+            // Clear old jobs (old shares invalid)
+            self.chip_jobs.clear();
+        }
+
+        // Send the task's first job; the ntime roller sends the rest
+        let chip_job_id = self.chip_jobs.insert(new_task.clone());
+        let old_task = self.current_task.replace(new_task.clone());
+        match task_to_job_full(&new_task, chip_job_id) {
+            Ok(job_data) => {
+                if let Err(e) = self.chip_commands.send(JobCommand::JobFull(job_data)).await {
+                    error!(error = ?e, "Failed to send first JobFull to chip");
+                    let err = anyhow!("failed to send job to chip: {e:?}");
+                    response_tx.send(Err(err)).ok();
+                    return ControlFlow::Continue(());
+                } else if replace {
+                    debug!("Sent first job to chip (old work invalidated)");
+                } else {
+                    debug!("Sent first job to chip");
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to convert task to JobFull");
+                response_tx.send(Err(e)).ok();
+                return ControlFlow::Continue(());
+            }
+        }
+
+        self.set_active(true);
+        response_tx.send(Ok(old_task)).ok();
+        ControlFlow::Continue(())
+    }
+
+    /// Initializes the chain on the first call; later calls are
+    /// no-ops.
+    async fn ensure_chain_initialized(
+        &mut self,
+        register_responses: &mut mpsc::Receiver<RegisterResponse>,
+    ) -> Result<()> {
+        if self.chain_initialized {
+            return Ok(());
+        }
+
+        trace!("Initializing chain on first assignment.");
+        self.initialize_chain(register_responses).await?;
+        self.chain_initialized = true;
+        Ok(())
+    }
+
+    /// Initializes the chip chain for mining.
+    ///
+    /// Powers the core rail, releases the chips from reset,
+    /// enumerates them against the declared topology, assigns
+    /// addresses, configures all registers, and ramps the frequency
+    /// to target.
+    async fn initialize_chain(
+        &mut self,
+        register_responses: &mut mpsc::Receiver<RegisterResponse>,
+    ) -> Result<()> {
+        // Power the core rail before releasing reset
+        debug!("Enabling core voltage");
+        self.peripherals
+            .voltage_regulator
             .enable()
             .await
-            .context("failed to enable ASIC")?;
-    }
+            .context("failed to enable core voltage")?;
+        time::sleep(Duration::from_millis(500)).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    // Broadcast a register write to the whole chain, converting the sink
-    // error to anyhow. `chip_address` is ignored by the chips when the
-    // broadcast flag is set, so it stays 0x00.
-    async fn send_reg<W>(chip_commands: &mut W, broadcast: bool, register: Register) -> Result<()>
-    where
-        W: Sink<protocol::Command> + Unpin,
-        W::Error: std::fmt::Debug,
-    {
-        send_reg_to(chip_commands, broadcast, 0x00, register).await
-    }
-
-    // Write a register on one specific chip.
-    async fn send_reg_to<W>(
-        chip_commands: &mut W,
-        broadcast: bool,
-        chip_address: u8,
-        register: Register,
-    ) -> Result<()>
-    where
-        W: Sink<protocol::Command> + Unpin,
-        W::Error: std::fmt::Debug,
-    {
-        chip_commands
-            .send(Command::WriteRegister {
-                broadcast,
-                chip_address,
-                register,
-            })
+        // Release the chips from reset
+        debug!("Releasing chip reset");
+        self.peripherals
+            .reset_line
+            .release()
             .await
-            .map_err(|e| anyhow!("{e:?}"))
-    }
+            .context("failed to release chip reset")?;
 
-    // Send version mask configuration (3 times)
-    debug!("Configuring version mask");
-    for _ in 1..=3 {
-        send_reg(
-            chip_commands,
-            true,
-            Register::VersionMask(protocol::VersionMask::full_rolling()),
-        )
-        .await
-        .context("failed to send version mask")?;
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+        time::sleep(Duration::from_millis(200)).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-    // Pre-configuration registers
-    debug!("Sending pre-configuration registers");
-
-    send_reg(
-        chip_commands,
-        true,
-        Register::InitControl {
-            raw_value: 0x00000700,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::MiscControl {
-            raw_value: 0x00C100F0,
-        },
-    )
-    .await?;
-
-    chip_commands
-        .send(Command::ChainInactive)
-        .await
-        .map_err(|e| anyhow!("{e:?}"))
-        .context("failed to send ChainInactive")?;
-
-    // Walk the chain assigning addresses. Each SetChipAddress is consumed
-    // by the first chip that has not yet been addressed, so the order here
-    // determines which physical chip gets which address.
-    for &chip_address in &addresses {
-        chip_commands
-            .send(Command::SetChipAddress { chip_address })
-            .await
-            .map_err(|e| anyhow!("{e:?}"))
-            .with_context(|| format!("failed to send SetChipAddress 0x{chip_address:02x}"))?;
-    }
-
-    // Core configuration (broadcast)
-    debug!("Sending broadcast core configuration");
-
-    send_reg(
-        chip_commands,
-        true,
-        Register::Core {
-            raw_value: 0x8000_8B00,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::Core {
-            raw_value: 0x8000_800C,
-        },
-    )
-    .await?;
-
-    // Ticket mask
-    let ticket_mask = TicketMask::new(asic_difficulty);
-
-    send_reg(chip_commands, true, Register::TicketMask(ticket_mask)).await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::IoDriverStrength(protocol::IoDriverStrength::normal()),
-    )
-    .await?;
-
-    // PLL3 configuration.
-    //
-    // PLL3 clocks the chip-to-chip UART relay, so on a chain every chip
-    // past the first depends on it to get its nonces back to the host.
-    // A single chip talks to the host directly and does not care, which is
-    // why this was missing without the Bitaxe ever noticing.
-    //
-    // The reference firmware puts the bytes 5A A5 5A A5 on the wire. This
-    // register serializes little-endian (unlike `Core`, which does not),
-    // so the raw value is the byte-reversed 0xA55AA55A -- writing the
-    // literal 0x5AA55AA5 here would send A5 5A A5 5A instead. The
-    // register's field layout is not documented, so the bytes have to
-    // match exactly rather than be derived.
-    send_reg(
-        chip_commands,
-        true,
-        Register::Pll3Parameter {
-            raw_value: 0xA55A_A55A,
-        },
-    )
-    .await?;
-
-    // Chip-specific configuration
-    debug!("Sending chip-specific configuration");
-
-    for &addr in &addresses {
-        send_reg_to(
-            chip_commands,
-            false,
-            addr,
-            Register::InitControl {
-                raw_value: 0xF0010700,
-            },
-        )
-        .await?;
-        send_reg_to(
-            chip_commands,
-            false,
-            addr,
-            Register::MiscControl {
-                raw_value: 0x00C100F0,
-            },
-        )
-        .await?;
-        send_reg_to(
-            chip_commands,
-            false,
-            addr,
-            Register::Core {
-                raw_value: 0x8000_8B00,
-            },
-        )
-        .await?;
-        send_reg_to(
-            chip_commands,
-            false,
-            addr,
-            Register::Core {
-                raw_value: 0x8000_800C,
-            },
-        )
-        .await?;
-        send_reg_to(
-            chip_commands,
-            false,
-            addr,
-            Register::Core {
-                raw_value: 0x8000_82AA,
-            },
-        )
-        .await?;
-    }
-
-    // Additional settings
-    send_reg(
-        chip_commands,
-        true,
-        Register::MiscSettings {
-            raw_value: 0x80440000,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::AnalogMux {
-            raw_value: 0x02000000,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::MiscSettings {
-            raw_value: 0x80440000,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::Core {
-            raw_value: 0x8000_8DEE,
-        },
-    )
-    .await?;
-
-    // Frequency ramping (56.25 MHz -> target)
-    debug!("Ramping frequency from 56.25 MHz to {target_mhz} MHz");
-    let frequency_steps = generate_frequency_ramp_steps(56.25, target_mhz, 6.25);
-
-    for (i, pll_config) in frequency_steps.iter().enumerate() {
-        send_reg(chip_commands, true, Register::PllDivider(*pll_config))
-            .await
-            .context("PLL ramp failed")?;
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        if i % 10 == 0 || i == frequency_steps.len() - 1 {
-            trace!("Frequency ramp step {}/{}", i + 1, frequency_steps.len());
-        }
-    }
-
-    debug!("Frequency ramping complete");
-
-    // Final configuration.
-    //
-    // Register 0x10 is named `NonceRange` after its BM1397-era function,
-    // but on BM1370 it carries the voltage-regulator sync frequency: this
-    // raw value is little-endian 00 00 1e b5, and 0x1eb5 is exactly the
-    // default the reference BM1370 firmware writes here. It is NOT a
-    // nonce-space split, so it stays broadcast and chain-length
-    // independent. Do not "fix" this by substituting
-    // `NonceRangeConfig::multi_chip(chip_count)` — that table belongs to a
-    // different chip generation and would write a garbage VR frequency.
-    // The chain divides the nonce space by chip address instead, which is
-    // handled by the SetChipAddress walk above.
-    send_reg(
-        chip_commands,
-        true,
-        Register::NonceRange(protocol::NonceRangeConfig::from_raw(0xB51E0000)),
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::VersionMask(protocol::VersionMask::full_rolling()),
-    )
-    .await?;
-
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-    Ok(())
-}
-
-/// Ramp the hash clock from `*current_mhz` to `to_mhz` in small PLL steps,
-/// in either direction, pausing between steps so the clock settles.
-///
-/// `*current_mhz` is advanced to each setpoint only *after* its PLL write
-/// is acknowledged, so on error it reflects where the chip actually is —
-/// the caller (and telemetry) never believe the clock is somewhere it
-/// isn't, and a subsequent ramp resumes from the true value instead of
-/// slamming the PLL in one large step.
-///
-/// Used for runtime retuning of a chip that is already hashing (chip
-/// bring-up uses the ascending ramp in `initialize_chip` directly).
-async fn ramp_frequency<W>(chip_commands: &mut W, current_mhz: &mut f32, to_mhz: f32) -> Result<()>
-where
-    W: Sink<protocol::Command> + Unpin,
-    W::Error: std::fmt::Debug,
-{
-    const STEP_MHZ: f32 = 6.25;
-
-    // Build the intermediate setpoints, walking up or down toward the goal.
-    let mut steps = Vec::new();
-    if to_mhz >= *current_mhz {
-        let mut c = *current_mhz + STEP_MHZ;
-        while c < to_mhz {
-            steps.push(c);
-            c += STEP_MHZ;
-        }
-    } else {
-        let mut c = *current_mhz - STEP_MHZ;
-        while c > to_mhz {
-            steps.push(c);
-            c -= STEP_MHZ;
-        }
-    }
-    steps.push(to_mhz);
-
-    for f in steps {
-        if let Some(cfg) = calculate_pll_for_frequency(f) {
-            chip_commands
-                .send(protocol::Command::WriteRegister {
-                    broadcast: true,
-                    chip_address: 0x00,
-                    register: protocol::Register::PllDivider(cfg),
-                })
+        // Send version mask configuration (3 times)
+        debug!("Configuring version mask");
+        for _ in 1..=3 {
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination: Destination::Broadcast,
+                    register: Register::MidstateConfig(MidstateConfig::full_rolling()),
+                }))
                 .await
-                .map_err(|e| anyhow!("{e:?}"))
-                .context("live PLL retune failed")?;
-            // Only advance the tracked clock once the write is acknowledged.
-            *current_mhz = f;
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                .context("failed to send version mask")?;
+            time::sleep(Duration::from_millis(5)).await;
+        }
+
+        time::sleep(Duration::from_millis(10)).await;
+
+        // Enumerate the chips and check them against the declared
+        // topology. The version mask above switched the chips to the
+        // 11-byte response format the codec parses.
+        debug!("Enumerating chips");
+        let replies = RegisterClient::new(&mut self.chip_commands, register_responses)
+            .broadcast_read(RegisterAddress::ChipId)
+            .await
+            .context("chip enumeration failed")?;
+        if replies.len() != self.chain.chip_count() {
+            bail!(
+                "found {} chips, declared topology has {}",
+                replies.len(),
+                self.chain.chip_count()
+            );
+        }
+        debug!(chips = replies.len(), "Chip enumeration complete");
+
+        // Pre-configuration registers
+        debug!("Sending pre-configuration registers");
+
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::SoftResetControl(self.config.soft_reset_defaults),
+            }))
+            .await?;
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::MiscControl(self.config.misc_control),
+            }))
+            .await?;
+
+        self.chip_commands
+            .send(RegisterCommand::ChainInactive(ChainInactive))
+            .await
+            .context("failed to send ChainInactive")?;
+
+        // Address the chips in chain order. After ChainInactive, the
+        // first unaddressed chip adopts each SetChipAddress and
+        // forwards later ones downstream, so one command per chip
+        // addresses the whole chain.
+        self.chain
+            .assign_addresses()
+            .context("chip address assignment failed")?;
+        for (_, chip) in self.chain.chips() {
+            self.chip_commands
+                .send(RegisterCommand::SetChipAddress(SetChipAddress {
+                    chip_address: chip.address,
+                }))
+                .await
+                .context("failed to send SetChipAddress")?;
+        }
+
+        // Core configuration (broadcast)
+        debug!("Sending broadcast core configuration");
+
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::CoreMailbox(self.config.clock_select),
+            }))
+            .await?;
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::CoreMailbox(CoreCommand::write_all(
+                    CoreRegister::ClockDelay,
+                    0x0C,
+                )),
+            }))
+            .await?;
+
+        // Ticket mask
+        let ticket_mask = TicketMask::new(self.asic_difficulty);
+
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::TicketMask(ticket_mask),
+            }))
+            .await?;
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::IoDriverStrength(IoDriverStrength::normal()),
+            }))
+            .await?;
+
+        // Chip-specific configuration
+        debug!("Sending chip-specific configuration");
+
+        for (_, chip) in self.chain.chips() {
+            let destination = Destination::Chip(chip.address);
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination,
+                    register: Register::SoftResetControl(self.config.core_reset),
+                }))
+                .await?;
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination,
+                    register: Register::MiscControl(self.config.misc_control),
+                }))
+                .await?;
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination,
+                    register: Register::CoreMailbox(self.config.clock_select),
+                }))
+                .await?;
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination,
+                    register: Register::CoreMailbox(CoreCommand::write_all(
+                        CoreRegister::ClockDelay,
+                        0x0C,
+                    )),
+                }))
+                .await?;
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination,
+                    register: Register::CoreMailbox(CoreCommand::write_all(
+                        CoreRegister::CoreEnable,
+                        0xAA,
+                    )),
+                }))
+                .await?;
+        }
+
+        // Additional settings
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::AdcCtrl1(AdcCtrl1::bring_up()),
+            }))
+            .await?;
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::AnalogMux(self.config.analog_mux),
+            }))
+            .await?;
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::AdcCtrl1(AdcCtrl1::bring_up()),
+            }))
+            .await?;
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::CoreMailbox(CoreCommand::nonce_bin_overflow(true)),
+            }))
+            .await?;
+
+        // Frequency ramping from the reset frequency to the
+        // configured target
+        let ramp = *self.config.freq_range.start()..=self.config.default_freq;
+        debug!(
+            "Ramping frequency from {} MHz to {} MHz",
+            ramp.start().mhz(),
+            ramp.end().mhz()
+        );
+        let frequency_steps =
+            generate_frequency_ramp_steps(&self.config, ramp, self.config.ramp_step);
+
+        for (i, pll_config) in frequency_steps.iter().enumerate() {
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination: Destination::Broadcast,
+                    register: Register::PllDivider(*pll_config),
+                }))
+                .await
+                .context("PLL ramp failed")?;
+
+            time::sleep(Duration::from_millis(100)).await;
+
+            if i % 10 == 0 || i == frequency_steps.len() - 1 {
+                trace!("Frequency ramp step {}/{}", i + 1, frequency_steps.len());
+            }
+        }
+
+        debug!("Frequency ramping complete");
+        self.current_freq = self.config.default_freq;
+
+        // Final configuration
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::HashCountingNumber(self.config.hash_counting_number),
+            }))
+            .await?;
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::MidstateConfig(MidstateConfig::full_rolling()),
+            }))
+            .await?;
+
+        time::sleep(Duration::from_millis(150)).await;
+
+        // Verify bring-up by reading configuration back from every
+        // chip at its assigned address; a directed read answered at
+        // that address also proves the chip took it.
+        debug!("Verifying chain configuration");
+        let target_pll = self
+            .config
+            .calculate_pll(self.config.default_freq)
+            .context("no PLL solution for the target frequency")?;
+        // What each chip should answer. The registers answer as
+        // written, except PLL_DIVIDER bit 31, the lock report
+        // (LOCKED), which a healthy chip answers set after the ramp.
+        let expected = [
+            Register::MiscControl(self.config.misc_control),
+            Register::TicketMask(ticket_mask),
+            Register::PllDivider(PllDivider {
+                locked: true,
+                ..target_pll
+            }),
+        ];
+        let addresses: Vec<u8> = self.chain.chips().map(|(_, chip)| chip.address).collect();
+        let mut client = RegisterClient::new(&mut self.chip_commands, register_responses);
+        for address in addresses {
+            for register in &expected {
+                let actual = client
+                    .read(address, register.address())
+                    .await
+                    .context("bring-up verification read failed")?;
+                if actual != *register {
+                    bail!(
+                        "chip 0x{address:02x} readback mismatch: \
+                         expected {register:?}, read {actual:?}"
+                    );
+                }
+            }
+        }
+        debug!("Chain configuration verified");
+
+        Ok(())
+    }
+
+    /// Handles one nonce report from the chips.
+    async fn handle_nonce(&mut self, nonce_response: NonceResponse) {
+        let NonceResponse {
+            nonce,
+            job_id,
+            version,
+            excess_difficulty,
+            subcore_id,
+        } = nonce_response;
+
+        // Look up the task for this job_id
+        if let Some(task) = self.chip_jobs.get(job_id) {
+            let template = task.template.as_ref();
+
+            // Reconstruct full version from rolling field
+            let full_version = version.apply_to_version(template.version.base());
+
+            // Compute merkle root for this task's EN2
+            match task
+                .en2
+                .as_ref()
+                .and_then(|en2| template.compute_merkle_root(en2).ok())
+            {
+                Some(merkle_root) => {
+                    // Build block header
+                    let header = BlockHeader {
+                        version: full_version,
+                        prev_blockhash: template.prev_blockhash,
+                        merkle_root,
+                        time: task.ntime,
+                        bits: template.bits,
+                        nonce,
+                    };
+
+                    // Compute hash
+                    let hash = header.block_hash();
+
+                    // Validate against task share target
+                    if task.share_target.is_met_by(hash) {
+                        // Attribute work at the harder of the
+                        // ASIC ticket mask and the scheduler
+                        // target, since the actual filter is
+                        // whichever is stricter.
+                        let expected_work =
+                            max(self.asic_difficulty.to_work(), task.share_target.to_work());
+
+                        let share = Share {
+                            chip: None,
+                            nonce,
+                            hash,
+                            version: full_version,
+                            ntime: task.ntime,
+                            extranonce2: task.en2,
+                            expected_work,
+                        };
+
+                        // Send via task's dedicated channel
+                        if task.share_tx.send(share).await.is_err() {
+                            // Channel closed = task replaced, share is stale
+                            debug!("Share channel closed (task replaced)");
+                        } else {
+                            debug!(
+                                chip_job_id = job_id,
+                                nonce = format!("{:#x}", nonce),
+                                hash = %hash,
+                                hash_diff = %Difficulty::from_hash(&hash),
+                                target_diff = %Difficulty::from_target(task.share_target),
+                                "Share found and sent"
+                            );
+                        }
+                    } else {
+                        trace!(
+                            chip_job_id = job_id,
+                            nonce = format!("{:#x}", nonce),
+                            hash = %hash,
+                            hash_diff = %Difficulty::from_hash(&hash),
+                            target_diff = %Difficulty::from_target(task.share_target),
+                            "Nonce does not meet target (filtered)"
+                        );
+                    }
+                }
+                None => {
+                    error!(
+                        chip_job_id = job_id,
+                        "Failed to compute merkle root for nonce"
+                    );
+                }
+            }
+        } else {
+            trace!(
+                chip_job_id = job_id,
+                nonce = format!("{:#x}", nonce),
+                "Nonce for unknown job_id (possibly stale)"
+            );
+        }
+
+        let _ = (excess_difficulty, subcore_id); // Unused for now
+    }
+
+    /// Rolls the current task's ntime forward and sends the job to
+    /// the chip.
+    async fn roll_ntime(&mut self) {
+        let task = self.current_task.as_mut().unwrap();
+
+        // Increment ntime
+        task.ntime += 1;
+
+        // Convert to chip format and send
+        match task_to_job_full(task, self.chip_jobs.insert(task.clone())) {
+            Ok(job_data) => {
+                if let Err(e) = self.chip_commands.send(JobCommand::JobFull(job_data)).await {
+                    error!(error = ?e, "Failed to send JobFull to chip");
+                } else {
+                    trace!(ntime = task.ntime, "Sent ntime-rolled job to chip");
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to convert task to JobFull");
+            }
         }
     }
-    Ok(())
+
+    /// Updates the shared active flag.
+    fn set_active(&self, is_active: bool) {
+        self.status.write().unwrap().is_active = is_active;
+    }
+
+    /// Steps the PLL between `current_freq` and `target` in increments of `self.config.ramp_step`.
+    async fn ramp_frequency(&mut self, target: Frequency) -> Result<()> {
+        let step = self.config.ramp_step;
+        let mut steps = Vec::new();
+        if target >= self.current_freq {
+            let mut c = Frequency::from_hz(self.current_freq.hz() + step.hz());
+            while c < target {
+                steps.push(c);
+                c = Frequency::from_hz(c.hz() + step.hz());
+            }
+        } else {
+            let mut c_hz = self.current_freq.hz().saturating_sub(step.hz());
+            let target_hz = target.hz();
+            while c_hz > target_hz {
+                steps.push(Frequency::from_hz(c_hz));
+                c_hz = c_hz.saturating_sub(step.hz());
+            }
+        }
+        steps.push(target);
+
+        for (i, f) in steps.iter().enumerate() {
+            if let Some(cfg) = self.config.calculate_pll(*f) {
+                self.chip_commands
+                    .send(RegisterCommand::WriteRegister(WriteRegister {
+                        destination: Destination::Broadcast,
+                        register: Register::PllDivider(cfg),
+                    }))
+                    .await
+                    .map_err(|e| anyhow!("{e:?}"))
+                    .context("live PLL retune failed")?;
+                self.current_freq = *f;
+                time::sleep(Duration::from_millis(50)).await;
+                if i % 10 == 0 || i == steps.len() - 1 {
+                    trace!(
+                        "Retune ramp step {}/{} -> {:.2} MHz",
+                        i + 1,
+                        steps.len(),
+                        f.mhz()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
-/// Generate frequency ramp steps for smooth PLL transitions
-fn generate_frequency_ramp_steps(
-    start_mhz: f32,
-    target_mhz: f32,
-    step_mhz: f32,
-) -> Vec<protocol::PllConfig> {
-    let mut configs = Vec::new();
-    let mut current = start_mhz;
+/// Tracks tasks sent to chip hardware, indexed by chip_job_id.
+///
+/// BM13xx chips use 4-bit job IDs. This tracker maintains snapshots of
+/// HashTasks sent to the chip so we can match nonce responses back to the
+/// correct task context (EN2, ntime, etc.).
+struct ChipJobTracker {
+    tasks: [Option<HashTask>; 16],
+    next_id: u8,
+}
 
-    while current <= target_mhz {
-        if let Some(config) = calculate_pll_for_frequency(current) {
-            configs.push(config);
-        }
-        current += step_mhz;
-        if current > target_mhz && (current - step_mhz) < target_mhz {
-            current = target_mhz;
+impl ChipJobTracker {
+    fn new() -> Self {
+        Self {
+            tasks: Default::default(),
+            next_id: 0,
         }
     }
 
-    configs
+    fn insert(&mut self, task: HashTask) -> u8 {
+        let chip_job_id = self.next_id;
+        self.tasks[chip_job_id as usize] = Some(task);
+        self.next_id = (self.next_id + 1) % (self.tasks.len() as u8);
+        chip_job_id
+    }
+
+    fn get(&self, chip_job_id: u8) -> Option<&HashTask> {
+        self.tasks
+            .get(chip_job_id as usize)
+            .and_then(|t| t.as_ref())
+    }
+
+    fn clear(&mut self) {
+        self.tasks = Default::default();
+    }
 }
 
 /// Convert HashTask to JobFullFormat for chip hardware.
@@ -736,7 +1103,7 @@ fn generate_frequency_ramp_steps(
 /// Extracts or computes the merkle root, then builds a JobFullFormat with all
 /// block header fields. For computed merkle roots, requires EN2. For fixed merkle
 /// roots (Stratum v2 header-only), uses the template's fixed value directly.
-fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<protocol::JobFullFormat> {
+fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<JobFullFormat> {
     use crate::job_source::MerkleRootKind;
 
     let template = task.template.as_ref();
@@ -758,7 +1125,7 @@ fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<protocol::JobFul
         MerkleRootKind::Fixed(merkle_root) => *merkle_root,
     };
 
-    Ok(protocol::JobFullFormat {
+    Ok(JobFullFormat {
         job_id: chip_job_id,
         num_midstates: 1,
         starting_nonce: 0,
@@ -770,588 +1137,81 @@ fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<protocol::JobFul
     })
 }
 
-/// Calculate PLL configuration for a specific frequency
-fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllConfig> {
-    let freq = protocol::Frequency::from_mhz(target_freq).ok()?;
-    Some(freq.calculate_pll())
-}
+/// Generate frequency ramp steps for smooth PLL transitions
+fn generate_frequency_ramp_steps(
+    config: &ChipConfig,
+    range: RangeInclusive<Frequency>,
+    step: Frequency,
+) -> Vec<PllDivider> {
+    let target = *range.end();
+    let mut configs = Vec::new();
+    let mut current = *range.start();
 
-/// Internal actor task for BM13xxThread.
-///
-/// This runs as an independent Tokio task and handles:
-/// - Commands from scheduler (update/replace work, go idle, shutdown)
-/// - Removal signal from board (USB unplug, fault, etc.)
-/// - Chip initialization (lazy, on first work assignment)
-/// - Serial communication with chips
-/// - Share filtering and event emission (TODO)
-///
-/// Chip is disabled on startup to establish known state. Chip is enabled and
-/// configured when scheduler assigns first work.
-// One private actor entry point wired up by `BM13xxThread::new`; bundling
-// its parameters into a struct would only move the same fields around.
-#[expect(clippy::too_many_arguments)]
-async fn bm13xx_thread_actor<R, W>(
-    mut cmd_rx: mpsc::Receiver<ThreadCommand>,
-    evt_tx: mpsc::Sender<HashThreadEvent>,
-    mut removal_rx: watch::Receiver<ThreadRemovalSignal>,
-    status: Arc<RwLock<HashThreadStatus>>,
-    mut chip_responses: R,
-    mut chip_commands: W,
-    mut peripherals: BoardPeripherals,
-    chip_count: usize,
-) where
-    R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin,
-    W: Sink<protocol::Command> + Unpin,
-    W::Error: std::fmt::Debug,
-{
-    // Disable ASIC on startup to establish known state
-    if let Some(ref mut asic_enable) = peripherals.asic_enable
-        && let Err(e) = asic_enable.disable().await
-    {
-        warn!(error = %e, "Failed to disable ASIC on startup");
-    }
-
-    // ASIC ticket mask difficulty: ~1 nonce/sec across the board's nameplate hashrate
-    let expected_hashrate = HashRate::from_terahashes(1.0 * chip_count as f64);
-    let asic_difficulty = Log2Difficulty::from_difficulty(
-        ShareRate::per_second(1.0).to_difficulty(expected_hashrate),
-    );
-
-    let mut chip_initialized = false;
-    // Desired hash clock used on (re)initialization, and the clock the chip
-    // is currently ramped to (0.0 until the chip is first initialized).
-    let mut target_freq = TARGET_FREQUENCY_MHZ;
-    let mut current_freq = 0.0f32;
-    let mut current_task: Option<HashTask> = None;
-    let mut chip_jobs = ChipJobTracker::new();
-    let mut ntime_ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
-    ntime_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        tokio::select! {
-            // Removal signal (highest priority)
-            _ = removal_rx.changed() => {
-                let signal = removal_rx.borrow().clone();  // Clone to avoid holding borrow across await
-                match signal {
-                    ThreadRemovalSignal::Running => {
-                        // False alarm - still running
-                    }
-                    _reason => {
-                        // Update status
-                        {
-                            let mut s = status.write().unwrap();
-                            s.is_active = false;
-                        }
-
-                        // Exit actor loop (channel closure signals removal to scheduler)
-                        break;
-                    }
-                }
-            }
-
-            // Commands from scheduler
-            Some(cmd) = cmd_rx.recv() => {
-                match cmd {
-                    ThreadCommand::Configure => {
-                        // Nameplate rate for one BM1370 chip; a rough stand-in
-                        // for a real frequency-derived estimate.
-                        let expected = HashRate::from_terahashes(1.0);
-                        if evt_tx.send(HashThreadEvent::ExpectedHashRate(expected)).await.is_err() {
-                            debug!("Event channel closed during configure");
-                        }
-                    }
-
-                    ThreadCommand::UpdateTask { new_task, response_tx } => {
-                        if let Some(ref old) = current_task {
-                            debug!(
-                                old_job = %old.template.id,
-                                new_job = %new_task.template.id,
-                                "Updating work"
-                            );
-                        } else {
-                            debug!(new_job = %new_task.template.id, "Updating work from idle");
-                        }
-
-                        if !chip_initialized {
-                            trace!("Initializing chain on first assignment.");
-                            if let Err(e) = initialize_chain(&mut chip_commands, &mut peripherals, asic_difficulty, target_freq, chip_count).await {
-                                error!(error = %e, "Chip initialization failed");
-                                response_tx.send(Err(e)).ok();
-                                continue;
-                            }
-                            chip_initialized = true;
-                            current_freq = target_freq;
-                        }
-
-                        // Send initial job to chip
-                        let chip_job_id = chip_jobs.insert(new_task.clone());
-                        let old_task = current_task.replace(new_task.clone());
-                        match task_to_job_full(&new_task, chip_job_id) {
-                            Ok(job_data) => {
-                                if let Err(e) = chip_commands.send(protocol::Command::JobFull { job_data }).await {
-                                    error!(error = ?e, "Failed to send initial JobFull to chip");
-                                    let err = anyhow!("failed to send job to chip: {e:?}");
-                                    response_tx.send(Err(err)).ok();
-                                    continue;
-                                } else {
-                                    debug!("Sent initial job to chip");
-                                }
-                            }
-                            Err(e) => {
-                                error!(error = %e, "Failed to convert task to JobFull");
-                                response_tx.send(Err(e)).ok();
-                                continue;
-                            }
-                        }
-
-                        {
-                            let mut s = status.write().unwrap();
-                            s.is_active = true;
-                        }
-
-                        response_tx.send(Ok(old_task)).ok();
-                    }
-
-                    ThreadCommand::ReplaceTask { new_task, response_tx } => {
-                        if let Some(ref old) = current_task {
-                            debug!(
-                                old_job = %old.template.id,
-                                new_job = %new_task.template.id,
-                                "Replacing work"
-                            );
-                        } else {
-                            debug!(new_job = %new_task.template.id, "Replacing work from idle");
-                        }
-
-                        if !chip_initialized {
-                            trace!("Initializing chain on first assignment.");
-                            if let Err(e) = initialize_chain(&mut chip_commands, &mut peripherals, asic_difficulty, target_freq, chip_count).await {
-                                error!(error = %e, "Chip initialization failed");
-                                response_tx.send(Err(e)).ok();
-                                continue;
-                            }
-                            chip_initialized = true;
-                            current_freq = target_freq;
-                        }
-
-                        // Clear old jobs (old shares invalid)
-                        chip_jobs.clear();
-
-                        // Send initial job to chip
-                        let chip_job_id = chip_jobs.insert(new_task.clone());
-                        let old_task = current_task.replace(new_task.clone());
-                        match task_to_job_full(&new_task, chip_job_id) {
-                            Ok(job_data) => {
-                                if let Err(e) = chip_commands.send(protocol::Command::JobFull { job_data }).await {
-                                    error!(error = ?e, "Failed to send initial JobFull to chip");
-                                    let err = anyhow!("failed to send job to chip: {e:?}");
-                                    response_tx.send(Err(err)).ok();
-                                    continue;
-                                } else {
-                                    debug!("Sent initial job to chip (old work invalidated)");
-                                }
-                            }
-                            Err(e) => {
-                                error!(error = %e, "Failed to convert task to JobFull");
-                                response_tx.send(Err(e)).ok();
-                                continue;
-                            }
-                        }
-
-                        {
-                            let mut s = status.write().unwrap();
-                            s.is_active = true;
-                        }
-
-                        response_tx.send(Ok(old_task)).ok();
-                    }
-
-                    ThreadCommand::GoIdle { response_tx } => {
-                        debug!("Going idle");
-
-                        let old_task = current_task.take();
-
-                        {
-                            let mut s = status.write().unwrap();
-                            s.is_active = false;
-                        }
-
-                        response_tx.send(Ok(old_task)).ok();
-                    }
-
-                    ThreadCommand::SetFrequency { mhz, response_tx } => {
-                        let target = mhz.clamp(MIN_FREQUENCY_MHZ, MAX_FREQUENCY_MHZ);
-                        target_freq = target;
-                        // Retune live only if the chip is already ramped; if it
-                        // has not been initialized yet, the new target is picked
-                        // up by the bring-up ramp on first work assignment.
-                        if chip_initialized {
-                            let from = current_freq;
-                            // ramp_frequency advances current_freq per acked step,
-                            // so it stays accurate even if the ramp fails partway.
-                            match ramp_frequency(&mut chip_commands, &mut current_freq, target).await {
-                                Ok(()) => {
-                                    info!(from_mhz = from, to_mhz = current_freq, "Retuned hash clock");
-                                    response_tx.send(Ok(())).ok();
-                                }
-                                Err(e) => {
-                                    error!(error = %e, stopped_at_mhz = current_freq, "Live frequency retune failed");
-                                    response_tx.send(Err(e)).ok();
-                                }
-                            }
-                        } else {
-                            response_tx.send(Ok(())).ok();
-                        }
-                    }
-
-                    ThreadCommand::Shutdown => {
-                        info!("Shutdown command received");
-                        // Exit actor loop (channel closure signals shutdown to scheduler)
-                        break;
-                    }
-                }
-            }
-
-            // Chip responses from serial stream
-            Some(result) = chip_responses.next() => {
-                match result {
-                    Ok(response) => {
-                        match response {
-                            protocol::Response::Nonce { nonce, job_id, version, midstate_num, subcore_id } => {
-                                // Look up the task for this job_id
-                                if let Some(task) = chip_jobs.get(job_id) {
-                                    let template = task.template.as_ref();
-
-                                    // Reconstruct full version from rolling field
-                                    let full_version = version.apply_to_version(template.version.base());
-
-                                    // Compute merkle root for this task's EN2
-                                    match task.en2.as_ref().and_then(|en2| template.compute_merkle_root(en2).ok()) {
-                                        Some(merkle_root) => {
-                                            // Build block header
-                                            let header = BlockHeader {
-                                                version: full_version,
-                                                prev_blockhash: template.prev_blockhash,
-                                                merkle_root,
-                                                time: task.ntime,
-                                                bits: template.bits,
-                                                nonce,
-                                            };
-
-                                            // Compute hash
-                                            let hash = header.block_hash();
-
-                                            // Validate against task share target
-                                            if task.share_target.is_met_by(hash) {
-                                                // Attribute work at the harder of the
-                                                // ASIC ticket mask and the scheduler
-                                                // target, since the actual filter is
-                                                // whichever is stricter.
-                                                let expected_work = max(
-                                                    asic_difficulty.to_work(),
-                                                    task.share_target.to_work(),
-                                                );
-
-                                                let share = Share {
-                                                    chip: chip_index_from_nonce(nonce, chip_count),
-                                                    nonce,
-                                                    hash,
-                                                    version: full_version,
-                                                    ntime: task.ntime,
-                                                    extranonce2: task.en2,
-                                                    expected_work,
-                                                };
-
-                                                // Send via task's dedicated channel
-                                                if task.share_tx.send(share).await.is_err() {
-                                                    // Channel closed = task replaced, share is stale
-                                                    debug!("Share channel closed (task replaced)");
-                                                } else {
-                                                    debug!(
-                                                        chip_job_id = job_id,
-                                                        nonce = format!("{:#x}", nonce),
-                                                        hash = %hash,
-                                                        hash_diff = %Difficulty::from_hash(&hash),
-                                                        target_diff = %Difficulty::from_target(task.share_target),
-                                                        "Share found and sent"
-                                                    );
-                                                }
-                                            } else {
-                                                trace!(
-                                                    chip_job_id = job_id,
-                                                    nonce = format!("{:#x}", nonce),
-                                                    hash = %hash,
-                                                    hash_diff = %Difficulty::from_hash(&hash),
-                                                    target_diff = %Difficulty::from_target(task.share_target),
-                                                    "Nonce does not meet target (filtered)"
-                                                );
-                                            }
-                                        }
-                                        None => {
-                                            error!(
-                                                chip_job_id = job_id,
-                                                "Failed to compute merkle root for nonce"
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    trace!(
-                                        chip_job_id = job_id,
-                                        nonce = format!("{:#x}", nonce),
-                                        "Nonce for unknown job_id (possibly stale)"
-                                    );
-                                }
-
-                                let _ = (midstate_num, subcore_id); // Unused for now
-                            }
-
-                            protocol::Response::ReadRegister { chip_address, register } => {
-                                trace!(chip_address = %format!("0x{:02x}", chip_address), register = ?register, "Register read response");
-                            }
-                        }
-                    }
-
-                    Err(e) => {
-                        error!(error = ?e, "Serial decode error");
-                        // TODO: Emit error event, potentially trigger going offline if persistent
-                    }
-                }
-            }
-
-            // ntime rolling timer (roll forward every second)
-            _ = ntime_ticker.tick(), if current_task.is_some() => {
-                let task = current_task.as_mut().unwrap();
-
-                // Increment ntime
-                task.ntime += 1;
-
-                // Convert to chip format and send
-                match task_to_job_full(task, chip_jobs.insert(task.clone())) {
-                    Ok(job_data) => {
-                        if let Err(e) = chip_commands.send(protocol::Command::JobFull { job_data }).await {
-                            error!(error = ?e, "Failed to send JobFull to chip");
-                        } else {
-                            trace!(ntime = task.ntime, "Sent ntime-rolled job to chip");
-                        }
-                    }
-                    Err(e) => {
-                        error!(error = %e, "Failed to convert task to JobFull");
-                    }
-                }
-            }
+    while current <= target {
+        if let Some(pll) = config.calculate_pll(current) {
+            configs.push(pll);
         }
+        let next = Frequency::from_hz(current.hz() + step.hz());
+        // A final short step ends the ramp exactly on the target
+        current = if next > target && current < target {
+            target
+        } else {
+            next
+        };
     }
 
-    debug!("BM13xx thread actor exiting");
+    configs
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+
+    use futures::{Sink, stream};
+
     use super::*;
+    use crate::asic::bm13xx::chip_config;
+    use crate::asic::bm13xx::peripherals::ResetLine;
+    use crate::peripheral::regulator::VoltageRegulator;
+    use crate::types::Voltage;
 
     #[test]
-    fn single_chip_chain_keeps_the_legacy_address() {
-        // The pre-chain code hardcoded 0x00. A one-chip chain must still
-        // emit exactly that, so the Bitaxe command stream is unchanged.
-        assert_eq!(chain_addresses(1), vec![0x00]);
-    }
+    fn ramp_covers_range_in_steps() {
+        let config = chip_config::bm1370();
+        let steps = generate_frequency_ramp_steps(
+            &config,
+            Frequency::from_mhz(56.25)..=Frequency::from_mhz(525.0),
+            Frequency::from_mhz(6.25),
+        );
 
-    #[test]
-    fn four_chip_chain_spreads_over_the_address_space() {
-        // Interval 256/4 = 64, matching the reference BM1370 firmware.
-        assert_eq!(chain_addresses(4), vec![0x00, 0x40, 0x80, 0xC0]);
-    }
+        // 75 steps of 6.25 MHz above the starting frequency
+        assert_eq!(steps.len(), 76);
 
-    #[test]
-    fn non_power_of_two_chains_round_the_interval_up() {
-        // 3 chips use 4 slots (interval 64), leaving the last slot unused
-        // rather than overlapping addresses.
-        assert_eq!(chain_addresses(3), vec![0x00, 0x40, 0x80]);
-        // 6 chips use 8 slots (interval 32).
-        assert_eq!(chain_addresses(6), vec![0x00, 0x20, 0x40, 0x60, 0x80, 0xA0]);
-    }
-
-    #[test]
-    fn full_chain_addresses_stay_in_range() {
-        // 256 chips is the densest chain the 8-bit space allows: interval
-        // 1, addresses 0x00..=0xFF, no wrap.
-        let addrs = chain_addresses(256);
-        assert_eq!(addrs.len(), 256);
-        assert_eq!(addrs[0], 0x00);
-        assert_eq!(addrs[255], 0xFF);
-        // Every address distinct.
-        let mut sorted = addrs.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), 256);
-    }
-
-    /// Build a nonce carrying `address` in the chip-address field, the
-    /// inverse of what `chip_index_from_nonce` extracts.
-    fn nonce_from_address(address: u8) -> u32 {
-        ((address as u32) << 17).swap_bytes()
-    }
-
-    #[test]
-    fn nonce_identifies_the_chip_that_found_it() {
-        // The four addresses a 4-chip chain is assigned map back to
-        // indices 0..3.
-        for (index, address) in [0x00u8, 0x40, 0x80, 0xC0].into_iter().enumerate() {
-            assert_eq!(
-                chip_index_from_nonce(nonce_from_address(address), 4),
-                Some(index as u8),
-                "address {address:#04x}"
-            );
+        // Each step is the solver's answer for the next stepped
+        // frequency
+        for (i, step) in steps.iter().enumerate() {
+            let freq = Frequency::from_hz(56_250_000 + i as u64 * 6_250_000);
+            assert_eq!(*step, config.calculate_pll(freq).unwrap(), "step {i}");
         }
     }
 
     #[test]
-    fn chip_decode_is_the_inverse_of_address_assignment() {
-        // Whatever addresses we hand out must decode back to the index we
-        // handed them out for; the two must not drift apart.
-        for chip_count in [2usize, 3, 4, 6, 8, 16] {
-            for (index, address) in chain_addresses(chip_count).into_iter().enumerate() {
-                assert_eq!(
-                    chip_index_from_nonce(nonce_from_address(address), chip_count),
-                    Some(index as u8),
-                    "chain of {chip_count}, address {address:#04x}"
-                );
-            }
-        }
-    }
+    fn ramp_ends_on_target_when_step_overshoots() {
+        let config = chip_config::bm1370();
+        let steps = generate_frequency_ramp_steps(
+            &config,
+            Frequency::from_mhz(56.25)..=Frequency::from_mhz(60.0),
+            Frequency::from_mhz(6.25),
+        );
 
-    #[test]
-    fn single_chip_reports_no_chip_attribution() {
-        // With one chip the field carries no address, so any answer would
-        // be a fabricated zero.
-        assert_eq!(chip_index_from_nonce(nonce_from_address(0x00), 1), None);
-        assert_eq!(chip_index_from_nonce(0xDEADBEEF, 1), None);
-    }
-
-    #[test]
-    fn address_beyond_the_chain_is_rejected() {
-        // A 2-chip chain uses interval 128, so only 0x00 and 0x80 are
-        // real. Anything decoding past the end means the field was not an
-        // address, and inventing chip 3 of a 2-chip chain would be worse
-        // than reporting nothing.
-        assert_eq!(chip_index_from_nonce(nonce_from_address(0x00), 2), Some(0));
-        assert_eq!(chip_index_from_nonce(nonce_from_address(0x80), 2), Some(1));
-        // 3 chips use 4 slots, so index 3 exists in the encoding but not
-        // on the chain.
-        assert_eq!(chip_index_from_nonce(nonce_from_address(0xC0), 3), None);
-    }
-
-    #[test]
-    fn overlong_chains_truncate_rather_than_collide() {
-        // Beyond 256 the interval would round to zero and every chip
-        // would be addressed 0x00 -- silently configuring the whole chain
-        // as one chip. Truncating keeps every returned address distinct.
-        let addrs = chain_addresses(300);
-        assert_eq!(addrs.len(), 256);
-        let mut sorted = addrs.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), 256, "addresses must stay distinct");
-    }
-
-    #[test]
-    fn zero_chips_degrades_to_a_single_address() {
-        // Defensive: discovery returning nothing must not produce an empty
-        // address list that silently skips all per-chip configuration.
-        assert_eq!(chain_addresses(0), vec![0x00]);
-    }
-
-    #[test]
-    fn test_pll_calculations_match_reference() {
-        // Test cases from the Bitaxe Gamma protocol capture adjusted for optimal lowest-VCO configurations
-        // Format: (freq_mhz, expected_flag, expected_fb_div, expected_ref_div, expected_post_div)
-        let test_cases = vec![
-            (62.50, 0x40, 0xAF, 0x02, 0x64),
-            (68.75, 0x40, 0xA5, 0x02, 0x54),
-            (75.00, 0x40, 0xA8, 0x02, 0x63),
-            (81.25, 0x40, 0xB6, 0x02, 0x63),
-            (87.50, 0x40, 0xA8, 0x02, 0x53),
-            (93.75, 0x40, 0xB4, 0x02, 0x53),
-            (100.00, 0x40, 0xA0, 0x02, 0x43),
-            (525.00, 0x40, 0xA8, 0x02, 0x30),
+        let expected = [
+            config.calculate_pll(Frequency::from_mhz(56.25)).unwrap(),
+            config.calculate_pll(Frequency::from_mhz(60.0)).unwrap(),
         ];
-
-        for (freq_mhz, expected_flag, expected_fb, expected_ref, expected_post) in test_cases {
-            let config = calculate_pll_for_frequency(freq_mhz)
-                .unwrap_or_else(|| panic!("Failed to calculate PLL for {} MHz", freq_mhz));
-
-            assert_eq!(
-                config.flag, expected_flag,
-                "Flag mismatch for {} MHz: expected 0x{:02X}, got 0x{:02X}",
-                freq_mhz, expected_flag, config.flag
-            );
-            assert_eq!(
-                config.fb_div, expected_fb,
-                "FB divider mismatch for {} MHz: expected 0x{:02X}, got 0x{:02X}",
-                freq_mhz, expected_fb, config.fb_div
-            );
-            assert_eq!(
-                config.ref_div, expected_ref,
-                "Ref divider mismatch for {} MHz: expected {}, got {}",
-                freq_mhz, expected_ref, config.ref_div
-            );
-            assert_eq!(
-                config.post_div, expected_post,
-                "Post divider mismatch for {} MHz: expected 0x{:02X}, got 0x{:02X}",
-                freq_mhz, expected_post, config.post_div
-            );
-
-            let post_div1 = ((config.post_div >> 4) & 0xF) + 1;
-            let post_div2 = (config.post_div & 0xF) + 1;
-            let calculated_freq =
-                25.0 * config.fb_div as f32 / (config.ref_div * post_div1 * post_div2) as f32;
-            assert!(
-                (calculated_freq - freq_mhz).abs() < 1.0,
-                "Frequency calculation error for {} MHz: calculated {} MHz",
-                freq_mhz,
-                calculated_freq
-            );
-        }
-    }
-
-    #[test]
-    fn test_frequency_ramp_generation() {
-        let steps = generate_frequency_ramp_steps(56.25, 525.0, 6.25);
-
-        // (525 - 56.25) / 6.25 + 1 = 76 steps
-        assert_eq!(steps.len(), 76, "Expected 76 frequency steps");
-
-        if let Some(first) = steps.first() {
-            let post_div1 = ((first.post_div >> 4) & 0xF) + 1;
-            let post_div2 = (first.post_div & 0xF) + 1;
-            let first_freq =
-                25.0 * first.fb_div as f32 / (first.ref_div * post_div1 * post_div2) as f32;
-            assert!(
-                (first_freq - 56.25).abs() < 1.0,
-                "First frequency should be ~56.25 MHz"
-            );
-        }
-
-        if let Some(last) = steps.last() {
-            let post_div1 = ((last.post_div >> 4) & 0xF) + 1;
-            let post_div2 = (last.post_div & 0xF) + 1;
-            let last_freq =
-                25.0 * last.fb_div as f32 / (last.ref_div * post_div1 * post_div2) as f32;
-            assert!(
-                (last_freq - 525.0).abs() < 1.0,
-                "Last frequency should be ~525 MHz"
-            );
-        }
-    }
-
-    #[test]
-    fn test_pll_flag_setting() {
-        // Flag is 0x50 when VCO frequency >= 2400 MHz, 0x40 otherwise
-        let low_freq = calculate_pll_for_frequency(100.0).unwrap();
-        assert_eq!(low_freq.flag, 0x40, "Should have 0x40 flag for 100 MHz (VCO = 2000 MHz)");
-
-        let high_freq = calculate_pll_for_frequency(600.0).unwrap();
-        assert_eq!(high_freq.flag, 0x50, "Should have 0x50 flag for 600 MHz (VCO = 2400 MHz)");
+        assert_eq!(steps, expected);
     }
 
     #[test]
@@ -1407,5 +1267,307 @@ mod tests {
             *esp_miner_job::wire_tx::PREV_BLOCKHASH
         );
         assert_eq!(result.merkle_root, *esp_miner_job::wire_tx::MERKLE_ROOT);
+    }
+
+    /// Sink that accepts and discards every command.
+    struct NullSink;
+
+    impl Sink<RegisterCommand> for NullSink {
+        type Error = io::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _: RegisterCommand) -> Result<(), io::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Sink<JobCommand> for NullSink {
+        type Error = io::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _: JobCommand) -> Result<(), io::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Sink that is never ready, parking the first send forever.
+    struct StallSink;
+
+    impl Sink<RegisterCommand> for StallSink {
+        type Error = io::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _: RegisterCommand) -> Result<(), io::Error> {
+            unreachable!("poll_ready never succeeds")
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+    }
+
+    impl Sink<JobCommand> for StallSink {
+        type Error = io::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _: JobCommand) -> Result<(), io::Error> {
+            unreachable!("poll_ready never succeeds")
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+    }
+
+    /// Peripheral states observed by the tests.
+    #[derive(Clone, Default)]
+    struct PeripheralFlags {
+        reset_asserted: Arc<AtomicBool>,
+        rail_disabled: Arc<AtomicBool>,
+    }
+
+    struct MockResetLine(PeripheralFlags);
+
+    #[async_trait]
+    impl ResetLine for MockResetLine {
+        async fn assert(&mut self) -> Result<()> {
+            self.0.reset_asserted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn release(&mut self) -> Result<()> {
+            self.0.reset_asserted.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct MockRegulator(PeripheralFlags);
+
+    #[async_trait]
+    impl VoltageRegulator for MockRegulator {
+        async fn enable(&mut self) -> Result<()> {
+            self.0.rail_disabled.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn disable(&mut self) -> Result<()> {
+            self.0.rail_disabled.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn is_enabled(&mut self) -> Result<bool> {
+            Ok(!self.0.rail_disabled.load(Ordering::SeqCst))
+        }
+
+        async fn set_voltage(&mut self, _voltage: Voltage) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_voltage(&mut self) -> Result<Voltage> {
+            Ok(Voltage::from_volts(1.15))
+        }
+    }
+
+    fn spawn_thread<R, W>(
+        chip_responses: R,
+        chip_commands: W,
+    ) -> (BM13xxThread, watch::Sender<()>, PeripheralFlags)
+    where
+        R: Stream<Item = Result<Response, std::io::Error>> + Unpin + Send + 'static,
+        W: ChipCommandSink + Unpin + Send + 'static,
+        SinkError<W>: std::error::Error + Send + Sync + 'static,
+    {
+        let flags = PeripheralFlags::default();
+        let peripherals = BoardPeripherals {
+            reset_line: Box::new(MockResetLine(flags.clone())),
+            voltage_regulator: Box::new(MockRegulator(flags.clone())),
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+
+        let thread = BM13xxThread::new(
+            "test".into(),
+            chip_config::bm1370(),
+            TopologySpec::single_domain(1),
+            chip_responses,
+            chip_commands,
+            peripherals,
+            shutdown_rx,
+        );
+
+        (thread, shutdown_tx, flags)
+    }
+
+    /// Builds a minimal task for driving the actor.
+    fn test_task() -> HashTask {
+        use crate::asic::bm13xx::test_data::esp_miner_job;
+        use crate::job_source::{
+            Extranonce2, GeneralPurposeBits, JobTemplate, MerkleRootKind, VersionTemplate,
+        };
+
+        let template = Arc::new(JobTemplate {
+            id: "test".into(),
+            prev_blockhash: *esp_miner_job::wire_tx::PREV_BLOCKHASH,
+            version: VersionTemplate::new(
+                *esp_miner_job::wire_tx::VERSION,
+                GeneralPurposeBits::full(),
+            )
+            .expect("Valid version template"),
+            bits: *esp_miner_job::wire_tx::NBITS,
+            share_target: crate::types::Difficulty::from(100_u64).to_target(),
+            time: *esp_miner_job::wire_tx::NTIME,
+            merkle_root: MerkleRootKind::Fixed(*esp_miner_job::wire_tx::MERKLE_ROOT),
+        });
+        let (share_tx, _share_rx) = mpsc::channel(1);
+
+        HashTask {
+            template,
+            en2_range: None,
+            en2: Some(Extranonce2::new(0, 1).unwrap()),
+            share_target: crate::types::Difficulty::from(100_u64).to_target(),
+            ntime: *esp_miner_job::wire_tx::NTIME,
+            share_tx,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exits_when_response_stream_ends() {
+        let (mut thread, _shutdown_tx, flags) = spawn_thread(stream::iter(Vec::new()), NullSink);
+        let mut events = thread.take_event_receiver().unwrap();
+
+        // The actor disables the chain before it drops its event
+        // sender, so a closed event channel implies the cleanup ran
+        let closed = time::timeout(Duration::from_secs(5), events.recv()).await;
+        assert!(closed.expect("actor should exit").is_none());
+
+        assert!(flags.reset_asserted.load(Ordering::SeqCst));
+        assert!(flags.rail_disabled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exits_when_shutdown_sender_drops() {
+        let (mut thread, shutdown_tx, flags) = spawn_thread(
+            stream::pending::<Result<Response, std::io::Error>>(),
+            NullSink,
+        );
+        let mut events = thread.take_event_receiver().unwrap();
+
+        // Drop the sender without a signal, as a dying board task
+        // would
+        drop(shutdown_tx);
+
+        let closed = time::timeout(Duration::from_secs(5), events.recv()).await;
+        assert!(closed.expect("actor should exit").is_none());
+
+        assert!(flags.reset_asserted.load(Ordering::SeqCst));
+        assert!(flags.rail_disabled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exits_on_shutdown_signal() {
+        let (_thread, shutdown_tx, flags) = spawn_thread(
+            stream::pending::<Result<Response, std::io::Error>>(),
+            NullSink,
+        );
+
+        shutdown_tx.send(()).unwrap();
+
+        // The actor drops its shutdown receiver only after disabling
+        // the chain, so a closed sender implies the cleanup ran
+        time::timeout(Duration::from_secs(5), shutdown_tx.closed())
+            .await
+            .expect("actor should drop its shutdown receiver");
+
+        assert!(flags.reset_asserted.load(Ordering::SeqCst));
+        assert!(flags.rail_disabled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exits_when_handle_dropped() {
+        let (mut thread, _shutdown_tx, flags) = spawn_thread(
+            stream::pending::<Result<Response, std::io::Error>>(),
+            NullSink,
+        );
+        let mut events = thread.take_event_receiver().unwrap();
+
+        drop(thread);
+
+        let closed = time::timeout(Duration::from_secs(5), events.recv()).await;
+        assert!(closed.expect("actor should exit").is_none());
+
+        assert!(flags.reset_asserted.load(Ordering::SeqCst));
+        assert!(flags.rail_disabled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_aborts_bring_up() {
+        // The stalling sink parks bring-up at its first chip
+        // command, holding it in progress until the signal arrives
+        let (mut thread, shutdown_tx, flags) = spawn_thread(
+            stream::pending::<Result<Response, std::io::Error>>(),
+            StallSink,
+        );
+
+        let assign = thread.update_task(test_task());
+        let signal = async {
+            // Bring-up has begun once the startup reset assertion
+            // is released
+            while !flags.reset_asserted.load(Ordering::SeqCst) {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+            while flags.reset_asserted.load(Ordering::SeqCst) {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+            shutdown_tx.send(()).unwrap();
+        };
+        let (result, _) = time::timeout(Duration::from_secs(60), async {
+            tokio::join!(assign, signal)
+        })
+        .await
+        .expect("bring-up should abort");
+
+        assert!(result.is_err());
+
+        // The actor exits, disabling the chain on the way out
+        time::timeout(Duration::from_secs(5), shutdown_tx.closed())
+            .await
+            .expect("actor should drop its shutdown receiver");
+        assert!(flags.reset_asserted.load(Ordering::SeqCst));
+        assert!(flags.rail_disabled.load(Ordering::SeqCst));
     }
 }
