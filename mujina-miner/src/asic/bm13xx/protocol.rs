@@ -1358,6 +1358,7 @@ mod init_tests {
             register: Register::IoDriverStrength(strength),
             ..
         } = first_boundary
+        {
             assert_eq!(*chip_address, 0x08); // 5th chip (index 4) * 2
             let strength_bytes: [u8; 4] = (*strength).into();
             // Expected bytes from hardware capture: clock output at max (0xF)
