@@ -315,10 +315,14 @@ impl Daemon {
         // Windows has no SIGTERM; Ctrl-C is the graceful-shutdown signal.
         #[cfg(windows)]
         {
-            match tokio::signal::ctrl_c().await {
-                Ok(()) => info!("Received Ctrl-C."),
+            use tokio::signal::windows;
+            match windows::ctrl_c() {
+                Ok(mut ctrl_c) => {
+                    ctrl_c.recv().await;
+                    info!("Received Ctrl-C.");
+                }
                 Err(e) => {
-                    warn!("Ctrl-C handler unavailable ({e}); holding daemon open");
+                    warn!("Ctrl-C stream unavailable ({e}); holding daemon open");
                     std::future::pending::<()>().await;
                 }
             }
