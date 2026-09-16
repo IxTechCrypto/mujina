@@ -15,6 +15,8 @@
 //! API reports them, replace the log scan with an API probe, and
 //! drive shutdown through the API instead of a signal.
 
+#![cfg(unix)]
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
