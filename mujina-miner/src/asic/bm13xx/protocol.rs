@@ -430,48 +430,81 @@ impl From<BaudRate> for [u8; 4] {
     }
 }
 
-/// IO driver strength configuration
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Drive strength of each chip output pin.
+///
+/// Each output has a 4-bit drive strength. Factory firmware runs
+/// every output at strength 1 and raises the clock output on the
+/// last chip of each voltage domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IoDriverStrength {
-    /// Drive strength for each signal group (4 bits each)
-    strengths: [u8; 8],
+    /// Drive strength of the command output (CO), toward the next chip.
+    pub command_out: u8,
+    /// Drive strength of the busy output (BO), toward the next chip.
+    pub busy_out: u8,
+    /// Drive strength of the reset output (NRSTO), toward the next chip.
+    pub reset_out: u8,
+    /// Drive strength of the clock output (CLKO), toward the next chip.
+    pub clock_out: u8,
+    /// Drive strength of the response output (RO), toward the host.
+    pub response_out: u8,
+    /// Undecoded bits 31-20, zero in every capture, held in place.
+    pub unexplained: u32,
 }
 
 impl IoDriverStrength {
-    /// Normal strength for chips in middle of chain
+    /// Returns the baseline strength: every output at 1.
     pub fn normal() -> Self {
-        // 0x11110100 = 0001 0001 0001 0001 0000 0001 0000 0000
         Self {
-            strengths: [0x0, 0x0, 0x1, 0x0, 0x1, 0x1, 0x1, 0x1],
+            command_out: 0x1,
+            busy_out: 0x1,
+            reset_out: 0x1,
+            clock_out: 0x1,
+            response_out: 0x1,
+            unexplained: 0,
         }
     }
 
-    /// Strong drive for domain boundary chips
+    /// Returns the strength for the last chip of a voltage domain:
+    /// clock output at maximum, the rest at the baseline. The boundary
+    /// chip drives the clock across the gap to the next domain.
     pub fn domain_boundary() -> Self {
-        // 0x1111f100 = 0001 0001 0001 0001 1111 0001 0000 0000
         Self {
-            strengths: [0x0, 0x0, 0x1, 0xf, 0x1, 0x1, 0x1, 0x1],
+            clock_out: 0xf,
+            ..Self::normal()
         }
+    }
+
+    pub fn from_u32(value: u32) -> Self {
+        Self {
+            command_out: (value & 0xf) as u8,
+            busy_out: (value >> 4 & 0xf) as u8,
+            reset_out: (value >> 8 & 0xf) as u8,
+            clock_out: (value >> 12 & 0xf) as u8,
+            response_out: (value >> 16 & 0xf) as u8,
+            unexplained: value & 0xfff0_0000,
+        }
+    }
+
+    pub fn to_u32(&self) -> u32 {
+        self.unexplained
+            | (self.response_out as u32) << 16
+            | (self.clock_out as u32) << 12
+            | (self.reset_out as u32) << 8
+            | (self.busy_out as u32) << 4
+            | self.command_out as u32
+    }
+
+    /// Get the raw bytes for testing
+    pub fn as_bytes(&self) -> [u8; 4] {
+        (*self).into()
     }
 }
 
 impl From<IoDriverStrength> for [u8; 4] {
     fn from(strength: IoDriverStrength) -> Self {
-        // Pack 8 4-bit values into 4 bytes (2 per byte)
-        // Each byte contains two strength values: [high_nibble|low_nibble]
-        [
-            strength.strengths[0] | (strength.strengths[1] << 4),
-            strength.strengths[2] | (strength.strengths[3] << 4),
-            strength.strengths[4] | (strength.strengths[5] << 4),
-            strength.strengths[6] | (strength.strengths[7] << 4),
-        ]
-    }
-}
-
-impl IoDriverStrength {
-    /// Get the raw bytes for testing
-    pub fn as_bytes(&self) -> [u8; 4] {
-        (*self).into()
+        // Unlike most registers, captures show this register's value
+        // big-endian on the wire: 0x0001F111 is sent as 00 01 F1 11.
+        strength.to_u32().to_be_bytes()
     }
 }
 
@@ -610,12 +643,7 @@ impl Register {
             RegisterAddress::Core => Register::Core { raw_value },
             RegisterAddress::AnalogMux => Register::AnalogMux { raw_value },
             RegisterAddress::IoDriverStrength => {
-                // Parse driver strength from raw value
-                let mut strengths = [0u8; 8];
-                for (i, strength) in strengths.iter_mut().enumerate() {
-                    *strength = ((raw_value >> (i * 4)) & 0xf) as u8;
-                }
-                Register::IoDriverStrength(IoDriverStrength { strengths })
+                Register::IoDriverStrength(IoDriverStrength::from_u32(raw_value))
             }
             RegisterAddress::Pll3Parameter => Register::Pll3Parameter { raw_value },
             RegisterAddress::VersionMask => {
@@ -1330,11 +1358,11 @@ mod init_tests {
             register: Register::IoDriverStrength(strength),
             ..
         } = first_boundary
-        {
             assert_eq!(*chip_address, 0x08); // 5th chip (index 4) * 2
             let strength_bytes: [u8; 4] = (*strength).into();
-            // Expected bytes from hardware capture
-            assert_eq!(strength_bytes, [0x00, 0xf1, 0x11, 0x11]);
+            // Expected bytes from hardware capture: clock output at max (0xF)
+            assert_eq!(strength_bytes, [0x00, 0x01, 0xf1, 0x11]);
+            assert_eq!(IoDriverStrength::normal().as_bytes(), [0x00, 0x01, 0x11, 0x11]);
         }
     }
 
@@ -2742,11 +2770,7 @@ impl BM13xxProtocol {
             RegisterAddress::Core => Register::Core { raw_value: value },
             RegisterAddress::AnalogMux => Register::AnalogMux { raw_value: value },
             RegisterAddress::IoDriverStrength => {
-                let mut strengths = [0u8; 8];
-                for (i, strength) in strengths.iter_mut().enumerate() {
-                    *strength = ((value >> (i * 4)) & 0xf) as u8;
-                }
-                Register::IoDriverStrength(IoDriverStrength { strengths })
+                Register::IoDriverStrength(IoDriverStrength::from_u32(value))
             }
             RegisterAddress::Pll3Parameter => Register::Pll3Parameter { raw_value: value },
             RegisterAddress::VersionMask => {
