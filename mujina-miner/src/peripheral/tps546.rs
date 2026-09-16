@@ -571,6 +571,12 @@ impl<I2C: I2c> Tps546<I2C> {
         Ok((volts * 1000.0) as u32)
     }
 
+    /// Whether the output is commanded on (OPERATION bit 7).
+    pub async fn output_enabled(&mut self) -> Result<bool> {
+        let op = self.read_byte(PmbusCommand::Operation).await?;
+        Ok(op & pmbus::Operation::On.as_u8() != 0)
+    }
+
     /// Read output current in milliamps
     pub async fn get_iout(&mut self) -> Result<u32> {
         // Set phase to 0xFF to read all phases
