@@ -29,7 +29,7 @@ use crate::{
         },
         hash_thread::HashThread,
     },
-    board::fan_control::FanController,
+    board::fan_control::{FanControl, FanController},
     hw_trait::{
         gpio::{Gpio, GpioPin, PinValue},
         i2c::I2c,
@@ -241,7 +241,7 @@ async fn create_from_usb(device: UsbDeviceInfo, firmware: Firmware) -> Result<Ba
         chip_model: "BM1370",
         chip_count: 1,
         thread_count: threads.len() as u32,
-        fan: FanController::default(),
+        fan: FanController::new(FanControl::Manual { percent: 100 }),
         freq_control,
         current_freq_mhz: bm13xx::thread::TARGET_FREQUENCY_MHZ,
         over_temp_count: 0,
@@ -428,9 +428,14 @@ impl Bitaxe {
             let mut reg = self.regulator.lock().await;
 
             if let Err(e) = reg.check_status().await {
-                error!("Power controller fault: {}", e);
-                if let Err(e) = reg.clear_faults().await {
-                    error!("Failed to clear faults: {}", e);
+                let err_str = e.to_string();
+                if err_str.contains("timeout") || err_str.contains("TimedOut") {
+                    warn!("Power controller status read timed out: {}", e);
+                } else {
+                    error!("Power controller fault: {}", e);
+                    if let Err(e) = reg.clear_faults().await {
+                        error!("Failed to clear faults: {}", e);
+                    }
                 }
             }
 

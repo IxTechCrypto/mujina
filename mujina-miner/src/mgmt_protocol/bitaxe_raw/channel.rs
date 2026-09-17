@@ -59,7 +59,7 @@ impl ControlChannel {
         inner.writer.send(packet).await?;
 
         // Wait for response with matching ID
-        let timeout = Duration::from_secs(1);
+        let timeout = Duration::from_millis(2500);
         let response = time::timeout(timeout, async {
             match inner.reader.next().await {
                 Some(Ok(resp)) => {
