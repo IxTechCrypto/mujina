@@ -2,20 +2,18 @@
 # Usage: .\start-mujina.ps1
 
 $here = $PSScriptRoot
-$exe = Join-Path $here "mujina-minerd.exe"
+$candidates = @(
+    (Join-Path $here "mujina-minerd.exe"),
+    (Join-Path $here "target\release\mujina-minerd.exe"),
+    (Join-Path $here "target\debug\mujina-minerd.exe")
+) | Where-Object { Test-Path $_ } | Sort-Object { (Get-Item $_).LastWriteTime } -Descending
 
-# Fallback: check target\release\ or target\debug\ if not in root
-if (-not (Test-Path $exe)) {
-    $exe = Join-Path $here "target\release\mujina-minerd.exe"
-}
-if (-not (Test-Path $exe)) {
-    $exe = Join-Path $here "target\debug\mujina-minerd.exe"
-}
-
-if (-not (Test-Path $exe)) {
-    Write-Host "Error: mujina-minerd.exe binary not found at $here\mujina-minerd.exe or target\release\mujina-minerd.exe" -ForegroundColor Red
+if ($candidates.Count -eq 0) {
+    Write-Host "Error: mujina-minerd.exe binary not found at $here\mujina-minerd.exe or target\[release|debug]\mujina-minerd.exe" -ForegroundColor Red
     exit 1
 }
+$exe = $candidates[0]
+Write-Host "Using binary: $exe (built $((Get-Item $exe).LastWriteTime))" -ForegroundColor DarkGray
 
 # If already running, stop it gracefully first
 $running = Get-Process -Name "mujina-minerd" -ErrorAction SilentlyContinue
