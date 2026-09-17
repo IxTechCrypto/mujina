@@ -282,8 +282,16 @@ impl AsyncRead for SerialReader {
         let before = buf.filled().len();
         let mut stream = self.inner.stream.write();
         let result = Pin::new(&mut *stream).poll_read(cx, buf);
-        if result.is_ready() {
-            let n = buf.filled().len() - before;
+        let n = buf.filled().len() - before;
+        if let Poll::Ready(Ok(())) = &result {
+            if n == 0 && buf.remaining() > 0 {
+                // On Windows, ReadFile can return 0 bytes when no data is in the RX buffer.
+                // A hardware serial port NEVER has an EOF. Returning 0 bytes to Tokio causes
+                // FramedRead to immediately drop the connection ("Control stream closed").
+                // Instead, yield and re-poll until data arrives or the command timeout fires.
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
             if n > 0 {
                 self.inner.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
             }
