@@ -1,5 +1,9 @@
+param(
+    [switch]$Foreground
+)
+
 # PowerShell script to start the Mujina miner daemon on Windows.
-# Usage: .\start-mujina.ps1
+# Usage: .\start-mujina.ps1 [-Foreground]
 
 $here = $PSScriptRoot
 $candidates = @(
@@ -39,8 +43,13 @@ if (-not (Test-Path $settings)) {
 }
 
 Write-Host "Starting Mujina miner daemon..." -ForegroundColor Green
-$proc = Start-Process -FilePath $exe -WorkingDirectory $here -PassThru
 
-Write-Host "Started Mujina (PID $($proc.Id))." -ForegroundColor Cyan
-Write-Host "  Pool: $poolDesc"
-Write-Host "  API : http://0.0.0.0:7785/api/v0/miner"
+if ($Foreground) {
+    Write-Host "Running in foreground..." -ForegroundColor Cyan
+    & $exe
+} else {
+    $proc = Start-Process -FilePath $exe -WorkingDirectory $here -PassThru
+    Write-Host "Started Mujina (PID $($proc.Id))." -ForegroundColor Cyan
+    Write-Host "  Pool: $poolDesc"
+    Write-Host "  API : http://0.0.0.0:7785/api/v0/miner"
+}

@@ -78,7 +78,6 @@ impl I2c for BitaxeRawI2c {
     }
 
     async fn write_read(&mut self, addr: u8, write: &[u8], read: &mut [u8]) -> Result<()> {
-        println!("DEBUG: write_read: addr = {:02x}, write = {:?}, mock = {}", addr, write, self.mock);
         if self.mock {
             read.fill(0);
             if addr == 0x4c { // EMC2101

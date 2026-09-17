@@ -318,8 +318,12 @@ impl Daemon {
             use tokio::signal::windows;
             match windows::ctrl_c() {
                 Ok(mut ctrl_c) => {
-                    ctrl_c.recv().await;
-                    info!("Received Ctrl-C.");
+                    if let Some(()) = ctrl_c.recv().await {
+                        info!("Received Ctrl-C.");
+                    } else {
+                        warn!("Ctrl-C stream closed (console detached); holding daemon open");
+                        std::future::pending::<()>().await;
+                    }
                 }
                 Err(e) => {
                     warn!("Ctrl-C stream unavailable ({e}); holding daemon open");

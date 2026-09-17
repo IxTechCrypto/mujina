@@ -236,7 +236,7 @@ impl TuneMode {
 }
 
 /// A frequency/voltage operating point.
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize, Serialize, ToSchema)]
 pub struct TuneSetpoint {
     pub frequency_mhz: f32,
     pub core_voltage_mv: u16,
@@ -978,6 +978,7 @@ struct SavedProfile {
     /// resumes as profile mode -- the same behavior they always had.
     #[serde(default)]
     target: Option<TuneTarget>,
+    #[serde(default)]
     setpoint: TuneSetpoint,
 }
 
