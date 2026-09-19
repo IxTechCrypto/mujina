@@ -9,3 +9,5 @@ __pycache__/
 graphify-out/
 mujina-autotune.json
 mujina-settings.json
+*.visual-check.*
+

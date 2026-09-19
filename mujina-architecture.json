@@ -1,0 +1,219 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Mujina ASIC Mining Architecture",
+    "output": "mujina-architecture.html",
+    "quality_profile": "showcase",
+    "animation": "trace",
+    "repository": {
+      "url": "https://github.com/256foundation/mujina.git",
+      "revision": "7a8b281c94a9ca58cb63104c55432471a2f718c3",
+      "provider": "github"
+    },
+    "viewBox": [1180, 620],
+    "views": [
+      {
+        "id": "mining-path",
+        "label": "Mining Pipeline",
+        "focus": ["pool", "stratum", "scheduler", "transport", "board-ctrl", "asics"],
+        "note": "Stratum V1 work dispatch, USB serial transmission, ASIC nonce search, and share verification."
+      },
+      {
+        "id": "telemetry-web",
+        "label": "Web Dashboard & Control",
+        "focus": ["dashboard-ui", "dashboard-srv", "daemon-api", "scheduler"],
+        "note": "Operator browser interface, proxy server, and daemon REST telemetry endpoints."
+      },
+      {
+        "id": "thermal-tuning",
+        "label": "Autotune & Fan Control",
+        "focus": ["autotune", "scheduler", "board-ctrl", "sensors"],
+        "note": "Closed-loop PI fan regulation, dynamic power caps, and frequency/voltage optimization."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "dashboard-ui",
+      "type": "frontend",
+      "label": "Dashboard UI",
+      "sublabel": "HTML5 / Tailwind",
+      "pos": [30, 80],
+      "size": [120, 64],
+      "sources": [
+        { "path": "dashboard.html", "line": 1, "label": "Web Interface" }
+      ]
+    },
+    {
+      "id": "dashboard-srv",
+      "type": "backend",
+      "label": "Web Server",
+      "sublabel": "Python :8088 Proxy",
+      "brand": "python",
+      "pos": [220, 80],
+      "size": [130, 64],
+      "sources": [
+        { "path": "dashboard.py", "line": 1, "label": "Proxy Server" }
+      ]
+    },
+    {
+      "id": "daemon-api",
+      "type": "backend",
+      "label": "Daemon API",
+      "sublabel": "Axum :7785 REST",
+      "brand": "rust",
+      "pos": [420, 80],
+      "size": [130, 64],
+      "sources": [
+        { "path": "mujina-miner/src/api/server.rs", "line": 1, "label": "API Server" }
+      ]
+    },
+    {
+      "id": "pool",
+      "type": "external",
+      "label": "Stratum Pool",
+      "sublabel": "TCP :3333 Stratum",
+      "tag": "Mining Pool",
+      "pos": [30, 230],
+      "size": [120, 64]
+    },
+    {
+      "id": "stratum",
+      "type": "backend",
+      "label": "Stratum Client",
+      "sublabel": "V1 Protocol",
+      "brand": "rust",
+      "pos": [220, 230],
+      "size": [130, 64],
+      "sources": [
+        { "path": "mujina-miner/src/stratum_v1/mod.rs", "line": 1, "label": "Stratum Client" }
+      ]
+    },
+    {
+      "id": "scheduler",
+      "type": "backend",
+      "label": "Job Scheduler",
+      "sublabel": "Work & Nonces",
+      "brand": "rust",
+      "pos": [420, 230],
+      "size": [130, 64],
+      "sources": [
+        { "path": "mujina-miner/src/scheduler.rs", "line": 1, "label": "Scheduler" }
+      ]
+    },
+    {
+      "id": "transport",
+      "type": "backend",
+      "label": "Serial Stream",
+      "sublabel": "CDC-ACM / Win32",
+      "brand": "rust",
+      "pos": [620, 230],
+      "size": [130, 64],
+      "sources": [
+        { "path": "mujina-miner/src/transport/serial.rs", "line": 1, "label": "Serial Transport" }
+      ]
+    },
+    {
+      "id": "board-ctrl",
+      "type": "cloud",
+      "label": "Board Driver",
+      "sublabel": "Bitaxe / NerdQAxe++",
+      "brand": "rust",
+      "pos": [820, 230],
+      "size": [130, 64],
+      "sources": [
+        { "path": "mujina-miner/src/board/mod.rs", "line": 1, "label": "Board Drivers" }
+      ]
+    },
+    {
+      "id": "asics",
+      "type": "database",
+      "label": "BM13xx Chips",
+      "sublabel": "1-Chip & 4-Chip Chains",
+      "pos": [1020, 230],
+      "size": [120, 64],
+      "sources": [
+        { "path": "mujina-miner/src/asic/bm13xx/protocol.rs", "line": 1, "label": "ASIC Protocol" }
+      ]
+    },
+    {
+      "id": "autotune",
+      "type": "backend",
+      "label": "Auto-Tuner",
+      "sublabel": "Dynamic Optimizer",
+      "brand": "rust",
+      "pos": [420, 380],
+      "size": [130, 64],
+      "sources": [
+        { "path": "mujina-miner/src/api/autotune.rs", "line": 1, "label": "AutoTuner Engine" }
+      ]
+    },
+    {
+      "id": "sensors",
+      "type": "security",
+      "label": "Fan & Thermal",
+      "sublabel": "PI Loop & I2C",
+      "brand": "rust",
+      "pos": [820, 380],
+      "size": [130, 64],
+      "sources": [
+        { "path": "mujina-miner/src/board/fan_control.rs", "line": 1, "label": "Fan Controller" }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Mujina Host Daemon (Windows / Linux Pi)",
+      "wraps": ["dashboard-srv", "daemon-api", "stratum", "scheduler", "transport", "autotune"]
+    },
+    {
+      "kind": "security-group",
+      "label": "Hardware Mining Target (Bitaxe / NerdQAxe++ / S19j)",
+      "wraps": ["board-ctrl", "asics", "sensors"]
+    }
+  ],
+  "connections": [
+    { "id": "ui-to-proxy", "from": "dashboard-ui", "to": "dashboard-srv", "label": "HTTP / SSE" },
+    { "id": "proxy-to-daemon", "from": "dashboard-srv", "to": "daemon-api", "label": "REST proxy" },
+    { "id": "scheduler-to-api", "from": "scheduler", "to": "daemon-api", "label": "telemetry" },
+    { "id": "pool-to-stratum", "from": "pool", "to": "stratum", "label": "Stratum V1", "variant": "emphasis" },
+    { "id": "stratum-to-sched", "from": "stratum", "to": "scheduler", "label": "jobs", "labelDy": -26 },
+    { "id": "sched-to-transport", "from": "scheduler", "to": "transport", "label": "UART frames", "variant": "emphasis" },
+    { "id": "transport-to-board", "from": "transport", "to": "board-ctrl", "label": "USB serial", "variant": "emphasis" },
+    { "id": "board-to-asics", "from": "board-ctrl", "to": "asics", "label": "SPI chain", "variant": "emphasis" },
+    { "id": "sched-to-autotune", "from": "scheduler", "to": "autotune", "label": "hashrate", "labelDy": 28 },
+    { "id": "board-to-sensors", "from": "board-ctrl", "to": "sensors", "label": "I2C bus", "labelDy": 28 },
+    { "id": "sensors-to-autotune", "from": "sensors", "to": "autotune", "label": "thermal data" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Mining Pipeline",
+      "items": [
+        "Stratum V1 async subscription & job distribution",
+        "Cross-platform USB CDC-ACM serial framing",
+        "BM1366/BM1368/BM1370 multi-chip nonce search"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Multi-Miner Fleet Support",
+      "items": [
+        "Bitaxe Gamma (1x BM1370, 500 GH/s, 15W)",
+        "NerdQAxe++ 4-chip chain (4.4 TH/s, 62W)",
+        "Antminer S19j Pro 3-chain enterprise rig"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Operator Dashboard & Tooling",
+      "items": [
+        "Python proxy with persistent JSON settings",
+        "Live console log tailing with ANSI parsing",
+        "Flashing & provisioning integration via Torii"
+      ]
+    }
+  ]
+}

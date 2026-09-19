@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1080, height=1920" />
+    <title>MUJINA // Open-Source Bitcoin Mining Firmware (Vertical)</title>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 0;
+        background: #05060c;
+        color: #ffffff;
+        font-family: sans-serif;
+        overflow: hidden;
+      }
+      #root {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background-color: #05060c;
+        background-image:
+          linear-gradient(rgba(0, 240, 255, 0.06) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(0, 240, 255, 0.06) 1px, transparent 1px);
+        background-size: 40px 40px;
+      }
+      .clip {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        height: 100%;
+        padding: 60px 40px;
+      }
+      .ambient-glow {
+        position: absolute;
+        width: 900px;
+        height: 900px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(0, 240, 255, 0.18) 0%, transparent 70%);
+        pointer-events: none;
+      }
+      .ambient-glow-mag {
+        position: absolute;
+        width: 900px;
+        height: 900px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(255, 46, 151, 0.18) 0%, transparent 70%);
+        pointer-events: none;
+      }
+      .cyber-tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        padding: 12px 28px;
+        border-radius: 6px;
+        background: rgba(0, 240, 255, 0.1);
+        border: 1px solid #00f0ff;
+        color: #00f0ff;
+        font-family: monospace;
+        font-size: 20px;
+        font-weight: 700;
+        letter-spacing: 3px;
+        text-transform: uppercase;
+        margin-bottom: 32px;
+        box-shadow: 0 0 24px rgba(0, 240, 255, 0.35);
+      }
+      .cyber-dot {
+        width: 12px;
+        height: 12px;
+        background: #00f0ff;
+        box-shadow: 0 0 12px #00f0ff;
+      }
+      .cyber-dot-mag {
+        width: 12px;
+        height: 12px;
+        background: #ff2e97;
+        box-shadow: 0 0 12px #ff2e97;
+      }
+      .headline-cyber {
+        font-size: 64px;
+        font-weight: 900;
+        line-height: 1.15;
+        text-align: center;
+        max-width: 960px;
+        letter-spacing: 0.5px;
+        color: #ffffff;
+        margin: 0 0 28px 0;
+      }
+      .neon-cyan {
+        color: #00f0ff;
+        text-shadow: 0 0 35px rgba(0, 240, 255, 0.7);
+      }
+      .neon-mag {
+        color: #ff2e97;
+        text-shadow: 0 0 35px rgba(255, 46, 151, 0.7);
+      }
+      .neon-lime {
+        color: #c8ff00;
+        text-shadow: 0 0 35px rgba(200, 255, 0, 0.7);
+      }
+      .subtext {
+        font-size: 28px;
+        font-weight: 400;
+        color: #d6f7ff;
+        text-align: center;
+        max-width: 920px;
+        margin: 0;
+        line-height: 1.45;
+      }
+      .stack-panels {
+        display: flex;
+        flex-direction: column;
+        gap: 24px;
+        width: 960px;
+        margin-top: 36px;
+      }
+      .cyber-panel {
+        padding: 28px 32px;
+        background: linear-gradient(160deg, #0a0f1c, #070b14);
+        border: 1px solid #14243a;
+        border-left: 5px solid #00f0ff;
+        box-shadow: 0 16px 40px rgba(0, 0, 0, 0.8), 0 0 20px rgba(0, 240, 255, 0.15);
+        border-radius: 8px;
+        text-align: left;
+      }
+      .cyber-panel-mag {
+        border-left-color: #ff2e97;
+        box-shadow: 0 16px 40px rgba(0, 0, 0, 0.8), 0 0 20px rgba(255, 46, 151, 0.15);
+      }
+      .cyber-panel-lime {
+        border-left-color: #c8ff00;
+        box-shadow: 0 16px 40px rgba(0, 0, 0, 0.8), 0 0 20px rgba(200, 255, 0, 0.15);
+      }
+      .panel-label {
+        font-family: monospace;
+        font-size: 15px;
+        letter-spacing: 2px;
+        color: #94a3b8;
+        text-transform: uppercase;
+        margin-bottom: 8px;
+      }
+      .panel-val {
+        font-size: 38px;
+        font-weight: 900;
+        margin-bottom: 6px;
+      }
+      .panel-desc {
+        font-size: 20px;
+        color: #cbd5e1;
+        line-height: 1.4;
+        margin: 0;
+      }
+      .vertical-preview {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 24px;
+        width: 960px;
+        margin-top: 24px;
+      }
+      .arch-frame {
+        width: 960px;
+        height: 540px;
+        border-radius: 12px;
+        overflow: hidden;
+        border: 2px solid #00f0ff;
+        box-shadow: 0 0 40px rgba(0, 240, 255, 0.35);
+        background: #000;
+      }
+      .arch-img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+      .hud-telemetry {
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        width: 960px;
+      }
+      .hud-card {
+        background: #0a0f1c;
+        border: 1px solid #14243a;
+        padding: 20px 28px;
+        border-radius: 8px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      .hud-title {
+        font-family: monospace;
+        font-size: 18px;
+        letter-spacing: 2px;
+        color: #94a3b8;
+      }
+      .hud-metric {
+        font-family: monospace;
+        font-size: 32px;
+        font-weight: 800;
+      }
+      .terminal-box {
+        width: 960px;
+        background: #080c14;
+        border: 1px solid #00f0ff;
+        border-radius: 12px;
+        padding: 28px 32px;
+        font-family: monospace;
+        text-align: left;
+        box-shadow: 0 16px 50px rgba(0, 0, 0, 0.8), 0 0 30px rgba(0, 240, 255, 0.25);
+        margin-top: 36px;
+      }
+      .term-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        border-bottom: 1px solid #14243a;
+        padding-bottom: 12px;
+        margin-bottom: 16px;
+        font-size: 15px;
+        color: #94a3b8;
+        letter-spacing: 2px;
+      }
+      .term-cmd {
+        font-size: 26px;
+        color: #00f0ff;
+        margin: 10px 0;
+      }
+      .term-out {
+        font-size: 20px;
+        color: #c8ff00;
+        margin: 8px 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div
+      id="root"
+      data-composition-id="main"
+      data-start="0"
+      data-width="1080"
+      data-height="1920"
+      data-duration="20"
+    >
+      <!-- Background Audio -->
+      <audio id="bg-music" src="assets/music.mp3" data-start="0" data-duration="20"></audio>
+      <audio id="sfx-impact" src="assets/impact.ogg" data-start="0.2" data-duration="1.48"></audio>
+      <audio id="sfx-slide-1" src="assets/card-slide.ogg" data-start="4.1" data-duration="0.60"></audio>
+      <audio id="sfx-slide-2" src="assets/card-slide.ogg" data-start="9.1" data-duration="0.60"></audio>
+      <audio id="sfx-chip" src="assets/chip-lay.ogg" data-start="14.6" data-duration="0.17"></audio>
+
+      <!-- Scene 1: The Hook (0.0s - 4.0s) -->
+      <section id="scene-1" class="clip" data-start="0" data-duration="4">
+        <div class="ambient-glow"></div>
+        <div id="s1-tag" class="cyber-tag">
+          <span class="cyber-dot"></span>
+          Autonomous Mining Infrastructure
+        </div>
+        <h1 id="s1-headline" class="headline-cyber">
+          YOU BOUGHT THE <span class="neon-cyan">HARDWARE</span>.<br /><br />
+          WHY DOES SOMEONE ELSE <span class="neon-mag">CONTROL IT?</span>
+        </h1>
+        <p id="s1-subtext" class="subtext">
+          Closed firmware vendors skim your revenue and lock your silicon behind secret binaries.
+        </p>
+      </section>
+
+      <!-- Scene 2: The Core Liberation (4.0s - 9.0s) -->
+      <section id="scene-2" class="clip" data-start="4" data-duration="5">
+        <div class="ambient-glow-mag"></div>
+        <div id="s2-tag" class="cyber-tag" style="border-color: #ff2e97; color: #ff2e97; background: rgba(255, 46, 151, 0.1);">
+          <span class="cyber-dot-mag"></span>
+          Universal Open-Source ASIC Firmware
+        </div>
+        <h2 id="s2-headline" class="headline-cyber" style="font-size: 52px; margin-bottom: 8px;">
+          RUN YOUR HASHBOARDS<br /><span class="neon-lime">WITHOUT PERMISSION</span>
+        </h2>
+        <div id="s2-panels" class="stack-panels">
+          <div class="cyber-panel">
+            <div class="panel-label">REVENUE PROTECTION</div>
+            <div class="panel-val neon-cyan">0% DEV FEE</div>
+            <p class="panel-desc">Keep 100% of your hashrate. Zero hidden dev-shares diverted to third-party wallets.</p>
+          </div>
+          <div class="cyber-panel cyber-panel-mag">
+            <div class="panel-label">HARDWARE AGNOSTIC</div>
+            <div class="panel-val neon-mag">ANY HASHBOARD</div>
+            <p class="panel-desc">Drive Bitaxe Gamma, BM1370, BM1362, EmberOne00, Antminer S19, and Libreboard.</p>
+          </div>
+          <div class="cyber-panel cyber-panel-lime">
+            <div class="panel-label">CORE SYSTEM</div>
+            <div class="panel-val neon-lime">WRITTEN IN RUST</div>
+            <p class="panel-desc">Memory-safe, high-performance concurrency with async Stratum v1 protocol engine.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Scene 3: The Architecture & Telemetry (9.0s - 14.5s) -->
+      <section id="scene-3" class="clip" data-start="9" data-duration="5.5">
+        <div class="ambient-glow"></div>
+        <div id="s3-tag" class="cyber-tag">
+          <span class="cyber-dot"></span>
+          Fleet Telemetry &amp; Modular HAL
+        </div>
+        <div id="s3-content" class="vertical-preview">
+          <div id="s3-arch" class="arch-frame">
+            <img class="arch-img" src="assets/architecture.png" alt="Mujina Architecture" />
+          </div>
+          <div id="s3-hud" class="hud-telemetry">
+            <div class="hud-card">
+              <span class="hud-title">REALTIME HASHRATE</span>
+              <span class="hud-metric neon-cyan">1.28 TH/s</span>
+            </div>
+            <div class="hud-card">
+              <span class="hud-title">POWER EFFICIENCY</span>
+              <span class="hud-metric neon-lime">18.4 J/TH</span>
+            </div>
+            <div class="hud-card">
+              <span class="hud-title">ACTIVE DEV FEE</span>
+              <span class="hud-metric neon-mag">0.00%</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Scene 4: Outro & Terminal (14.5s - 20.0s) -->
+      <section id="scene-4" class="clip" data-start="14.5" data-duration="5.5">
+        <div class="ambient-glow"></div>
+        <h1 id="s4-brand" class="headline-cyber" style="font-size: 76px; margin-bottom: 12px;">
+          MUJINA <span class="neon-cyan">//</span> MINER
+        </h1>
+        <p id="s4-tagline" class="subtext" style="color: #c8ff00; font-weight: 700; font-size: 36px; letter-spacing: 2px; margin-bottom: 32px;">
+          OWN YOUR FIRMWARE.
+        </p>
+        <p class="subtext" style="font-size: 24px; color: #94a3b8; margin-bottom: 24px;">
+          No dev fee • No vendor lock-in • Fully verifiable
+        </p>
+        <div id="s4-term" class="terminal-box">
+          <div class="term-header">
+            <span>TERMINAL // MUJINA-DAEMON</span>
+            <span>STRATUM v1 READY</span>
+          </div>
+          <div class="term-cmd">$ cargo run --bin mujina-minerd</div>
+          <div class="term-out">[INFO] Hardware HAL: BM1370 ASIC detected</div>
+          <div class="term-out">[INFO] Stratum v1 pool connected · 0% fee diversion</div>
+        </div>
+      </section>
+    </div>
+
+    <script>
+      const tl = gsap.timeline({ paused: true });
+
+      // Scene 1 animations
+      tl.from("#s1-tag", { y: -30, opacity: 0, duration: 0.6, ease: "power3.out" }, 0.2);
+      tl.from("#s1-headline", { scale: 0.9, opacity: 0, duration: 0.8, ease: "power4.out" }, 0.4);
+      tl.from("#s1-subtext", { y: 20, opacity: 0, duration: 0.6, ease: "power2.out" }, 1.0);
+
+      // Scene 2 animations
+      tl.from("#s2-tag", { y: -20, opacity: 0, duration: 0.5, ease: "power3.out" }, 4.1);
+      tl.from("#s2-headline", { scale: 0.95, opacity: 0, duration: 0.7, ease: "power3.out" }, 4.3);
+      tl.from("#s2-panels .cyber-panel", {
+        x: -40,
+        opacity: 0,
+        duration: 0.5,
+        stagger: 0.2,
+        ease: "power3.out"
+      }, 4.8);
+
+      // Scene 3 animations
+      tl.from("#s3-tag", { y: -20, opacity: 0, duration: 0.5, ease: "power3.out" }, 9.1);
+      tl.from("#s3-arch", { scale: 0.9, opacity: 0, duration: 0.8, ease: "power3.out" }, 9.3);
+      tl.from("#s3-hud .hud-card", {
+        y: 30,
+        opacity: 0,
+        duration: 0.5,
+        stagger: 0.15,
+        ease: "power3.out"
+      }, 9.8);
+
+      // Scene 4 animations
+      tl.from("#s4-brand", { scale: 0.8, opacity: 0, duration: 0.8, ease: "back.out(1.4)" }, 14.7);
+      tl.from("#s4-tagline", { opacity: 0, duration: 0.5, ease: "power2.out" }, 15.2);
+      tl.from("#s4-term", { y: 30, opacity: 0, duration: 0.6, ease: "power3.out" }, 15.6);
+
+      window.__timelines = window.__timelines || {};
+      window.__timelines["main"] = tl;
+    </script>
+  </body>
+</html>

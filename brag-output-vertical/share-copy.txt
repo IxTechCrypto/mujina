@@ -1,0 +1,5 @@
+You bought the ASIC hardware, but closed firmware controls it.
+
+Mujina changes that: the first truly open-source Bitcoin mining firmware written in Rust. Drive any hashboard from any vendor on any control board with zero dev fees, real-time fleet telemetry, and complete hardware autonomy.
+
+Own your firmware: cargo run --bin mujina-minerd

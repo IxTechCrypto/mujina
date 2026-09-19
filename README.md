@@ -2,6 +2,42 @@
 
 Open-source Bitcoin mining firmware.
 
+## ⚡ IxTech Distribution — Repository Updates & Windows Bring-Up
+
+This repository ([`IxTechCrypto/mujina`](https://github.com/IxTechCrypto/mujina)) is an active, production-hardened fork of [256foundation/mujina](https://github.com/256foundation/mujina) engineered for enterprise stability, native Windows USB CDC-ACM support, multi-chip ASIC bring-up, real-time fleet telemetry, and automated fan/frequency autotuning.
+
+### 🚀 Major Improvements & Features in this Fork
+
+* **🪟 Native Windows Transport & CDC-ACM Hardening**:
+  * **Custom Win32 Serial Driver (`src/transport/serial_windows.rs`)**: Complete native Windows `SerialStream` implementation utilizing Win32 overlapped asynchronous I/O and custom byte ringbuffers, eliminating external Unix serial dependencies.
+  * **0-Byte EOF Prevention**: Intercepts 0-byte `ReadFile` in `SerialReader::poll_read` on Windows to return `Poll::Pending` with waker re-poll instead of premature EOF, permanently resolving `Control stream closed` errors during board initialization.
+  * **COM Port Lifecycle Resiliency**: DTR/RTS auto-reset pulse handling, port settling delay, and COM handle preservation preventing USB disconnects.
+  * **Detached Console Protection**: Graceful handling of `tokio::signal::windows::ctrl_c` disconnections so the daemon stays continuously hashing in background/headless runs.
+
+* **⛏️ Multi-Chip Hardware Bring-Up & Fleet Expansion**:
+  * **NerdQAxe++ (BM1366 4-Chip Chain)**: Full board driver (`src/board/nerdqaxe_pp.rs`), multi-chip PLL and chain enumeration, TI TPS53647 multi-phase core buck regulator driver, and Microchip EMC2302 dual-fan controller over I2C/PMBus.
+  * **Bitaxe Gamma Multi-Device Fleet Support**: Concurrently run multiple Bitaxe Gammas (BM1370) on Windows over native USB CDC-ACM without port collisions or key clashes (~1.7+ TH/s verified aggregate).
+  * **Per-Chip Hashrate & Thermal Telemetry**: Reports individual chip frequencies, core voltages, and temperatures in JSON REST APIs.
+
+* **🧠 Advanced Auto-Tuning Supervisor & Intelligent Cooling**:
+  * **AxeOS-Style Fan Controller**: Closed-loop PI fan controller with EMA smoothing to eliminate acoustic oscillation while locking target ASIC junction temperatures.
+  * **Adaptive Autotuner (`src/autotune.rs`)**: Dynamic frequency and core voltage tuning engine with multiple operational profiles (`Efficiency`, `Balanced`, `Max Hash`, `Target Power/Hashrate`).
+  * **Chip-Count Scaled Power Capping**: Dynamic power cap calculations that scale by active ASIC count to prevent false trip-offs on multi-chip boards.
+  * **Profile Persistence**: State-saving to `mujina-autotune.json` with fallback mechanisms and delta updates.
+
+* **📊 Cyberpunk Fleet HUD & Real-Time Telemetry Dashboard**:
+  * **Interactive Web Interface**: Live responsive web dashboard (`dashboard.html` / `dashboard.py`) hosted on port 8088.
+  * **Sub-50ms Delta Updates**: Decoupled control modals submit only modified settings, eliminating board timeout errors.
+  * **Memory-Capped Log Viewer**: Real-time log streaming capped at 500 DOM elements to prevent browser lag during long runs.
+  * **Promoted Mining Logs**: Elevated share submission, pool acceptance, and pool difficulty updates to `INFO` level for transparent live monitoring.
+
+* **🍓 Raspberry Pi 4 & Embedded Linux Deployment**:
+  * Complete headless deployment configuration for Raspberry Pi 4 (Debian aarch64) with native systemd service daemons (`mujina-miner`, `mujina-dashboard`).
+  * **Waveshare 2.13" V4 E-Paper HUD**: Live hardware status monitor (`scripts/waveshare_epaper_monitor.py`) displaying real-time hashrate, temperatures, pool latency, and network IP.
+
+* **🎬 Launch Media & Cross-Platform Distribution (`brag-output/`)**:
+  * High-production 1080p and 9:16 vertical launch videos, visual storyboards, poster frames, and ready-to-publish social media copy (`social-posts.md`) formatted for Twitter/X, Facebook, TikTok, and YouTube Shorts.
+
 ## Why Mujina
 
 You bought the hardware, but someone else controls the software. Whether
