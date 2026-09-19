@@ -35,9 +35,6 @@ This repository ([`IxTechCrypto/mujina`](https://github.com/IxTechCrypto/mujina)
   * Complete headless deployment configuration for Raspberry Pi 4 (Debian aarch64) with native systemd service daemons (`mujina-miner`, `mujina-dashboard`).
   * **Waveshare 2.13" V4 E-Paper HUD**: Live hardware status monitor (`scripts/waveshare_epaper_monitor.py`) displaying real-time hashrate, temperatures, pool latency, and network IP.
 
-* **🎬 Launch Media & Cross-Platform Distribution (`brag-output/`)**:
-  * High-production 1080p and 9:16 vertical launch videos, visual storyboards, poster frames, and ready-to-publish social media copy (`social-posts.md`) formatted for Twitter/X, Facebook, TikTok, and YouTube Shorts.
-
 ## Why Mujina
 
 You bought the hardware, but someone else controls the software. Whether
