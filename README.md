@@ -15,7 +15,7 @@ This repository ([`IxTechCrypto/mujina`](https://github.com/IxTechCrypto/mujina)
   * **Detached Console Protection**: Graceful handling of `tokio::signal::windows::ctrl_c` disconnections so the daemon stays continuously hashing in background/headless runs.
 
 * **⛏️ Multi-Chip Hardware Bring-Up & Fleet Expansion**:
-  * **NerdQAxe++ (BM1366 4-Chip Chain)**: Full board driver (`src/board/nerdqaxe_pp.rs`), multi-chip PLL and chain enumeration, TI TPS53647 multi-phase core buck regulator driver, and Microchip EMC2302 dual-fan controller over I2C/PMBus.
+  * **NerdQAxe++ (BM1370 4-Chip Chain)**: Full board driver (`src/board/nerdqaxe_pp.rs`), multi-chip PLL and chain enumeration, TI TPS53647 multi-phase core buck regulator driver, and Microchip EMC2302 dual-fan controller over I2C/PMBus.
   * **Bitaxe Gamma Multi-Device Fleet Support**: Concurrently run multiple Bitaxe Gammas (BM1370) on Windows over native USB CDC-ACM without port collisions or key clashes (~1.7+ TH/s verified aggregate).
   * **Per-Chip Hashrate & Thermal Telemetry**: Reports individual chip frequencies, core voltages, and temperatures in JSON REST APIs.
 
