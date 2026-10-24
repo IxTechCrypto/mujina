@@ -3,6 +3,8 @@ pub(crate) mod cpu;
 pub(crate) mod emberone00;
 #[cfg(feature = "nano3s")]
 pub(crate) mod nano3s;
+pub(crate) mod nano3s_owner_tune;
+pub(crate) mod nano3s_tuner_core;
 pub mod pattern;
 
 use anyhow::Result;

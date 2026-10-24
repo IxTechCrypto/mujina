@@ -43,6 +43,8 @@ use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256d;
 use tokio::sync::{mpsc, watch};
 
+use super::nano3s_owner_tune::{self as owner, OwnerCmd, OwnerTune};
+use super::nano3s_tuner_core::{TuneProfile, TuneSetpoint};
 use super::{BackplaneConnector, BoardInfo, VirtualBoardDescriptor};
 use crate::api_client::types::{
     BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor, ThreadTelemetry,
@@ -1266,6 +1268,10 @@ struct PersistedTuning {
     /// resumes searching from where it left off instead of restarting
     /// from the middle.
     autotune_level: Option<f64>,
+    /// Owner-tuner profile (`owner_tune:` directive). `Some` means the owner
+    /// tuner owns frequency+voltage+fan escalation and the three aadhi loops
+    /// above are forced off, at startup and live. `None` = off (default).
+    owner_tune_profile: Option<TuneProfile>,
 }
 
 /// Reads [`TUNING_CONF_PATH`], or all-`None` if missing/unparseable --
@@ -1297,6 +1303,7 @@ fn load_tuning() -> PersistedTuning {
                 cfg.autotune_hashrate_target_ths = value.parse::<f64>().ok()
             }
             "autotune_level" => cfg.autotune_level = value.parse::<f64>().ok(),
+            "owner_tune_profile" => cfg.owner_tune_profile = owner::parse_directive(value).ok().flatten(),
             _ => {}
         }
     }
@@ -1325,6 +1332,12 @@ fn write_tuning_conf(cfg: &PersistedTuning) {
     }
     if let Some(l) = cfg.autotune_level {
         out.push_str(&format!("autotune_level={l}\n"));
+    }
+    if let Some(p) = cfg.owner_tune_profile {
+        out.push_str(&format!(
+            "owner_tune_profile={}\n",
+            owner::directive_for(Some(p)).trim_start_matches("owner_tune:")
+        ));
     }
     if let Err(e) = std::fs::write(TUNING_CONF_PATH, out) {
         eprintln!("[nano3s] failed to write {TUNING_CONF_PATH}: {e}");
@@ -1385,6 +1398,32 @@ fn persist_autotune_hashrate_target(target_ths: Option<f64>) {
         cfg.autotune_level = Some(0.5);
     }
     write_tuning_conf(&cfg);
+}
+
+fn persist_owner_tune_profile(profile: Option<TuneProfile>) {
+    let mut cfg = load_tuning();
+    cfg.owner_tune_profile = profile;
+    write_tuning_conf(&cfg);
+}
+
+/// Turns the owner tuner off because a manual/aadhi control took over.
+/// Hands the fan back to auto if the tuner had forced it to 100 %.
+fn disable_owner_for_manual(owner: &mut OwnerTune, why: &str) {
+    if !owner.is_enabled() {
+        return;
+    }
+    if let Some(OwnerCmd::Fan(t)) = owner.disable() {
+        write_harness_control(t);
+    }
+    persist_owner_tune_profile(None);
+    eprintln!("[nano3s] owner-tune: disabled by {why}");
+}
+
+/// Queues an `owner_tune:<profile|off>` directive for the run loop. The
+/// worker persists the choice when it consumes the directive. Shares the
+/// single-slot control file with every other writer: space calls >= 5 s.
+pub(crate) fn write_owner_tune_command(profile: Option<TuneProfile>) -> std::io::Result<()> {
+    std::fs::write(MUJINA_CONTROL_FILE, owner::directive_for(profile))
 }
 
 fn persist_autotune_level(level: f64) {
@@ -2147,7 +2186,10 @@ fn run_worker(
     // disabled autotune as a side effect (same failure class as the
     // persisted-field version of this bug, fixed the same day, via a
     // path that fix didn't close).
-    let mut power_target_w: Option<f64> = if persisted_tuning.autotune_hashrate_target_ths.is_some() {
+    let mut power_target_w: Option<f64> = if !owner::startup_loop_allowed(
+        persisted_tuning.owner_tune_profile,
+        persisted_tuning.autotune_hashrate_target_ths,
+    ) {
         None
     } else {
         persisted_tuning.power_target_w.or_else(|| {
@@ -2170,7 +2212,10 @@ fn run_worker(
     // above -- no env var fallback exists for this one today, but this
     // keeps the invariant explicit rather than relying on that being
     // true forever.
-    let mut temp_target_c: Option<f64> = if persisted_tuning.autotune_hashrate_target_ths.is_some() {
+    let mut temp_target_c: Option<f64> = if !owner::startup_loop_allowed(
+        persisted_tuning.owner_tune_profile,
+        persisted_tuning.autotune_hashrate_target_ths,
+    ) {
         None
     } else {
         persisted_tuning.temp_target_c
@@ -2209,6 +2254,17 @@ fn run_worker(
     let mut next_autotune_check = std::time::Instant::now() + AUTOTUNE_CHECK_INTERVAL;
     let mut autotune_over_ticks: u32 = 0;
     let mut next_autotune_forced_check = std::time::Instant::now();
+    // Owner tuner (IxTech AutoTuner) -- OFF unless a profile is persisted or
+    // set via `owner_tune:`. While on, power_target_w / temp_target_c /
+    // autotune_hashrate_target_ths are all None (startup guards above, and
+    // the `owner_tune:` arm). aadhi's PSU safety trip and the 97C backstop
+    // below keep running and win over it.
+    let mut owner = OwnerTune::new();
+    if let Some(p) = persisted_tuning.owner_tune_profile {
+        owner.enable(p);
+        eprintln!("[nano3s] owner-tune: resumed profile {p:?} from {TUNING_CONF_PATH}");
+    }
+    owner.publish(None);
 
     loop {
         // Poll for an external pause/resume via MUJINA_CONTROL_FILE,
@@ -2243,6 +2299,40 @@ fn run_worker(
                 manual_pause = false;
                 eprintln!("[nano3s] manual RESUME via {MUJINA_CONTROL_FILE} (reapplied pll_freq={last_applied_pll_freq:?} voltage_mv={last_applied_voltage_mv:?})");
             }
+            Some(s) if s.starts_with("owner_tune:") => {
+                match owner::parse_directive(&s["owner_tune:".len()..]) {
+                    Ok(Some(profile)) => {
+                        // Exclusive: the owner tuner takes over frequency,
+                        // voltage and fan escalation; aadhi's loops go off
+                        // (live and persisted).
+                        owner::clear_other_loops(
+                            &mut power_target_w,
+                            &mut temp_target_c,
+                            &mut autotune_hashrate_target_ths,
+                        );
+                        persist_tuning_clear_power_target();
+                        persist_tuning_clear_temp_target();
+                        persist_autotune_hashrate_target(None);
+                        persist_owner_tune_profile(Some(profile));
+                        // Keep the throttle/PSU ceilings in step with the
+                        // clock we start from (stale-ceiling bug).
+                        temp_throttle_base_freq = last_applied_pll_freq;
+                        psu_ceiling_freq = last_applied_pll_freq;
+                        owner.enable(profile);
+                        owner.publish(None);
+                        eprintln!("[nano3s] owner-tune: enabled profile {profile:?} (power-target/temp-target/autotune-hashrate disabled)");
+                    }
+                    Ok(None) => {
+                        if let Some(OwnerCmd::Fan(t)) = owner.disable() {
+                            write_harness_control(t);
+                        }
+                        persist_owner_tune_profile(None);
+                        owner.publish(None);
+                        eprintln!("[nano3s] owner-tune: disabled via dashboard/API");
+                    }
+                    Err(()) => eprintln!("[nano3s] malformed owner_tune directive: {s}"),
+                }
+            }
             Some(s) if s.starts_with("tune:") => {
                 // A manual command always wins over the autotuner --
                 // same "explicit action overrides automatic" precedent
@@ -2252,6 +2342,7 @@ fn run_worker(
                     persist_autotune_hashrate_target(None);
                     eprintln!("[nano3s] autotune: disabled by manual tune command");
                 }
+                disable_owner_for_manual(&mut owner, "manual tune command");
                 // See write_tuning_command()'s doc comment for the exact
                 // "always 7 fields" wire format this expects.
                 let fields: Vec<&str> = s["tune:".len()..].split(',').collect();
@@ -2330,6 +2421,7 @@ fn run_worker(
                             // rather than waiting out the old interval.
                             next_power_check = std::time::Instant::now();
                             eprintln!("[nano3s] power-target: live target set to {w:.1}W via dashboard/API");
+                            disable_owner_for_manual(&mut owner, "manual power-target command");
                         }
                         Err(_) => eprintln!("[nano3s] malformed power_target directive: {s}"),
                     }
@@ -2369,6 +2461,7 @@ fn run_worker(
                             }
                             temp_target_c = Some(c);
                             eprintln!("[nano3s] temp-target: live target set to {c:.1}C via dashboard/API");
+                            disable_owner_for_manual(&mut owner, "manual temp-target command");
                         }
                         Err(_) => eprintln!("[nano3s] malformed temp_target directive: {s}"),
                     }
@@ -2394,6 +2487,7 @@ fn run_worker(
                             // that the manual-command guard mistook for
                             // a real user command and used to disable
                             // autotune again.
+                            disable_owner_for_manual(&mut owner, "manual autotune-hashrate command");
                             power_target_w = None;
                             temp_target_c = None;
                             persist_tuning_clear_power_target();
@@ -2583,7 +2677,22 @@ fn run_worker(
                     eprintln!(
                         "[nano3s] PSU safety trip: power={power_w:.1}W exceeds ceiling={effective_safety_w:.1}W (no power-target configured) cur={cur_mv}mV -> {new_mv}mV"
                     );
-                    if let Err(e) = write_tuning_command(None, Some(new_mv as u32), None, None) {
+                    if owner.is_enabled() {
+                        // Apply directly: a `tune:` directive would count as
+                        // a manual command and switch the owner tuner off.
+                        // Only ever lower voltage here (the clamp above can
+                        // otherwise lift it to POWER_TARGET_MIN_MV).
+                        if new_mv < cur_mv {
+                            let rc = unsafe { nano3s_ipc_set_voltage_raw(new_mv) };
+                            if rc != 0 {
+                                eprintln!("[nano3s] PSU safety trip: nano3s_ipc_set_voltage_raw failed");
+                            } else {
+                                last_applied_voltage_mv = Some(new_mv);
+                                persist_tuning_set(None, Some(new_mv as u32), None, None);
+                                owner.note_external_voltage(new_mv as u16);
+                            }
+                        }
+                    } else if let Err(e) = write_tuning_command(None, Some(new_mv as u32), None, None) {
                         eprintln!("[nano3s] PSU safety trip: failed to write tuning command: {e}");
                     }
                 }
@@ -2846,6 +2955,73 @@ fn run_worker(
             // Publish telemetry to the REST API's board registry. Modeled
             // as one HashThread == one ThreadTelemetry entry (the whole
             // 12-chip chain is a single HashThread).
+            // Owner tuner tick. Runs AFTER the PSU safety trip, temp-target,
+            // PSU freq-ceiling and combined frequency apply above, so it
+            // observes whatever they just did (last_applied_* are current)
+            // instead of fighting it.
+            if owner.is_enabled() {
+                owner.set_power_ceiling(owner::owner_power_ceiling(effective_safety_w));
+                if owner.tick_due(std::time::Instant::now()) {
+                    let volt_now = last_applied_voltage_mv.map(|v| v.max(0) as u32).unwrap_or(st.voltage_mv);
+                    let cmds: Vec<OwnerCmd> = if (st.temp_max as f64) >= owner::BACKSTOP_TEMP_C {
+                        let f = owner::backstop_freqs(last_applied_pll_freq);
+                        eprintln!(
+                            "[nano3s] owner-tune: {:.1}C backstop ({:.0}C) -- emergency clock drop {last_applied_pll_freq:?} -> {f:?}",
+                            st.temp_max,
+                            owner::BACKSTOP_TEMP_C
+                        );
+                        vec![OwnerCmd::SetMode(f)]
+                    } else if let Some(m) = owner::metrics_from_readings(
+                        st.temp_max,
+                        power_w,
+                        st.ghsspd,
+                        last_applied_pll_freq[0],
+                        volt_now,
+                        st.spd_dh,
+                    ) {
+                        owner.evaluate(&m)
+                    } else {
+                        Vec::new()
+                    };
+                    for cmd in cmds {
+                        match cmd {
+                            OwnerCmd::SetMode(f) => {
+                                let rc = unsafe { nano3s_ipc_set_mode(f.as_ptr(), 0) };
+                                if rc != 0 {
+                                    eprintln!("[nano3s] owner-tune: nano3s_ipc_set_mode failed");
+                                } else {
+                                    eprintln!("[nano3s] owner-tune: SET_MODE pll_freq={f:?}");
+                                    last_applied_pll_freq = f;
+                                    // Keep both ceilings at the new clock so
+                                    // neither clamps it back to a stale one.
+                                    temp_throttle_base_freq = f;
+                                    psu_ceiling_freq = f;
+                                    persist_tuning_set(Some(f), None, None, None);
+                                }
+                            }
+                            OwnerCmd::SetVoltage(mv) => {
+                                let rc = unsafe { nano3s_ipc_set_voltage_raw(mv) };
+                                if rc != 0 {
+                                    eprintln!("[nano3s] owner-tune: nano3s_ipc_set_voltage_raw failed");
+                                } else {
+                                    eprintln!("[nano3s] owner-tune: SET_VOLTAGE_RAW target_mv={mv}");
+                                    last_applied_voltage_mv = Some(mv);
+                                    persist_tuning_set(None, Some(mv as u32), None, None);
+                                }
+                            }
+                            OwnerCmd::Fan(t) => {
+                                eprintln!("[nano3s] owner-tune: harness {t}");
+                                write_harness_control(t);
+                            }
+                        }
+                    }
+                    owner.publish(Some(TuneSetpoint {
+                        frequency_mhz: last_applied_pll_freq[0] as f32,
+                        core_voltage_mv: last_applied_voltage_mv.unwrap_or(st.voltage_mv as i32).max(0) as u16,
+                    }));
+                }
+            }
+
             telemetry_tx.send_modify(|t| {
                 t.threads = vec![ThreadTelemetry {
                     name: "chain".into(),

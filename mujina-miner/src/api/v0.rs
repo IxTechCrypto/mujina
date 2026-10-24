@@ -15,6 +15,7 @@ use tokio::sync::oneshot;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::commands::SchedulerCommand;
+use crate::board::nano3s_owner_tune::{OwnerTuneRequest, OwnerTuneStatus};
 use super::server::SharedState;
 use crate::api_client::types::{
     AutotuneHashrateRequest, AutotuneHashrateResponse, BoardFanRequest, BoardLedRequest,
@@ -48,6 +49,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(patch_board_temp_target))
         .routes(routes!(get_board_psu, patch_board_psu))
         .routes(routes!(get_board_autotune_hashrate, patch_board_autotune_hashrate))
+        .routes(routes!(get_board_owner_tune, patch_board_owner_tune))
         .routes(routes!(patch_board_fan))
         .routes(routes!(get_board_fan_curve, patch_board_fan_curve))
         .routes(routes!(patch_board_pause))
@@ -568,6 +570,90 @@ async fn patch_board_autotune_hashrate(
     }
     #[cfg(not(feature = "nano3s"))]
     {
+        Err(StatusCode::NOT_IMPLEMENTED)
+    }
+}
+
+/// Read the owner-tuner state.
+#[utoipa::path(
+    get,
+    path = "/boards/{name}/owner-tune",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    responses(
+        (status = OK, description = "Current owner-tuner state", body = OwnerTuneStatus),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support the owner tuner"),
+    ),
+)]
+async fn get_board_owner_tune(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<Json<OwnerTuneStatus>, StatusCode> {
+    let known = state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .boards()
+        .into_iter()
+        .any(|b| b.name == name);
+    if !known {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    #[cfg(feature = "nano3s")]
+    {
+        Ok(Json(crate::board::nano3s_owner_tune::read_status()))
+    }
+    #[cfg(not(feature = "nano3s"))]
+    {
+        Err(StatusCode::NOT_IMPLEMENTED)
+    }
+}
+
+/// Enable (`quiet`/`efficient`/`balanced`/`max_hash`) or disable (`null`) the
+/// owner tuner. Enabling turns off power-target, temp-target and
+/// autotune-hashrate; enabling any of those, or a manual tune, turns it off.
+/// Shares the single-slot control file: space writes at least 5 s apart.
+#[utoipa::path(
+    patch,
+    path = "/boards/{name}/owner-tune",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    request_body = OwnerTuneRequest,
+    responses(
+        (status = OK, description = "Owner-tune directive queued"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support the owner tuner"),
+    ),
+)]
+async fn patch_board_owner_tune(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<OwnerTuneRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let known = state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .boards()
+        .into_iter()
+        .any(|b| b.name == name);
+    if !known {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    #[cfg(feature = "nano3s")]
+    {
+        crate::board::nano3s::write_owner_tune_command(req.profile)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok(StatusCode::OK)
+    }
+    #[cfg(not(feature = "nano3s"))]
+    {
+        let _ = req;
         Err(StatusCode::NOT_IMPLEMENTED)
     }
 }
