@@ -412,8 +412,7 @@ pub(crate) fn fan_step(st: &mut FanState, temp: Option<f32>, cap: f32, target: f
 
 /// Snaps a requested core voltage to the DC/DC's 26 mV grid (anchored at
 /// 3600), never returns 3600 (steps one grid step down), then clamps to the
-/// envelope range. 3800 is off-grid but is the project's hard limit, so it is
-/// reached by the final clamp, as in POWER_TARGET_MAX_MV.
+/// highest/lowest on-grid values inside the envelope (3782 / 3392 mV).
 pub(crate) fn snap_voltage_mv(mv: i64) -> u16 {
     let rel = mv - VOLT_GRID_ANCHOR_MV as i64;
     let step = VOLT_STEP_MV as i64;
