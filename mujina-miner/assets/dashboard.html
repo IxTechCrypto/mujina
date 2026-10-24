@@ -251,12 +251,6 @@
     .tdot.warn { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
     .tdot.crit { background: var(--mag); box-shadow: 0 0 8px var(--mag); animation: pulse 1.4s infinite; }
     
-    .gear {
-      cursor: pointer; background: none; border: 1px solid var(--line); color: var(--cyan);
-      font-family: 'Share Tech Mono', monospace; font-size: 21px; line-height: 1; border-radius: 4px;
-      padding: 7px 10px; transition: .15s; box-shadow: 0 0 0 0 var(--cyan);
-    }
-    .gear:hover { border-color: var(--cyan); box-shadow: 0 0 12px rgba(0,240,255,.4); text-shadow: 0 0 8px var(--cyan); }
 
     .navlink {
       display: inline-flex; align-items: center; text-decoration: none; cursor: pointer;
@@ -266,6 +260,16 @@
       transition: .15s;
     }
     .navlink:hover { border-color: var(--cyan); color: var(--cyan); box-shadow: 0 0 12px rgba(0,240,255,.4); }
+
+    #poolCard .prow { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+    #poolCard .prow label { font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--dim); }
+    #poolCard .prow label small { text-transform: none; letter-spacing: 0; }
+    #poolCard input {
+      width: 100%; background: #05070e; border: 1px solid var(--line); color: var(--ink);
+      font-family: 'Share Tech Mono', monospace; font-size: 14px; padding: 9px 10px; border-radius: 4px;
+    }
+    #poolCard input:focus { outline: none; border-color: var(--cyan); box-shadow: 0 0 10px rgba(0,240,255,.3); }
+    #poolCard .pacts { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 
     /* Modal */
     .modal {
@@ -376,12 +380,6 @@
     }
     select:focus { outline: none; border-color: var(--cyan); box-shadow: 0 0 10px rgba(0,240,255,.3); }
     
-    .atpill {
-      display: none; align-items: center; gap: 6.6px; font-size: 11px; letter-spacing: .16em; text-transform: uppercase;
-      color: var(--mag); border: 1px solid rgba(255,46,151,.5); border-radius: 22px; padding: 3.3px 11px;
-      text-shadow: 0 0 8px rgba(255,46,151,.5); animation: pulse 1.8s infinite; white-space: nowrap;
-    }
-    .atpill.on { display: inline-flex; }
     
     .status {
       margin-top: 16px; color: var(--dim); font-size: 12px; letter-spacing: .12em; text-transform: uppercase;
@@ -447,13 +445,10 @@
       <div class="tagline" id="tagline">booting…</div>
     </div>
     <div style="display:flex;align-items:center;gap:12px">
-      <span class="atpill" id="atpill">◉ <span id="atpilltxt">auto-tuning</span></span>
       <a class="navlink" href="/info">Info</a>
       <a class="navlink" href="/led">LED</a>
-      <a class="navlink" href="/pool">Pool</a>
       <a class="navlink" href="/tuning">Tuning</a>
       <a class="navlink" href="/firmware">Firmware</a>
-      <button class="gear" id="gear" title="Settings">⚙</button>
     </div>
   </div>
 
@@ -553,49 +548,6 @@
 
   </div>
 
-  <!-- Global Miner Settings Modal -->
-  <div class="modal" id="modal">
-    <div class="sheet">
-      <h2>Global Settings</h2>
-      <div class="subhead" id="modalboard">applies to whole miner</div>
-
-      <div class="modalsec">Identity</div>
-      <div class="note">The miner's name. Sent to the pool as the worker suffix so this rig is identifiable.</div>
-      <div class="row">
-        <label for="mname">Miner Name</label>
-        <input type="text" id="mname" placeholder="unnamed" style="width:180px">
-      </div>
-
-      <div class="modalsec">Pool <span class="badge" id="restartbadge" style="display:none">restart required</span></div>
-      <div class="note">Saved immediately, applied at next daemon start.</div>
-      <div class="row">
-        <label for="purl">URL</label>
-        <input type="text" id="purl" placeholder="stratum+tcp://pool:3333" style="width:210px">
-      </div>
-      <div class="row">
-        <label for="puser">User</label>
-        <input type="text" id="puser" placeholder="address or account" style="width:210px">
-      </div>
-      <div class="row">
-        <label for="ppass">Password</label>
-        <input type="password" id="ppass" placeholder="unchanged" style="width:210px">
-      </div>
-      <div class="note" id="workernote" style="margin:-6px 0 4px"></div>
-
-      <div class="modalsec">Apply</div>
-      <div class="note" id="restartnote">The daemon reads its name and pool once, at startup.</div>
-      <div class="acts" style="margin-top:0">
-        <button class="btn pri" id="mrestart">Restart Mujina Now</button>
-      </div>
-
-      <div class="msg" id="smsg"></div>
-      <div class="acts">
-        <button class="btn" id="scancel">Cancel</button>
-        <button class="btn pri" id="ssave">Save</button>
-      </div>
-    </div>
-  </div>
-
   <!-- Embedded Per-Board Controls Modal Sub-Menu (Triggered via ⚙ Tune Button) -->
   <div class="modal" id="boardControlModal">
     <div class="sheet">
@@ -635,7 +587,7 @@
       </div>
 
       <div class="modalsec">Auto-Tuning Config <span class="badge" style="color:var(--lime);border-color:rgba(200,255,0,.4)">90s thermal soak + HW error guard</span></div>
-      <div class="note">Tunes frequency &amp; voltage toward chosen profile within safe thermal/power limits. Calibrated points persist to disk (mujina-autotune.json).</div>
+      <div class="note">Tunes frequency &amp; voltage toward chosen profile within safe thermal/power limits.</div>
       <div class="row">
         <label for="vauto">Enable Auto-Tuning</label>
         <label class="sw"><input type="checkbox" id="vauto"><span></span></label>
@@ -727,13 +679,34 @@
     <div class="card fan"><div class="label">Avg Fan</div><div class="val" id="ffan">—</div></div>
     <div class="card pool span2">
       <div class="label">Pool</div>
-      <div class="val" id="pool">—</div>
+      <div class="val" id="poolval">—</div>
       <div class="poolmeta">
         <span>Shares<b id="shares">—</b></span>
         <span>Difficulty<b id="diff">—</b></span>
         <span>Best Share<b id="bestdiff" style="color:var(--lime)">—</b></span>
       </div>
     </div>
+  </div>
+
+  <div class="sec" id="pool">Pool Settings<span class="sec-sub">saved immediately, applied after a device reboot</span></div>
+  <div class="card" id="poolCard" style="max-width:560px">
+    <div class="prow">
+      <label for="poolUrl">Pool URL</label>
+      <input type="text" id="poolUrl" placeholder="stratum+tcp://pool.example.com:3333" autocomplete="off" autocapitalize="off" spellcheck="false">
+    </div>
+    <div class="prow">
+      <label for="poolUser">Worker <small>(usually address.workername)</small></label>
+      <input type="text" id="poolUser" placeholder="bc1q....worker1" autocomplete="off" autocapitalize="off" spellcheck="false">
+    </div>
+    <div class="prow">
+      <label for="poolPass">Password <small>(blank keeps current; most pools ignore it)</small></label>
+      <input type="password" id="poolPass" placeholder="unchanged" autocomplete="new-password">
+    </div>
+    <div class="pacts">
+      <button class="btn pri" id="poolSave">Save</button>
+      <button class="btn" id="poolReboot" style="display:none;border-color:var(--mag);color:var(--mag)">Reboot now</button>
+    </div>
+    <div class="msg" id="poolMsg"></div>
   </div>
 
   <div class="chartcard">
@@ -1313,7 +1286,7 @@ function renderFleet(d) {
   $('fboards').textContent = f.boards_online;
   $('fpower').innerHTML = fx(f.total_power_w, 'W', 1);
   $('ffan').innerHTML = (f.avg_fan_rpm != null) ? Math.round(f.avg_fan_rpm) + ' <small>RPM</small>' : '—';
-  $('pool').textContent = d.pool_url || d.pool_name || '—';
+  $('poolval').textContent = d.pool_url || d.pool_name || '—';
   $('shares').textContent = (d.shares != null) ? d.shares : '—';
   $('diff').textContent = (d.difficulty != null) ? d.difficulty : '—';
   $('bestdiff').textContent = (d.best_diff != null) ? d.best_diff : '—';
@@ -1324,7 +1297,6 @@ function renderFleet(d) {
   checkAlerts(d);
 }
 
-const PROFILES = { eco_quiet: 'Eco-Quiet', quiet: 'Quiet', efficient: 'Efficient', balanced: 'Balanced', max_hash: 'Max Hash' };
 function renderAutolog(at, bestId, listId) {
   if (!at) { $(listId).textContent = '—'; $(bestId).textContent = 'No calibration point established yet'; $('at-phase-label').textContent = 'IDLE'; return; }
   const b = at.best;
@@ -1335,22 +1307,6 @@ function renderAutolog(at, bestId, listId) {
   if (!log.length) { $(listId).textContent = at.enabled ? 'Warming up thermal soak & telemetry windows…' : 'Auto-tuner is idle. Enable in board controls menu (⚙ Tune Board) to calibrate.'; return; }
   $(listId).innerHTML = log.slice().reverse().map(e =>
     '<div class="entry"><b>[' + (e.timestamp ? new Date(e.timestamp * 1000).toLocaleTimeString() : 'LOG') + ']</b> <i>' + Math.round(e.frequency_mhz) + 'MHz</i> <span>' + e.message + '</span></div>').join('');
-}
-
-function autotuneLabel(at) {
-  if (at && at.target) {
-    return at.target.axis === 'power' ? (at.target.value.toFixed(1) + 'W target') : (at.target.value.toFixed(0) + 'TH/s target');
-  }
-  return PROFILES[at && at.profile] || (at && at.profile);
-}
-
-function renderAutotune(at) {
-  const on = at && at.enabled;
-  $('atpill').classList.toggle('on', !!on);
-  if (on) {
-    const ph = (at.phase || '').replace('_', ' ');
-    $('atpilltxt').textContent = 'auto · ' + autotuneLabel(at) + ' · ' + ph;
-  }
 }
 
 function renderBoard(b) {
@@ -1375,7 +1331,6 @@ function renderBoard(b) {
   // Model-specific color assignment for single-board chart and glow
   const bColor = getBoardColor(b);
   drawChart('chart', b.series || [], bColor);
-  renderAutotune(b.autotune);
 }
 
 function render(d) {
@@ -1469,28 +1424,6 @@ function setTargetAxis(axis) {
 function activeBoard() {
   return (LAST && LAST.boards) ? (LAST.boards.find(b => b.board_name === ACTIVE_NAME) || null) : null;
 }
-let SETTINGS = null;
-function syncWorkerNote() {
-  const user = $('puser').value.trim(), name = $('mname').value.trim();
-  if (!user) { $('workernote').textContent = ''; return; }
-  const worker = name ? user + '.' + name : user;
-  const dup = !!name && user.toLowerCase().endsWith('.' + name.toLowerCase());
-  $('workernote').textContent = (dup ? '⚠ name already in the user field — ' : 'Worker sent to pool: ') + worker;
-  $('workernote').style.color = dup ? 'var(--amber)' : '';
-}
-async function loadSettings() {
-  try { SETTINGS = await (await fetch('/minersettings')).json(); } catch (e) { SETTINGS = null; }
-  const s = SETTINGS || {}, p = s.pool || {};
-  $('mname').value = s.name || '';
-  $('purl').value = p.url || '';
-  $('puser').value = p.user || '';
-  $('ppass').value = '';
-  $('ppass').placeholder = p.password_set ? 'unchanged' : 'x';
-  $('restartbadge').style.display = s.restart_required ? '' : 'none';
-  syncWorkerNote();
-}
-function openSettings() { loadSettings(); $('modalboard').textContent = 'applies to whole miner'; $('smsg').textContent = ''; $('smsg').className = 'msg'; $('modal').classList.add('show'); }
-function closeSettings() { $('modal').classList.remove('show'); }
 function syncAuto() { $('fvgroup').classList.toggle('locked', $('vauto').checked); }
 let BOARD_FORM_FOR = null;
 function fillBoardForm(d) {
@@ -1537,40 +1470,6 @@ async function launchDoom() {
   } catch (e) {
     alert('DOOM launch failed: ' + e);
   }
-}
-async function restartMiner() {
-  if (!confirm('Restart Mujina now? Mining stops for a few seconds while both boards re-enumerate.')) return;
-  $('smsg').textContent = 'restarting — this takes ~15s…'; $('smsg').className = 'msg';
-  $('mrestart').disabled = true;
-  try {
-    const j = await post('/restart', {});
-    $('smsg').textContent = j.ok ? ('restarted ✓ — ' + (j.detail || '')) : ('restart failed: ' + (j.detail || 'error'));
-    $('smsg').className = j.ok ? 'msg ok' : 'msg';
-    if (j.ok) loadSettings();
-    tick();
-  } catch (e) { $('smsg').textContent = 'restart failed: ' + e; $('smsg').className = 'msg'; }
-  $('mrestart').disabled = false;
-}
-async function saveMinerSettings() {
-  const body = { name: $('mname').value };
-  const url = $('purl').value.trim(), user = $('puser').value.trim();
-  if (url || user) {
-    if (!url || !user) { $('smsg').textContent = 'pool URL and user are both required'; $('smsg').className = 'msg'; return; }
-    body.pool = { url: url, user: user };
-    const pass = $('ppass').value;
-    if (pass) body.pool.password = pass;
-  }
-  $('smsg').textContent = 'saving…'; $('smsg').className = 'msg';
-  try {
-    const j = await post('/minersettings', body);
-    if (!j.ok) { $('smsg').textContent = 'failed: ' + (j.detail || 'error'); $('smsg').className = 'msg'; return; }
-    SETTINGS = j.settings || null;
-    $('restartbadge').style.display = (SETTINGS && SETTINGS.restart_required) ? '' : 'none';
-    $('ppass').value = '';
-    $('smsg').textContent = (SETTINGS && SETTINGS.restart_required) ? 'saved — use Restart Mujina Now below to apply' : 'saved ✓';
-    $('smsg').className = 'msg ok';
-    tick();
-  } catch (e) { $('smsg').textContent = 'failed: ' + e; $('smsg').className = 'msg'; }
 }
 async function saveBoardSettings() {
   const d = activeBoard();
@@ -1885,10 +1784,6 @@ $('mjlogo').addEventListener('click', () => {
   }
   mjLogoTimer = setTimeout(() => { mjLogoClicks = 0; }, 2000);
 });
-$('gear').addEventListener('click', openSettings);
-$('scancel').addEventListener('click', closeSettings);
-$('ssave').addEventListener('click', saveMinerSettings);
-$('mrestart').addEventListener('click', restartMiner);
 $('bcClose').addEventListener('click', closeBoardControlModal);
 $('bsave').addEventListener('click', saveBoardSettings);
 $('fauto').addEventListener('change', syncRows);
@@ -1908,10 +1803,50 @@ $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(b => {
   });
 });
 
-$('mname').addEventListener('input', syncWorkerNote);
-$('puser').addEventListener('input', syncWorkerNote);
-$('modal').addEventListener('click', e => { if (e.target === $('modal')) closeSettings(); });
 $('boardControlModal').addEventListener('click', e => { if (e.target === $('boardControlModal')) closeBoardControlModal(); });
+
+// Pool settings: GET/PATCH /api/v0/pool (persisted to pool.conf, applied on
+// next boot). The API never returns the password; only send it if typed.
+async function loadPool() {
+  try {
+    const r = await fetch('/api/v0/pool');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    $('poolUrl').value = d.url || '';
+    $('poolUser').value = d.user || '';
+    $('poolPass').placeholder = d.password_set ? 'unchanged (set)' : 'unchanged';
+  } catch (e) { $('poolMsg').textContent = 'failed to load pool config: ' + e; $('poolMsg').className = 'msg'; }
+}
+async function savePool() {
+  const body = {};
+  const url = $('poolUrl').value.trim(), user = $('poolUser').value.trim(), pass = $('poolPass').value;
+  if (url) body.url = url;
+  if (user) body.user = user;
+  if (pass) body.password = pass;
+  if (!Object.keys(body).length) { $('poolMsg').textContent = 'nothing to save'; $('poolMsg').className = 'msg'; return; }
+  $('poolMsg').textContent = 'saving…'; $('poolMsg').className = 'msg';
+  try {
+    const r = await fetch('/api/v0/pool', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!r.ok) {
+      $('poolMsg').textContent = r.status === 400 ? 'rejected: URL must start with stratum+tcp:// or stratum+ssl://' : 'save failed (HTTP ' + r.status + ')';
+      $('poolMsg').className = 'msg'; return;
+    }
+    $('poolPass').value = '';
+    $('poolMsg').textContent = 'saved ✓ — reboot the device to apply (mining stops for a couple of minutes)';
+    $('poolMsg').className = 'msg ok';
+    $('poolReboot').style.display = '';
+    loadPool();
+  } catch (e) { $('poolMsg').textContent = 'failed: ' + e; $('poolMsg').className = 'msg'; }
+}
+async function poolRebootNow() {
+  if (!confirm('Reboot the device now to apply the new pool settings? Mining will stop for a couple of minutes.')) return;
+  $('poolReboot').disabled = true;
+  $('poolMsg').textContent = 'rebooting — device will be unreachable shortly…'; $('poolMsg').className = 'msg';
+  try { await fetch('/api/v0/reboot', { method: 'POST' }); } catch (e) { /* connection drops as it reboots */ }
+}
+$('poolSave').addEventListener('click', savePool);
+$('poolReboot').addEventListener('click', poolRebootNow);
+loadPool();
 
 tick(); setInterval(tick, 2000);
 </script>
