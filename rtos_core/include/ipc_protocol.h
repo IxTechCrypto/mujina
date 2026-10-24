@@ -47,6 +47,11 @@ enum {
 	 * REG_SS_LOG_TIMER=SS_TIMER_DEFAULT_VALUE (re-arms the window
 	 * timer). Fire-and-forget, 1-byte dummy payload. */
 	IPC_MSG_RESET_SPDLOG_RAW = 11,
+	/* mujina -> rtos: per-chip clock offsets in MHz, added to all four
+	 * domains of the SET_MODE base. All zero restores broadcast writes.
+	 * Fire-and-forget. Older rtos_core builds treat it as wrong_peer, so
+	 * mujina only sends it when an offset is non-zero. */
+	IPC_MSG_SET_CHIP_PLL_OFFSET = 12,
 };
 
 struct ipc_job {
@@ -131,6 +136,11 @@ struct ipc_status {
 struct ipc_set_mode {
 	uint32_t pll_freq[4];
 	uint8_t  work_mode;
+};
+
+/* IPC_MSG_SET_CHIP_PLL_OFFSET payload. */
+struct ipc_set_chip_pll_offset {
+	int16_t offset_mhz[IPC_STATUS_MAX_CHIPS];
 };
 
 /* IPC_MSG_SET_ROLLTIME_RAW payload -- see that enum value's comment. */

@@ -154,6 +154,8 @@ pub(crate) struct Nano3sDetail {
     pub pll_freq_commanded: [u32; 4],
     /// Last commanded (not read back) core voltage, mV.
     pub voltage_mv_commanded: u32,
+    /// Last commanded per-chip clock offsets, MHz (all zero = uniform).
+    pub chip_offset_mhz: [i16; CHIP_COUNT],
     pub err_crc: u32,
     pub nonce_read_err: u32,
     pub nonce_bad_len: u32,
@@ -223,7 +225,27 @@ unsafe extern "C" {
     /// endpoint (`write_tuning_command()` below) to change core voltage
     /// live, no reboot required.
     fn nano3s_ipc_set_voltage_raw(target_mv: i32) -> i32;
+    /// Per-chip clock offsets (MHz) on top of the SET_MODE base. See
+    /// [`CHIP_OFFSET_RANGE_MHZ`] and `nano3s_ipc_shim.h`.
+    fn nano3s_ipc_set_chip_pll_offset(offset_mhz: *const i16) -> i32;
     fn nano3s_ipc_close();
+}
+
+/// Chips on the Nano 3S chain (and slots in the per-chip offset message).
+pub(crate) const CHIP_COUNT: usize = 12;
+/// Allowed per-chip clock offset, MHz (rtos_core also clamps the result
+/// at 100 MHz).
+pub(crate) const CHIP_OFFSET_RANGE_MHZ: std::ops::RangeInclusive<i16> = -150..=50;
+
+/// Parses `a,b,...` (exactly [`CHIP_COUNT`] in-range offsets).
+fn parse_chip_offsets(s: &str) -> Option<[i16; CHIP_COUNT]> {
+    let v: Vec<i16> = s.split(',').map(|f| f.trim().parse().ok()).collect::<Option<_>>()?;
+    let arr: [i16; CHIP_COUNT] = v.try_into().ok()?;
+    arr.iter().all(|o| CHIP_OFFSET_RANGE_MHZ.contains(o)).then_some(arr)
+}
+
+fn join_chip_offsets(o: &[i16; CHIP_COUNT]) -> String {
+    o.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")
 }
 
 /// PLL ramp target sent once at board startup via IPC_MSG_SET_MODE.
@@ -1275,6 +1297,8 @@ struct PersistedTuning {
     /// Chip-temp target (C) the owner-tuner fan loop holds; `None` = profile
     /// temp cap - 5 C.
     owner_fan_target_c: Option<f32>,
+    /// Per-chip clock offsets, MHz; `None` = uniform clocks.
+    chip_offset_mhz: Option<[i16; CHIP_COUNT]>,
 }
 
 /// Reads [`TUNING_CONF_PATH`], or all-`None` if missing/unparseable --
@@ -1311,6 +1335,7 @@ fn load_tuning() -> PersistedTuning {
                 cfg.owner_fan_target_c =
                     value.parse::<f32>().ok().filter(|c| owner::FAN_TARGET_RANGE_C.contains(c))
             }
+            "chip_offset_mhz" => cfg.chip_offset_mhz = parse_chip_offsets(value),
             _ => {}
         }
     }
@@ -1348,6 +1373,9 @@ fn write_tuning_conf(cfg: &PersistedTuning) {
     }
     if let Some(c) = cfg.owner_fan_target_c {
         out.push_str(&format!("owner_fan_target_c={c}\n"));
+    }
+    if let Some(o) = cfg.chip_offset_mhz.filter(|o| o.iter().any(|x| *x != 0)) {
+        out.push_str(&format!("chip_offset_mhz={}\n", join_chip_offsets(&o)));
     }
     if let Err(e) = std::fs::write(TUNING_CONF_PATH, out) {
         eprintln!("[nano3s] failed to write {TUNING_CONF_PATH}: {e}");
@@ -1432,6 +1460,7 @@ fn disable_owner_for_manual(owner: &mut OwnerTune, why: &str) {
         write_harness_control(t);
     }
     persist_owner_tune_profile(None);
+    owner.publish(None);
     eprintln!("[nano3s] owner-tune: disabled by {why}");
 }
 
@@ -1444,6 +1473,15 @@ pub(crate) fn write_owner_tune_command(
     fan_target_c: Option<f32>,
 ) -> std::io::Result<()> {
     std::fs::write(MUJINA_CONTROL_FILE, owner::directive_for_request(profile, fan_target_c))
+}
+
+/// Queues a `chip_offset:a,b,...` directive (per-chip clock offsets, MHz)
+/// and persists it. Shares the single-slot control file: space calls >= 5 s.
+pub(crate) fn write_chip_offset_command(offset_mhz: [i16; CHIP_COUNT]) -> std::io::Result<()> {
+    let mut cfg = load_tuning();
+    cfg.chip_offset_mhz = Some(offset_mhz);
+    write_tuning_conf(&cfg);
+    std::fs::write(MUJINA_CONTROL_FILE, format!("chip_offset:{}", join_chip_offsets(&offset_mhz)))
 }
 
 fn persist_autotune_level(level: f64) {
@@ -2136,6 +2174,7 @@ fn run_worker(
     // hardcoded defaults on every reboot, a real reported bug).
     let persisted_tuning = load_tuning();
     let startup_pll_freq = persisted_tuning.pll_freq_mhz.unwrap_or(NANO3S_PLL_FREQ_TARGET);
+    let mut chip_offset_mhz: [i16; CHIP_COUNT] = persisted_tuning.chip_offset_mhz.unwrap_or_default();
     let mut psu_override_max_w = load_psu_override_w();
     let mut last_pd_ceiling_logged_w: Option<f64> = None;
 
@@ -2160,6 +2199,14 @@ fn run_worker(
             if rc != 0 {
                 eprintln!("[nano3s] startup nano3s_ipc_set_voltage_raw failed");
             }
+        }
+        // Only when non-zero: older rtos_core builds abort on this message.
+        if chip_offset_mhz.iter().any(|o| *o != 0) {
+            let rc = unsafe { nano3s_ipc_set_chip_pll_offset(chip_offset_mhz.as_ptr()) };
+            if rc != 0 {
+                eprintln!("[nano3s] startup nano3s_ipc_set_chip_pll_offset failed");
+            }
+            eprintln!("[nano3s] startup chip offsets {chip_offset_mhz:?}");
         }
 
         // Declare a known-good estimate immediately rather than leaving
@@ -2334,6 +2381,21 @@ fn run_worker(
                 manual_pause = false;
                 eprintln!("[nano3s] manual RESUME via {MUJINA_CONTROL_FILE} (reapplied pll_freq={last_applied_pll_freq:?} voltage_mv={last_applied_voltage_mv:?})");
             }
+            Some(s) if s.starts_with("chip_offset:") => match parse_chip_offsets(&s["chip_offset:".len()..]) {
+                // All-zero only goes out if non-zero offsets went out before
+                // (older rtos_core builds abort on this message).
+                Some(o) if o != chip_offset_mhz || o.iter().any(|x| *x != 0) => {
+                    let rc = unsafe { nano3s_ipc_set_chip_pll_offset(o.as_ptr()) };
+                    if rc != 0 {
+                        eprintln!("[nano3s] nano3s_ipc_set_chip_pll_offset failed");
+                    } else {
+                        chip_offset_mhz = o;
+                        eprintln!("[nano3s] chip offsets {o:?} (via dashboard/API)");
+                    }
+                }
+                Some(_) => {}
+                None => eprintln!("[nano3s] malformed chip_offset directive: {s}"),
+            },
             Some(s) if s.starts_with("owner_tune:") => {
                 let parsed = owner::parse_owner_directive(&s["owner_tune:".len()..]);
                 if let Ok(d) = &parsed
@@ -3170,6 +3232,7 @@ fn run_worker(
                 temp_max: st.temp_max,
                 pll_freq_commanded: st.pll_freq,
                 voltage_mv_commanded: st.voltage_mv,
+                chip_offset_mhz,
                 err_crc: st.err_crc,
                 nonce_read_err: st.nonce_read_err,
                 nonce_bad_len: st.nonce_bad_len,

@@ -19,7 +19,7 @@ use crate::board::nano3s_owner_tune::{OwnerTuneRequest, OwnerTuneStatus};
 use super::server::SharedState;
 use crate::api_client::types::{
     AutotuneHashrateRequest, AutotuneHashrateResponse, BoardFanRequest, BoardLedRequest,
-    BoardLedState, BoardPauseRequest, BoardPowerTargetRequest, BoardTelemetry,
+    BoardChipClocksRequest, BoardLedState, BoardPauseRequest, BoardPowerTargetRequest, BoardTelemetry,
     BoardTempTargetRequest, BoardTuningRequest, FanCurvePoint, FanCurveRequest, FanCurveResponse,
     FirmwareBundleResponse, FirmwareUploadResponse, MinerPatchRequest, MinerTelemetry,
     PoolConfigRequest, PoolConfigResponse, PsuOverrideRequest, PsuStatusResponse, SourceTelemetry,
@@ -45,6 +45,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_boards))
         .routes(routes!(get_board))
         .routes(routes!(patch_board_tuning))
+        .routes(routes!(patch_board_chip_clocks))
         .routes(routes!(patch_board_power_target))
         .routes(routes!(patch_board_temp_target))
         .routes(routes!(get_board_psu, patch_board_psu))
@@ -259,6 +260,61 @@ async fn patch_board_tuning(
     }
     #[cfg(not(feature = "nano3s"))]
     {
+        Err(StatusCode::NOT_IMPLEMENTED)
+    }
+}
+
+/// Set per-chip clock offsets (MHz), layered on the board's base clock.
+///
+/// `offset_mhz` must hold one in-range value per chip. Applied live with a
+/// 10 MHz/s ramp and persisted across reboots. Needs an rtos_core build
+/// with per-chip clock support.
+#[utoipa::path(
+    patch,
+    path = "/boards/{name}/chip-clocks",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    request_body = BoardChipClocksRequest,
+    responses(
+        (status = OK, description = "Offsets queued"),
+        (status = BAD_REQUEST, description = "Wrong count, or an offset outside the allowed range"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support per-chip clocks"),
+    ),
+)]
+async fn patch_board_chip_clocks(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<BoardChipClocksRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let known = state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .boards()
+        .into_iter()
+        .any(|b| b.name == name);
+    if !known {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "nano3s")]
+    {
+        use crate::board::nano3s::{CHIP_COUNT, CHIP_OFFSET_RANGE_MHZ};
+        let offsets: [i16; CHIP_COUNT] =
+            req.offset_mhz.try_into().map_err(|_| StatusCode::BAD_REQUEST)?;
+        if !offsets.iter().all(|o| CHIP_OFFSET_RANGE_MHZ.contains(o)) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        crate::board::nano3s::write_chip_offset_command(offsets)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok(StatusCode::OK)
+    }
+    #[cfg(not(feature = "nano3s"))]
+    {
+        let _ = req;
         Err(StatusCode::NOT_IMPLEMENTED)
     }
 }

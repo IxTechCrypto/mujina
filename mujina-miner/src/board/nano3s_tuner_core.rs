@@ -935,6 +935,37 @@ impl AutoTuner {
             return Some(TuneAction::SetVoltage(prev_mv));
         }
 
+        // A settled point over the fail-rate limit is unstable whatever its
+        // hashrate or J/TH: never record it as best or climb from it. Raise
+        // voltage a step (power permitting), else drop the clock a step. The
+        // efficiency walk also stays above it from now on.
+        if let (Some(max), Some(rate)) = (env.max_fail_rate_pct, m.fail_rate_pct)
+            && rate > max
+        {
+            let commanded_v = self.commanded_voltage(m);
+            self.probe_floor_mv = self.probe_floor_mv.max(commanded_v);
+            self.phase = TunePhase::Seeking;
+            let up = env.voltage_up(commanded_v);
+            if up <= env.max_voltage_mv && m.power_w < caps.power_w - 1.0 {
+                self.last_commanded_voltage_mv = Some(up);
+                self.log_event(
+                    format!("fail rate {rate:.1}% over {max:.1}%: raising voltage to {up} mV"),
+                    m,
+                );
+                return Some(TuneAction::SetVoltage(up));
+            }
+            let down = m.frequency_mhz - env.freq_step_mhz;
+            if down >= env.min_freq_mhz {
+                self.probe_ceiling_mhz = self.probe_ceiling_mhz.min(m.frequency_mhz);
+                self.log_event(
+                    format!("fail rate {rate:.1}% over {max:.1}%: lowering clock to {down:.0} MHz"),
+                    m,
+                );
+                return Some(TuneAction::SetFrequency(down));
+            }
+            return None;
+        }
+
         let hashrate = m.hashrate_ths;
         let efficiency = efficiency_j_th(m.power_w, hashrate).unwrap_or(f32::INFINITY);
         // All voltage reasoning is in the commanded domain (see helper), so a
@@ -1880,10 +1911,35 @@ mod tests {
             ..m(70.0, 76.0, 1.0, 300.0, 3678)
         };
         assert_eq!(t.evaluate(&hot), Some(TuneAction::SetFanFull));
-        // Cooled again with a high fail rate: must not raise voltage back
-        // to the pre-trim 3704 mV on the strength of the old trim.
-        let action = step_to_action(&mut t, &nano_m(76.0, 3678, Some(15.0)));
-        assert_ne!(action, Some(TuneAction::SetVoltage(3704)));
+        // Cooled again with a high fail rate: no revert-and-lock on the
+        // strength of the old trim. The stability gate raises one step
+        // because this point is unstable, and keeps seeking.
+        step_to_action(&mut t, &nano_m(76.0, 3678, Some(15.0)));
+        assert_ne!(t.phase, TunePhase::Locked);
+        assert!(t.log.back().unwrap().message.contains("raising voltage"));
+    }
+
+    #[test]
+    fn unstable_point_raises_voltage_instead_of_climbing() {
+        // The 2026-10-24 failure: Balanced at 72 % fail kept raising the clock.
+        let mut t = nano_tuner(TuneProfile::Balanced);
+        assert_eq!(
+            step_to_action(&mut t, &nano_m(85.0, 3444, Some(72.0))),
+            Some(TuneAction::SetVoltage(3470))
+        );
+        assert!(t.best_point().is_none());
+        // Stable now: the efficiency walk never trims back to 3444.
+        let a = step_to_action(&mut t, &nano_m(88.0, 3470, Some(3.0)));
+        assert_ne!(a, Some(TuneAction::SetVoltage(3444)));
+    }
+
+    #[test]
+    fn unstable_point_at_power_cap_lowers_the_clock() {
+        let mut t = nano_tuner(TuneProfile::Balanced); // power cap 110
+        assert_eq!(
+            step_to_action(&mut t, &nano_m(109.5, 3678, Some(40.0))),
+            Some(TuneAction::SetFrequency(290.0))
+        );
     }
 
     #[test]

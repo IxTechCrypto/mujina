@@ -156,6 +156,16 @@ int nano3s_ipc_set_voltage_raw(int32_t target_mv);
 int nano3s_ipc_reset_spdlog_raw(void);
 
 /*
+ * Sends IPC_MSG_SET_CHIP_PLL_OFFSET: per-chip MHz offsets added to all four
+ * domains of the SET_MODE base (rtos_core ramps them 10 MHz/s). All zero
+ * restores broadcast PLL writes. Only rtos_core builds with per-chip clock
+ * support know this message; older ones abort as wrong_peer, so callers
+ * must not send it with all-zero offsets unless they sent non-zero ones
+ * before. Returns 0 on send success, -1 on failure.
+ */
+int nano3s_ipc_set_chip_pll_offset(const int16_t offset_mhz[IPC_STATUS_MAX_CHIPS]);
+
+/*
  * Disconnects and cleans up. Safe to call even if nano3s_ipc_open()
  * failed or was never called.
  */

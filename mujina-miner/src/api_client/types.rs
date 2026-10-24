@@ -120,6 +120,14 @@ pub struct BoardTuningRequest {
     pub temp_target_c: Option<f64>,
 }
 
+/// Request body for `PATCH /api/v0/boards/{name}/chip-clocks`: one clock
+/// offset per chip in MHz, added to every PLL domain of that chip on top of
+/// the board's base clock. All zero = uniform clocks.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct BoardChipClocksRequest {
+    pub offset_mhz: Vec<i16>,
+}
+
 /// Request body for `PATCH /api/v0/boards/{name}/power-target`.
 ///
 /// Live-edits the power-target voltage loop's target without a reboot.

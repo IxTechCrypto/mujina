@@ -331,6 +331,14 @@ int nano3s_ipc_reset_spdlog_raw(void)
 	return send_only(g_ipc_id, IPC_MSG_RESET_SPDLOG_RAW, &dummy, sizeof(dummy));
 }
 
+int nano3s_ipc_set_chip_pll_offset(const int16_t offset_mhz[IPC_STATUS_MAX_CHIPS])
+{
+	struct ipc_set_chip_pll_offset co;
+
+	memcpy(co.offset_mhz, offset_mhz, sizeof(co.offset_mhz));
+	return send_only(g_ipc_id, IPC_MSG_SET_CHIP_PLL_OFFSET, &co, sizeof(co));
+}
+
 void nano3s_ipc_close(void)
 {
 	if (g_ipc_id >= 0) {

@@ -46,8 +46,30 @@ uint32_t get_cpm_freq(uint32_t pll)
 	return 0;
 }
 
+/* Per-chip MHz offsets added to every PLL domain of that chip. All zero
+ * (the default) keeps a3197s_pll_apply() on its original broadcast path. */
+int16_t g_pll_chip_offset[HBOARD_COUNT][PLL_CHIP_OFFSET_MAX];
+
+static int pll_offsets_active(uint8_t miner_id)
+{
+	int i;
+
+	for (i = 0; i < PLL_CHIP_OFFSET_MAX; i++)
+		if (g_pll_chip_offset[miner_id][i] != 0)
+			return 1;
+	return 0;
+}
+
+static uint32_t pll_offset_freq(uint32_t base, int16_t offset)
+{
+	int32_t f = (int32_t)base + offset;
+
+	return (uint32_t)(f < PLL_CHIP_MIN_MHZ ? PLL_CHIP_MIN_MHZ : f);
+}
+
 /* Sets g_pll_state.set_pll[miner_id][0][0..3] and applies it via
- * a3197s_pll_apply(), which broadcasts to the whole chain. */
+ * a3197s_pll_apply(), which broadcasts to the whole chain (or addresses
+ * each chip in turn while per-chip offsets are set). */
 void asic_apply_pll_freq(uint8_t miner_id, const uint32_t pll_freq[4])
 {
 	int k;
@@ -97,20 +119,11 @@ void asic_ramp_pll_freq(uint8_t miner_id, uint16_t init_freq, uint16_t target_fr
 	}
 }
 
-void a3197s_pll_apply(uint8_t miner_id, uint16_t asic_id)
+/* The PLL write sequence for whatever chip (or broadcast) is selected. */
+static void pll_write_sequence(uint8_t miner_id, uint32_t freq0, uint32_t freq1,
+			       uint32_t freq2, uint32_t freq3)
 {
 	uint32_t tmp32;
-	uint32_t freq0, freq1, freq2, freq3;
-	uint16_t chip_select_id;
-
-	chip_select_id = asic_get_chip_select();
-
-	freq0 = g_pll_state.set_pll[miner_id][0][0];
-	freq1 = g_pll_state.set_pll[miner_id][0][1];
-	freq2 = g_pll_state.set_pll[miner_id][0][2];
-	freq3 = g_pll_state.set_pll[miner_id][0][3];
-
-	a3197s_select_chip(miner_id, CHIP_ADDR_BROADCAST);
 
 	/* SS_CTRL handshake bracketing this PLL step. */
 	a3197s_smartspeed_set_ctrl(miner_id, SS_CTRL_RAMP_PRE);
@@ -131,6 +144,34 @@ void a3197s_pll_apply(uint8_t miner_id, uint16_t asic_id)
 
 	tmp32 = ROLLTIME_TIMEOUT_CONST / freq3;
 	a3197s_set_reg(miner_id, REG_ROLLTIME, tmp32);
+}
+
+void a3197s_pll_apply(uint8_t miner_id, uint16_t asic_id)
+{
+	const uint16_t *base = g_pll_state.set_pll[miner_id][0];
+	uint16_t chip_select_id;
+
+	(void)asic_id;
+	chip_select_id = asic_get_chip_select();
+
+	if (!pll_offsets_active(miner_id)) {
+		a3197s_select_chip(miner_id, CHIP_ADDR_BROADCAST);
+		pll_write_sequence(miner_id, base[0], base[1], base[2], base[3]);
+	} else {
+		/* Each chip gets the same handshake and writes the broadcast
+		 * path sends, addressed to it alone, at its own clocks. */
+		uint16_t chip;
+
+		for (chip = 0; chip < PLL_CHIP_OFFSET_MAX; chip++) {
+			int16_t off = g_pll_chip_offset[miner_id][chip];
+
+			a3197s_select_chip(miner_id, chip);
+			pll_write_sequence(miner_id, pll_offset_freq(base[0], off),
+				pll_offset_freq(base[1], off), pll_offset_freq(base[2], off),
+				pll_offset_freq(base[3], off));
+		}
+		a3197s_select_chip(miner_id, CHIP_ADDR_BROADCAST);
+	}
 	delay_ms(1);
 
 	/* Read-only diagnostic: logs the LOCK/LOCK_IP bits inside the PLLxL1
@@ -168,7 +209,48 @@ void asic_refresh_rolltime(uint8_t miner_id, uint16_t freq3)
 	uint16_t chip_select_id = asic_get_chip_select();
 	uint32_t tmp32 = ROLLTIME_TIMEOUT_CONST / freq3;
 
-	a3197s_select_chip(miner_id, CHIP_ADDR_BROADCAST);
-	a3197s_set_reg(miner_id, REG_ROLLTIME, tmp32);
+	if (!pll_offsets_active(miner_id)) {
+		a3197s_select_chip(miner_id, CHIP_ADDR_BROADCAST);
+		a3197s_set_reg(miner_id, REG_ROLLTIME, tmp32);
+	} else {
+		uint16_t chip;
+
+		for (chip = 0; chip < PLL_CHIP_OFFSET_MAX; chip++) {
+			a3197s_select_chip(miner_id, chip);
+			a3197s_set_reg(miner_id, REG_ROLLTIME, ROLLTIME_TIMEOUT_CONST /
+				pll_offset_freq(freq3, g_pll_chip_offset[miner_id][chip]));
+		}
+	}
 	a3197s_select_chip(miner_id, chip_select_id);
+}
+
+/* Moves the per-chip offsets toward target, at most PLL_RAMP_STEP_MHZ per
+ * chip per step, one second apart (same pacing as asic_ramp_pll_freq()). */
+void asic_set_pll_chip_offsets(uint8_t miner_id, const int16_t target[PLL_CHIP_OFFSET_MAX])
+{
+	int moving = 1;
+
+	while (moving) {
+		int i;
+
+		moving = 0;
+		for (i = 0; i < PLL_CHIP_OFFSET_MAX; i++) {
+			int16_t *cur = &g_pll_chip_offset[miner_id][i];
+			int16_t d = (int16_t)(target[i] - *cur);
+
+			if (d > PLL_RAMP_STEP_MHZ)
+				d = PLL_RAMP_STEP_MHZ;
+			else if (d < -PLL_RAMP_STEP_MHZ)
+				d = -PLL_RAMP_STEP_MHZ;
+			if (d != 0) {
+				*cur = (int16_t)(*cur + d);
+				moving = 1;
+			}
+		}
+		if (moving) {
+			/* Once every offset reaches zero this is the broadcast path. */
+			a3197s_pll_apply(miner_id, 0);
+			delay_ms(1000);
+		}
+	}
 }

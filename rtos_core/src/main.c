@@ -1574,6 +1574,8 @@ struct stage6_ctx {
 	int32_t pending_voltage_raw_mv; /* IPC_MSG_SET_VOLTAGE_RAW override */
 	int have_pending_voltage_raw;
 	int have_pending_spdlog_reset; /* IPC_MSG_RESET_SPDLOG_RAW request */
+	int16_t pending_chip_offset[IPC_STATUS_MAX_CHIPS]; /* IPC_MSG_SET_CHIP_PLL_OFFSET */
+	int have_pending_chip_offset;
 	int rolltime_raw_override_active; /* Set while a raw rolltime
 					    * override is active; a new
 					    * SET_MODE clears it. */
@@ -1723,6 +1725,24 @@ static void stage6_recv_handler(uint16_t cmd, const void *body, uint16_t len)
 
 		fprintf(ctx->fp, "[recv] RESET_SPDLOG_RAW\n");
 		fflush(ctx->fp);
+	} else if (cmd == IPC_MSG_SET_CHIP_PLL_OFFSET) {
+		struct ipc_set_chip_pll_offset co;
+
+		if (len != sizeof(co)) {
+			fprintf(ctx->fp, "[recv] SET_CHIP_PLL_OFFSET bad len=%u (want %u)\n",
+				(unsigned)len, (unsigned)sizeof(co));
+			fflush(ctx->fp);
+			return;
+		}
+		memcpy(&co, body, sizeof(co));
+
+		pthread_mutex_lock(&ctx->lock);
+		memcpy(ctx->pending_chip_offset, co.offset_mhz, sizeof(ctx->pending_chip_offset));
+		ctx->have_pending_chip_offset = 1;
+		pthread_mutex_unlock(&ctx->lock);
+
+		fprintf(ctx->fp, "[recv] SET_CHIP_PLL_OFFSET\n");
+		fflush(ctx->fp);
 	} else {
 		pthread_mutex_lock(&ctx->lock);
 		ctx->wrong_peer = 1;
@@ -1827,8 +1847,10 @@ static void *stage6_worker(void *arg)
 		uint32_t pll_copy[4];
 		uint32_t rolltime_raw_copy = 0;
 		int32_t voltage_raw_copy = 0;
+		int16_t chip_offset_copy[IPC_STATUS_MAX_CHIPS];
 		int have_new_job = 0, have_new_mode = 0, have_new_rolltime_raw = 0,
-		    have_new_voltage_raw = 0, have_new_spdlog_reset = 0, wrong_peer;
+		    have_new_voltage_raw = 0, have_new_spdlog_reset = 0,
+		    have_new_chip_offset = 0, wrong_peer;
 		uint16_t chip;
 
 		g_stage6_last_progress = time(NULL);
@@ -1925,6 +1947,11 @@ static void *stage6_worker(void *arg)
 			have_new_spdlog_reset = 1;
 			ctx->have_pending_spdlog_reset = 0;
 		}
+		if (ctx->have_pending_chip_offset) {
+			memcpy(chip_offset_copy, ctx->pending_chip_offset, sizeof(chip_offset_copy));
+			have_new_chip_offset = 1;
+			ctx->have_pending_chip_offset = 0;
+		}
 		pthread_mutex_unlock(&ctx->lock);
 
 		/* PLL ramp, CORE_RST=1 pulse, and noncemask reconfiguration
@@ -1952,6 +1979,24 @@ static void *stage6_worker(void *arg)
 			fprintf(ctx->fp, "CORE_RST pulse + noncemask reconfigured after ramp\n");
 			fflush(ctx->fp);
 			ctx->rolltime_raw_override_active = 0;
+		}
+
+		/* After have_new_mode so offsets layer on the new base. Same
+		 * CORE_RST+noncemask sequence as have_new_mode's block. */
+		if (have_new_chip_offset) {
+			int i;
+
+			asic_set_pll_chip_offsets(STAGE6_UART_CHANNEL, chip_offset_copy);
+			a3197s_select_chip(STAGE6_UART_CHANNEL, CHIP_ADDR_BROADCAST);
+			a3197s_set_reg(STAGE6_UART_CHANNEL, REG_CORE_RST, 1);
+			asic_set_noncemask(STAGE6_UART_CHANNEL, 0x00000001);
+			fprintf(ctx->fp, "applied SET_CHIP_PLL_OFFSET [");
+			for (i = 0; i < IPC_STATUS_MAX_CHIPS; i++)
+				fprintf(ctx->fp, "%s%d", i ? "," : "", chip_offset_copy[i]);
+			fprintf(ctx->fp, "] on base [%u,%u,%u,%u]\n",
+				ctx->last_applied_pll_freq[0], ctx->last_applied_pll_freq[1],
+				ctx->last_applied_pll_freq[2], ctx->last_applied_pll_freq[3]);
+			fflush(ctx->fp);
 		}
 
 		/* Applied after have_new_mode's block so it always wins. */
