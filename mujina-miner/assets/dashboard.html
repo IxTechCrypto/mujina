@@ -169,6 +169,9 @@
     .at-feed { max-height: 120px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
     .at-feed .entry { display: flex; gap: 10px; color: var(--dim); }
     .at-feed .entry b { color: var(--ink); font-weight: 400; }
+    .at-console-header { flex-wrap: wrap; gap: 4px 12px; }
+    .at-title, .at-best-badge { overflow-wrap: anywhere; }
+    .at-feed .entry { flex-wrap: wrap; gap: 2px 8px; }
     .at-feed .entry i { color: var(--mag); font-style: normal; }
 
     .freq::before { background: var(--mag); box-shadow: 0 0 10px var(--mag); }
@@ -1298,6 +1301,7 @@ function renderFleet(d) {
 }
 
 function renderAutolog(at, bestId, listId) {
+  if (OWNER_ACTIVE) return; // owner-tune poll owns this panel
   if (!at) { $(listId).textContent = '—'; $(bestId).textContent = 'No calibration point established yet'; $('at-phase-label').textContent = 'IDLE'; return; }
   const b = at.best;
   $(bestId).textContent = b ? ('Best Point: ' + Math.round(b.frequency_mhz) + ' MHz @ ' + b.core_voltage_mv + ' mV'
@@ -1849,6 +1853,52 @@ $('poolReboot').addEventListener('click', poolRebootNow);
 loadPool();
 
 tick(); setInterval(tick, 2000);
+// Owner-tuner panel: separate 5 s poll of GET /api/v0/boards/nano3s-0/owner-tune.
+// All text goes in via textContent (event messages come from the device).
+let OWNER_ACTIVE = false;
+function renderOwnerTune(o) {
+  const best = $('atbest'), list = $('atlist'), st = $('at-phase-label');
+  if (!o.enabled) {
+    st.textContent = 'TUNER OFF';
+    best.textContent = 'tuner off';
+    list.textContent = 'tuner off';
+    return;
+  }
+  const parts = [(o.profile || '?') + ' / ' + (o.phase || '?')];
+  if (o.fan_duty_percent != null || o.fan_target_c != null) {
+    parts.push('fan ' + (o.fan_duty_percent != null ? o.fan_duty_percent + '%' : '—')
+      + ' → ' + (o.fan_target_c != null ? o.fan_target_c.toFixed(0) + '°C' : '—'));
+  }
+  if (o.averaging_progress) parts.push('avg ' + o.averaging_progress.ticks + '/' + o.averaging_progress.needed);
+  if (o.continuous_ceiling_w != null) parts.push('cap ' + o.continuous_ceiling_w.toFixed(0) + ' W');
+  st.textContent = parts.join(' · ');
+  const b = o.best;
+  best.textContent = b ? ('Best: ' + Math.round(b.freq_mhz) + ' MHz @ ' + b.voltage_mv + ' mV · ' + b.j_th.toFixed(1) + ' J/TH')
+    : 'No calibration point established yet';
+  list.textContent = '';
+  const ev = (o.events || []).slice().reverse();
+  if (!ev.length) { list.textContent = 'Warming up…'; return; }
+  for (const e of ev) {
+    const row = document.createElement('div'); row.className = 'entry';
+    const t = document.createElement('b'); t.textContent = '[-' + Math.round(e.t_secs_ago / 60) + 'm]';
+    const f = document.createElement('i'); f.textContent = Math.round(e.freq_mhz) + 'MHz/' + e.voltage_mv + 'mV';
+    const m = document.createElement('span');
+    m.textContent = e.message + ' (' + e.power_w.toFixed(0) + ' W, ' + e.hashrate_ths.toFixed(2) + ' TH/s)';
+    row.append(t, ' ', f, ' ', m);
+    list.appendChild(row);
+  }
+}
+async function pollOwnerTune() {
+  if (!$('atlist')) return;
+  try {
+    const r = await fetch('/api/v0/boards/nano3s-0/owner-tune');
+    if (!r.ok) { OWNER_ACTIVE = false; return; }
+    OWNER_ACTIVE = true;
+    renderOwnerTune(await r.json());
+  } catch (e) { OWNER_ACTIVE = false; }
+}
+pollOwnerTune(); setInterval(pollOwnerTune, 5000);
+
 </script>
 </body>
 </html>

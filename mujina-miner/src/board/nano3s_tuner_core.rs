@@ -82,6 +82,13 @@ pub struct TuneEnvelope {
     /// back to it only allowed) if its mean power is at most the cap minus
     /// this margin. 0.0 disables the hysteresis.
     pub best_point_margin_w: f32,
+    /// Efficiency trims move this many voltage grid steps per judgement
+    /// (1 = one step). If the larger move would cross the voltage floor or
+    /// the `probe_floor`, the largest smaller move that fits is used, so a
+    /// failed 3-step trim is refined with 2- then 1-step trims before the
+    /// walk locks. A value above 1 also enables the power-at-equal-hashrate
+    /// acceptance (see `evaluate_inner`).
+    pub trim_steps_per_judgement: u8,
 }
 
 impl TuneEnvelope {
@@ -120,6 +127,19 @@ impl TuneEnvelope {
             max_fail_rate_pct: None,
             average_judgement: false,
             best_point_margin_w: 0.0,
+            trim_steps_per_judgement: 1,
+        }
+    }
+
+    /// `n` voltage grid steps down from `mv`: the target is `mv - n*step`
+    /// (passing over a forbidden value is fine); if it lands exactly on one,
+    /// one more step is taken. `n == 1` equals [`Self::voltage_down`].
+    fn voltage_down_n(&self, mv: u16, n: u8) -> u16 {
+        let v = mv.saturating_sub(self.voltage_step_mv.saturating_mul(n as u16));
+        if self.is_forbidden(v) {
+            v.saturating_sub(self.voltage_step_mv)
+        } else {
+            v
         }
     }
 
@@ -170,6 +190,9 @@ impl Default for TuneEnvelope {
 /// directly against real measurements from this chip, never an extrapolated
 /// nameplate table.
 const IMPROVEMENT_MARGIN: f32 = 0.03;
+/// Power-at-equal-hashrate acceptance (multi-step envelopes only).
+const POWER_SAVING_MARGIN: f32 = 0.015;
+const HASHRATE_EQUAL_TOLERANCE: f32 = 0.01;
 /// Below this hashrate the board is still warming up / not usefully hashing;
 /// don't judge stability yet.
 const MIN_HASHRATE_THS: f32 = 0.3;
@@ -371,6 +394,10 @@ pub struct TuneEvent {
     pub core_voltage_mv: u16,
     pub asic_temp_c: f32,
     pub efficiency_j_th: Option<f32>,
+    pub power_w: f32,
+    pub hashrate_ths: f32,
+    /// `evaluate` call count when logged (the adapter turns it into age).
+    pub cycle: u64,
 }
 
 /// Snapshot the API returns for `GET /boards/{name}/autotune`.
@@ -463,6 +490,8 @@ pub struct AutoTuner {
     /// Running sums of hashrate/power/fail rate since the last applied change
     /// (only fed when `envelope.average_judgement`).
     acc: Accum,
+    /// Number of `evaluate` calls while enabled.
+    cycle: u64,
     log: VecDeque<TuneEvent>,
 }
 
@@ -525,6 +554,7 @@ impl Default for AutoTuner {
             stuck_at_limit_cycles: 0,
             pending_trim_from_mv: None,
             acc: Accum::default(),
+            cycle: 0,
             log: VecDeque::with_capacity(LOG_CAPACITY),
         }
     }
@@ -581,6 +611,21 @@ impl AutoTuner {
         self.probe_floor_mv = 0;
         self.pending_trim_from_mv = None;
         self.acc = Accum::default();
+    }
+
+    /// Evaluate calls so far while enabled (event ages are measured in these).
+    pub fn cycle(&self) -> u64 {
+        self.cycle
+    }
+
+    /// Recent activity-log entries, oldest first.
+    pub fn events(&self) -> impl Iterator<Item = &TuneEvent> {
+        self.log.iter()
+    }
+
+    /// Best measured point and its efficiency (J/TH).
+    pub fn best_point(&self) -> Option<(TuneSetpoint, f32)> {
+        self.best.map(|(sp, _, eff)| (sp, eff))
     }
 
     /// Averaging window progress: (samples accumulated, samples needed).
@@ -685,6 +730,9 @@ impl AutoTuner {
             core_voltage_mv: m.core_voltage_mv,
             asic_temp_c: m.asic_temp_c,
             efficiency_j_th: efficiency_j_th(m.power_w, m.hashrate_ths),
+            power_w: m.power_w,
+            hashrate_ths: m.hashrate_ths,
+            cycle: self.cycle,
         });
     }
 
@@ -702,6 +750,9 @@ impl AutoTuner {
     /// holding (settling, locked, or disabled). Pure aside from internal
     /// state; the caller applies the returned action to the hardware.
     pub fn evaluate(&mut self, m: &Metrics) -> Option<TuneAction> {
+        if self.enabled {
+            self.cycle += 1;
+        }
         if self.enabled && self.envelope.average_judgement {
             self.acc.add(m);
         }
@@ -942,7 +993,14 @@ impl AutoTuner {
             None => true,
             Some((_, best_hash, best_eff)) => {
                 if caps.seek_efficiency {
-                    efficiency < best_eff * (1.0 - IMPROVEMENT_MARGIN)
+                    // Multi-step envelopes also accept equal-hashrate power
+                    // savings: mean power down >= 1.5 % with mean hashrate
+                    // within -1 % (power is far less noisy than hashrate).
+                    let best_power = best_eff * best_hash;
+                    let power_win = env.trim_steps_per_judgement > 1
+                        && m.power_w <= best_power * (1.0 - POWER_SAVING_MARGIN)
+                        && hashrate >= best_hash * (1.0 - HASHRATE_EQUAL_TOLERANCE);
+                    power_win || efficiency < best_eff * (1.0 - IMPROVEMENT_MARGIN)
                 } else {
                     hashrate > best_hash * (1.0 + IMPROVEMENT_MARGIN)
                 }
@@ -1128,7 +1186,13 @@ impl AutoTuner {
         // droop+step (which would overshoot the stability cliff).
         let env = self.envelope;
         let current_v = self.commanded_voltage(m);
-        let trimmed = env.voltage_down(current_v);
+        // Largest trim (up to `trim_steps_per_judgement` grid steps) that
+        // stays on or above the floor and above the failed-trim `probe_floor`.
+        let trimmed = (1..=env.trim_steps_per_judgement.max(1))
+            .rev()
+            .map(|k| env.voltage_down_n(current_v, k))
+            .find(|t| *t >= env.min_voltage_mv && *t > self.probe_floor_mv)
+            .unwrap_or_else(|| env.voltage_down(current_v));
         if caps.seek_efficiency && trimmed >= env.min_voltage_mv && trimmed > self.probe_floor_mv {
             self.pending_trim_from_mv = Some(current_v);
             self.last_commanded_voltage_mv = Some(trimmed);
@@ -1688,6 +1752,7 @@ mod tests {
             max_fail_rate_pct: Some(10.0),
             average_judgement: false,
             best_point_margin_w: 0.0,
+            trim_steps_per_judgement: 1,
         }
     }
 
@@ -1978,5 +2043,67 @@ mod tests {
             t.evaluate(&m(50.0, 135.5, 6.0, 310.0, 3704));
         }
         assert_eq!(t.best, before);
+    }
+
+    // --- multi-step trims ------------------------------------------------------
+
+    fn v3_env() -> TuneEnvelope {
+        TuneEnvelope { trim_steps_per_judgement: 3, ..avg_env() }
+    }
+
+    #[test]
+    fn three_step_trim_path_skips_3600() {
+        let e = v3_env();
+        assert_eq!(e.voltage_down_n(3704, 3), 3626);
+        // 3626 - 78 = 3548: passes over 3600 without landing on it.
+        assert_eq!(e.voltage_down_n(3626, 3), 3548);
+        // Landing exactly on 3600 takes one more step.
+        assert_eq!(e.voltage_down_n(3678, 3), 3574 - 0); // 3600 -> 3574
+        assert_eq!(e.voltage_down_n(3704, 1), e.voltage_down(3704));
+        // bm1370 is unchanged.
+        let b = TuneEnvelope::bm1370();
+        assert_eq!(b.trim_steps_per_judgement, 1);
+        assert_eq!(b.voltage_down_n(1200, 1), b.voltage_down(1200));
+    }
+
+    #[test]
+    fn efficient_trims_three_steps_at_once_then_again() {
+        let mut t = avg_tuner(TuneProfile::Efficient, v3_env());
+        assert_eq!(noisy(&mut t, 80.0, 4.88, 0.0, 3704, 4), Some(TuneAction::SetVoltage(3626)));
+        // 6 % less power, same hashrate: accepted, trims again.
+        assert_eq!(noisy(&mut t, 75.0, 4.88, 0.0, 3626, 4), Some(TuneAction::SetVoltage(3548)));
+    }
+
+    #[test]
+    fn failed_multi_step_trim_reverts_then_refines_with_smaller_steps() {
+        let mut t = avg_tuner(TuneProfile::Efficient, v3_env());
+        noisy(&mut t, 80.0, 4.88, 0.0, 3704, 4); // -> 3626
+        // Mean fail rate 15 % > 10 %: back to the last good voltage.
+        let mut last = None;
+        for _ in 0..4 {
+            last = t.evaluate(&Metrics { fail_rate_pct: Some(15.0), ..m(50.0, 75.0, 4.88, 300.0, 3626) });
+        }
+        assert_eq!(last, Some(TuneAction::SetVoltage(3704)));
+        assert_eq!(t.phase, TunePhase::Locked);
+        // At the good point again: 3 steps would reach the failed 3626, so
+        // the refinement is a 2-step trim, then (if it fails) 1 step.
+        assert_eq!(noisy(&mut t, 80.0, 4.88, 0.0, 3704, 4), Some(TuneAction::SetVoltage(3652)));
+    }
+
+    #[test]
+    fn power_at_equal_hashrate_is_accepted_for_multi_step_only() {
+        // 2 % less power, hashrate -0.5 %: J/TH gain only ~1.5 % (< 3 %).
+        let run = |env: TuneEnvelope| {
+            let mut t = avg_tuner(TuneProfile::Efficient, env);
+            noisy(&mut t, 80.0, 4.88, 0.0, 3704, 4);
+            noisy(&mut t, 78.4, 4.856, 0.0, 3626, 4)
+        };
+        assert_eq!(run(v3_env()), Some(TuneAction::SetVoltage(3548)));
+        // Single-step envelope keeps the old criterion: reverts.
+        assert_eq!(run(TuneEnvelope { trim_steps_per_judgement: 1, ..avg_env() }), Some(TuneAction::SetVoltage(3704)));
+        // Hashrate down 3 %: not "equal hashrate", power win rejected.
+        let mut t = avg_tuner(TuneProfile::Efficient, v3_env());
+        noisy(&mut t, 80.0, 4.88, 0.0, 3704, 4);
+        assert_eq!(noisy(&mut t, 78.4, 4.73, 0.0, 3626, 4), Some(TuneAction::SetVoltage(3704)));
     }
 }

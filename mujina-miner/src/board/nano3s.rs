@@ -3005,7 +3005,7 @@ fn run_worker(
             // observes whatever they just did (last_applied_* are current)
             // instead of fighting it.
             if owner.is_enabled() {
-                owner.set_power_ceiling(owner::owner_power_ceiling(effective_safety_w));
+                owner.set_power_ceiling(owner::owner_power_ceiling(pd_ceiling_w, effective_safety_w));
                 if owner.tick_due(std::time::Instant::now()) {
                     let volt_now = last_applied_voltage_mv.map(|v| v.max(0) as u32).unwrap_or(st.voltage_mv);
                     let cmds: Vec<OwnerCmd> = if (st.temp_max as f64) >= owner::BACKSTOP_TEMP_C {
