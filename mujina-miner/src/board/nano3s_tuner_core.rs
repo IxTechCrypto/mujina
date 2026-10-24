@@ -73,6 +73,15 @@ pub struct TuneEnvelope {
     /// exceeds this is undone and the tuner locks. `None` disables the check
     /// (it is also inert unless `Metrics::fail_rate_pct` is `Some`).
     pub max_fail_rate_pct: Option<f32>,
+    /// Judge efficiency and fail rate on the MEAN of every evaluation since
+    /// the last applied change instead of the single settled sample. The
+    /// scheduler hashrate estimate is noisy between windows; safety checks
+    /// (temp/power caps) always use the instantaneous reading regardless.
+    pub average_judgement: bool,
+    /// Profile mode: a settled point is only recorded as best (and a climb
+    /// back to it only allowed) if its mean power is at most the cap minus
+    /// this margin. 0.0 disables the hysteresis.
+    pub best_point_margin_w: f32,
 }
 
 impl TuneEnvelope {
@@ -109,6 +118,8 @@ impl TuneEnvelope {
             target_hashrate_power_w: 22.0,
             target_power_headroom: 1.05,
             max_fail_rate_pct: None,
+            average_judgement: false,
+            best_point_margin_w: 0.0,
         }
     }
 
@@ -449,7 +460,47 @@ pub struct AutoTuner {
     /// has been judged. Lets the fail-rate check step back to the last good
     /// voltage.
     pending_trim_from_mv: Option<u16>,
+    /// Running sums of hashrate/power/fail rate since the last applied change
+    /// (only fed when `envelope.average_judgement`).
+    acc: Accum,
     log: VecDeque<TuneEvent>,
+}
+
+/// Running means for averaged judgement.
+#[derive(Clone, Copy, Debug, Default)]
+struct Accum {
+    n: u32,
+    hash: f32,
+    power: f32,
+    fail: f32,
+    fail_n: u32,
+}
+
+impl Accum {
+    fn add(&mut self, m: &Metrics) {
+        self.n += 1;
+        self.hash += m.hashrate_ths;
+        self.power += m.power_w;
+        if let Some(f) = m.fail_rate_pct {
+            self.fail += f;
+            self.fail_n += 1;
+        }
+    }
+
+    /// `m` with hashrate, power and fail rate replaced by the means; temp,
+    /// clock and voltage stay instantaneous.
+    fn mean_of(&self, m: &Metrics) -> Metrics {
+        if self.n == 0 {
+            return *m;
+        }
+        let n = self.n as f32;
+        Metrics {
+            hashrate_ths: self.hash / n,
+            power_w: self.power / n,
+            fail_rate_pct: if self.fail_n > 0 { Some(self.fail / self.fail_n as f32) } else { m.fail_rate_pct },
+            ..*m
+        }
+    }
 }
 
 impl Default for AutoTuner {
@@ -473,6 +524,7 @@ impl Default for AutoTuner {
             last_efficiency: None,
             stuck_at_limit_cycles: 0,
             pending_trim_from_mv: None,
+            acc: Accum::default(),
             log: VecDeque::with_capacity(LOG_CAPACITY),
         }
     }
@@ -494,6 +546,7 @@ impl AutoTuner {
         self.enabled = true;
         self.phase = TunePhase::Warmup;
         self.cycles_since_change = 0;
+        self.acc = Accum::default();
         // Fresh search: drop any best/log from a previous mode so we never
         // persist a stale point under the newly-selected mode.
         self.best = None;
@@ -527,6 +580,12 @@ impl AutoTuner {
         self.pending_reject_mhz = None;
         self.probe_floor_mv = 0;
         self.pending_trim_from_mv = None;
+        self.acc = Accum::default();
+    }
+
+    /// Averaging window progress: (samples accumulated, samples needed).
+    pub fn averaging_progress(&self) -> (u32, u32) {
+        (self.acc.n.min(self.envelope.settle_cycles), self.envelope.settle_cycles)
     }
 
     /// Update the chip count for the board this tuner is driving, looked up
@@ -548,6 +607,11 @@ impl AutoTuner {
     pub fn note_external_voltage(&mut self, mv: u16) {
         self.last_commanded_voltage_mv = Some(mv);
         self.pending_trim_from_mv = None;
+    }
+
+    /// nano-mujina addition: temperature cap (C) of the current mode.
+    pub fn temp_cap_c(&self) -> f32 {
+        self.caps().temp_c
     }
 
     /// nano-mujina addition: whether the tuner currently holds the fan at 100 %.
@@ -586,6 +650,7 @@ impl AutoTuner {
         self.enabled = false;
         self.phase = TunePhase::Disabled;
         self.last_commanded_voltage_mv = None;
+        self.acc = Accum::default();
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -637,6 +702,17 @@ impl AutoTuner {
     /// holding (settling, locked, or disabled). Pure aside from internal
     /// state; the caller applies the returned action to the hardware.
     pub fn evaluate(&mut self, m: &Metrics) -> Option<TuneAction> {
+        if self.enabled && self.envelope.average_judgement {
+            self.acc.add(m);
+        }
+        let action = self.evaluate_inner(m);
+        if action.is_some() {
+            self.acc = Accum::default();
+        }
+        action
+    }
+
+    fn evaluate_inner(&mut self, m: &Metrics) -> Option<TuneAction> {
         if !self.enabled {
             return None;
         }
@@ -714,6 +790,16 @@ impl AutoTuner {
             } else {
                 format!("power {:.1}W over {:.0}W cap", m.power_w, caps.power_w)
             };
+            // Cap hysteresis: a clock above best that breaches the POWER cap
+            // is a real ceiling (power is deterministic in clock), so the
+            // climb must not return to it and oscillate across the cap.
+            if env.best_point_margin_w > 0.0
+                && m.power_w > caps.power_w
+                && let Some((b, ..)) = self.best
+                && m.frequency_mhz > b.frequency_mhz + FREQ_TOLERANCE_MHZ
+            {
+                self.probe_ceiling_mhz = self.probe_ceiling_mhz.min(m.frequency_mhz);
+            }
             if m.frequency_mhz > env.min_freq_mhz {
                 let target = (m.frequency_mhz - env.freq_step_mhz).max(env.min_freq_mhz);
                 self.log_event(format!("{why}: lowering to {target:.0} MHz"), m);
@@ -753,6 +839,13 @@ impl AutoTuner {
             return None;
         }
         self.cycles_since_change = 0;
+
+        // Averaged judgement: from here on efficiency, fail rate and the
+        // headroom checks see the window means; the safety branch above
+        // already ran on the instantaneous reading.
+        let judged = if self.envelope.average_judgement { self.acc.mean_of(m) } else { *m };
+        self.acc = Accum::default();
+        let m = &judged;
 
         // Target mode converges to a fixed setpoint rather than climbing as
         // far as the caps allow -- entirely different logic from the
@@ -797,6 +890,10 @@ impl AutoTuner {
         // recorded `best`, an `at_best` match, and the next raise/trim all
         // agree instead of chasing regulator droop.
         let commanded_v = self.commanded_voltage(m);
+        // Cap hysteresis: a point whose mean power sits inside the margin
+        // below the cap is "at cap" and never becomes the known-good point.
+        let near_cap = env.best_point_margin_w > 0.0
+            && m.power_w > caps.power_w - env.best_point_margin_w;
 
         // 3. At the setpoint recorded as `best`: this is a confirmation, not a
         //    new candidate (e.g. we just returned here after a transient
@@ -817,20 +914,31 @@ impl AutoTuner {
                 return None;
             }
             self.pending_reject_mhz = None;
-            self.best = Some((
-                TuneSetpoint {
-                    frequency_mhz: m.frequency_mhz,
-                    core_voltage_mv: commanded_v,
-                },
-                hashrate,
-                efficiency,
-            ));
+            if !near_cap {
+                self.best = Some((
+                    TuneSetpoint {
+                        frequency_mhz: m.frequency_mhz,
+                        core_voltage_mv: commanded_v,
+                    },
+                    hashrate,
+                    efficiency,
+                ));
+            }
             return self.seek_further_or_lock(m, &caps);
         }
 
         // 4. A genuinely new candidate point: judge it directly against the
         //    best ever measured on this chip, never an extrapolated table.
-        let strictly_improved = match self.best {
+        let at_cap_candidate = near_cap && self.best.is_some();
+        if at_cap_candidate
+            && let Some((b, ..)) = self.best
+            && m.frequency_mhz > b.frequency_mhz + FREQ_TOLERANCE_MHZ
+        {
+            // Deterministic (power, not noisy hashrate): exclude at once.
+            self.probe_ceiling_mhz = self.probe_ceiling_mhz.min(m.frequency_mhz);
+            self.pending_reject_mhz = Some(m.frequency_mhz);
+        }
+        let strictly_improved = !at_cap_candidate && match self.best {
             None => true,
             Some((_, best_hash, best_eff)) => {
                 if caps.seek_efficiency {
@@ -868,6 +976,7 @@ impl AutoTuner {
         if caps.seek_hash
             && m.frequency_mhz > best.frequency_mhz + FREQ_TOLERANCE_MHZ
             && hashrate >= MIN_HASHRATE_THS
+            && !near_cap
             && env.voltage_up(commanded_v) <= env.max_voltage_mv
             && m.power_w < caps.power_w - 1.0
         {
@@ -1031,7 +1140,8 @@ impl AutoTuner {
         }
 
         let next = m.frequency_mhz + env.freq_step_mhz;
-        let has_headroom = m.asic_temp_c < caps.temp_c - 3.0 && m.power_w < caps.power_w - 1.0;
+        let has_headroom = m.asic_temp_c < caps.temp_c - 3.0
+            && m.power_w < caps.power_w - 1.0 - env.best_point_margin_w;
         if caps.seek_hash
             && next <= env.max_freq_mhz
             && next < self.probe_ceiling_mhz
@@ -1576,6 +1686,8 @@ mod tests {
             target_hashrate_power_w: 137.0,
             target_power_headroom: 1.05,
             max_fail_rate_pct: Some(10.0),
+            average_judgement: false,
+            best_point_margin_w: 0.0,
         }
     }
 
@@ -1731,5 +1843,140 @@ mod tests {
             step_to_action(&mut t, &hi(11.0, 1190)),
             Some(TuneAction::SetVoltage(1180))
         );
+    }
+
+    // --- averaged judgement + cap hysteresis ---------------------------------
+
+    fn avg_env() -> TuneEnvelope {
+        TuneEnvelope {
+            settle_cycles: 4,
+            safety_settle_cycles: 1,
+            average_judgement: true,
+            ..nano_env()
+        }
+    }
+
+    fn avg_tuner(profile: TuneProfile, env: TuneEnvelope) -> AutoTuner {
+        let mut t = AutoTuner::default();
+        t.set_envelope(env);
+        t.enable_profile(profile);
+        t
+    }
+
+    /// Feeds `n` samples alternating +/- `noise` (fraction) on hashrate.
+    fn noisy(t: &mut AutoTuner, power: f32, hash: f32, noise: f32, volt: u16, n: u32) -> Option<TuneAction> {
+        let mut last = None;
+        for k in 0..n {
+            let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
+            last = t.evaluate(&m(50.0, power, hash * (1.0 + sign * noise), 300.0, volt));
+        }
+        last
+    }
+
+    #[test]
+    fn averaged_judgement_accepts_a_real_trim_despite_noise() {
+        // Baseline 80 W / 4.88 TH/s, then a trim to 76 W (5 % better J/TH).
+        // The judging sample reads 4 % low; alone it would look like a 1 %
+        // gain and be reverted. The window mean sees the real gain.
+        let mut t = avg_tuner(TuneProfile::Efficient, avg_env());
+        assert_eq!(noisy(&mut t, 80.0, 4.88, 0.0, 3704, 4), Some(TuneAction::SetVoltage(3678)));
+        assert_eq!(noisy(&mut t, 76.0, 4.88, 0.04, 3678, 4), Some(TuneAction::SetVoltage(3652)));
+
+        // Same samples with averaging off: the trim is (wrongly) reverted.
+        let mut u = avg_tuner(TuneProfile::Efficient, TuneEnvelope { average_judgement: false, ..avg_env() });
+        assert_eq!(noisy(&mut u, 80.0, 4.88, 0.0, 3704, 4), Some(TuneAction::SetVoltage(3678)));
+        assert_eq!(noisy(&mut u, 76.0, 4.88, 0.04, 3678, 4), Some(TuneAction::SetVoltage(3704)));
+    }
+
+    #[test]
+    fn averaged_judgement_uses_mean_fail_rate_and_reports_progress() {
+        let mut t = avg_tuner(TuneProfile::Efficient, avg_env());
+        noisy(&mut t, 80.0, 4.88, 0.0, 3704, 4);
+        assert_eq!(t.averaging_progress(), (0, 4));
+        // Fail rate 12, 2, 12, 2: mean 7 < 10 -> trim stands.
+        let mut last = None;
+        for (i, f) in [12.0, 2.0, 12.0, 2.0].into_iter().enumerate() {
+            last = t.evaluate(&Metrics { fail_rate_pct: Some(f), ..m(50.0, 76.0, 4.88, 300.0, 3678) });
+            assert_eq!(t.averaging_progress().0, if i < 3 { i as u32 + 1 } else { 0 });
+        }
+        assert_eq!(last, Some(TuneAction::SetVoltage(3652)));
+    }
+
+    #[test]
+    fn averaged_judgement_still_trips_safety_on_one_hot_sample() {
+        let mut t = avg_tuner(TuneProfile::Efficient, avg_env()); // temp cap 60
+        noisy(&mut t, 80.0, 4.88, 0.0, 3704, 2);
+        let hot = m(75.0, 80.0, 4.88, 300.0, 3704);
+        assert_eq!(t.evaluate(&hot), Some(TuneAction::SetFanFull));
+        // Fan already full, next hot sample after the 1-cycle safety settle.
+        assert_eq!(t.evaluate(&hot), Some(TuneAction::SetFrequency(290.0)));
+        // Power breach is also instantaneous.
+        let mut t = avg_tuner(TuneProfile::Efficient, avg_env()); // power cap 90
+        noisy(&mut t, 80.0, 4.88, 0.0, 3704, 2);
+        t.evaluate(&m(50.0, 80.0, 4.88, 300.0, 3704));
+        assert_eq!(t.evaluate(&m(50.0, 95.0, 4.88, 300.0, 3704)), Some(TuneAction::SetFrequency(290.0)));
+    }
+
+    #[test]
+    fn default_envelope_does_not_average() {
+        let e = TuneEnvelope::bm1370();
+        assert!(!e.average_judgement);
+        assert_eq!(e.best_point_margin_w, 0.0);
+        let mut t = AutoTuner::default();
+        t.enable_profile(TuneProfile::Efficient);
+        t.evaluate(&m(50.0, 12.0, 1.0, 525.0, 1200));
+        assert_eq!(t.averaging_progress().0, 0);
+    }
+
+    /// Climb sim: power is deterministic in clock (101 W + 0.4 W/MHz above
+    /// 300), hashrate grows with clock, power drifts +/-0.5 W sample to
+    /// sample. Returns the iteration of the last frequency change.
+    fn climb_sim(margin: f32) -> (usize, f32) {
+        let env = TuneEnvelope { best_point_margin_w: margin, ..avg_env() };
+        let mut t = avg_tuner(TuneProfile::MaxHash, env); // cap 137 W
+        let mut freq = 300.0_f32;
+        let mut last_change = 0;
+        for i in 0..400 {
+            let drift = if i % 2 == 0 { 0.5 } else { -0.5 };
+            let power = 101.0 + 0.4 * (freq - 300.0) + drift;
+            let hash = (freq / 100.0).powi(2) * 0.5;
+            match t.evaluate(&m(50.0, power, hash, freq, 3704)) {
+                Some(TuneAction::SetFrequency(f)) => {
+                    freq = f;
+                    last_change = i;
+                }
+                _ => {}
+            }
+        }
+        (last_change, freq)
+    }
+
+    #[test]
+    fn cap_hysteresis_stops_oscillation_across_the_power_cap() {
+        // 380 MHz = 133.2 W (inside cap - 3 margin = 134), 390 MHz = 137.2 W.
+        let (last, freq) = climb_sim(3.0);
+        assert!(last < 200, "still changing clock at iteration {last}");
+        assert_eq!(freq, 380.0);
+        // Without the margin the same plant keeps hopping across the cap.
+        let (last, _) = climb_sim(0.0);
+        assert!(last >= 300, "control case should oscillate, last change {last}");
+    }
+
+    #[test]
+    fn point_inside_the_margin_is_not_recorded_as_best() {
+        let env = TuneEnvelope { best_point_margin_w: 3.0, ..avg_env() };
+        let mut t = avg_tuner(TuneProfile::MaxHash, env);
+        // First point 135 W (inside the margin, cap 137): nothing to revert
+        // to, so it is recorded anyway.
+        noisy(&mut t, 135.0, 5.0, 0.0, 3704, 4);
+        assert!(t.best.is_some());
+        // A later improving point inside the margin is NOT adopted.
+        let before = t.best;
+        let a = t.evaluate(&m(50.0, 135.5, 6.0, 310.0, 3704));
+        assert_eq!(a, None);
+        for _ in 0..3 {
+            t.evaluate(&m(50.0, 135.5, 6.0, 310.0, 3704));
+        }
+        assert_eq!(t.best, before);
     }
 }
