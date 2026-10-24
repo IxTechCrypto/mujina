@@ -1272,6 +1272,9 @@ struct PersistedTuning {
     /// tuner owns frequency+voltage+fan escalation and the three aadhi loops
     /// above are forced off, at startup and live. `None` = off (default).
     owner_tune_profile: Option<TuneProfile>,
+    /// Chip-temp target (C) the owner-tuner fan loop holds; `None` = profile
+    /// temp cap - 5 C.
+    owner_fan_target_c: Option<f32>,
 }
 
 /// Reads [`TUNING_CONF_PATH`], or all-`None` if missing/unparseable --
@@ -1304,6 +1307,10 @@ fn load_tuning() -> PersistedTuning {
             }
             "autotune_level" => cfg.autotune_level = value.parse::<f64>().ok(),
             "owner_tune_profile" => cfg.owner_tune_profile = owner::parse_directive(value).ok().flatten(),
+            "owner_fan_target_c" => {
+                cfg.owner_fan_target_c =
+                    value.parse::<f32>().ok().filter(|c| owner::FAN_TARGET_RANGE_C.contains(c))
+            }
             _ => {}
         }
     }
@@ -1338,6 +1345,9 @@ fn write_tuning_conf(cfg: &PersistedTuning) {
             "owner_tune_profile={}\n",
             owner::directive_for(Some(p)).trim_start_matches("owner_tune:")
         ));
+    }
+    if let Some(c) = cfg.owner_fan_target_c {
+        out.push_str(&format!("owner_fan_target_c={c}\n"));
     }
     if let Err(e) = std::fs::write(TUNING_CONF_PATH, out) {
         eprintln!("[nano3s] failed to write {TUNING_CONF_PATH}: {e}");
@@ -1400,6 +1410,12 @@ fn persist_autotune_hashrate_target(target_ths: Option<f64>) {
     write_tuning_conf(&cfg);
 }
 
+fn persist_owner_fan_target(c: Option<f32>) {
+    let mut cfg = load_tuning();
+    cfg.owner_fan_target_c = c;
+    write_tuning_conf(&cfg);
+}
+
 fn persist_owner_tune_profile(profile: Option<TuneProfile>) {
     let mut cfg = load_tuning();
     cfg.owner_tune_profile = profile;
@@ -1419,11 +1435,15 @@ fn disable_owner_for_manual(owner: &mut OwnerTune, why: &str) {
     eprintln!("[nano3s] owner-tune: disabled by {why}");
 }
 
-/// Queues an `owner_tune:<profile|off>` directive for the run loop. The
-/// worker persists the choice when it consumes the directive. Shares the
-/// single-slot control file with every other writer: space calls >= 5 s.
-pub(crate) fn write_owner_tune_command(profile: Option<TuneProfile>) -> std::io::Result<()> {
-    std::fs::write(MUJINA_CONTROL_FILE, owner::directive_for(profile))
+/// Queues an `owner_tune:<profile|off|keep>[;fan=<C>]` directive for the run
+/// loop (`profile`: `Some(None)` = off, `None` = keep). The worker persists
+/// the choice when it consumes the directive. Shares the single-slot control
+/// file with every other writer: space calls >= 5 s.
+pub(crate) fn write_owner_tune_command(
+    profile: Option<Option<TuneProfile>>,
+    fan_target_c: Option<f32>,
+) -> std::io::Result<()> {
+    std::fs::write(MUJINA_CONTROL_FILE, owner::directive_for_request(profile, fan_target_c))
 }
 
 fn persist_autotune_level(level: f64) {
@@ -2259,7 +2279,22 @@ fn run_worker(
     // autotune_hashrate_target_ths are all None (startup guards above, and
     // the `owner_tune:` arm). aadhi's PSU safety trip and the 97C backstop
     // below keep running and win over it.
-    let mut owner = OwnerTune::new();
+    let (owner_env, owner_env_from_file) = owner::load_envelope(owner::CALI_PATH);
+    if owner_env_from_file {
+        eprintln!(
+            "[nano3s] owner-tune: caps from {}: min {} mV, quiet {}W/{}C, efficient {}W/{}C, balanced {}W/{}C, max_hash {}W/{}C",
+            owner::CALI_PATH,
+            owner_env.min_voltage_mv,
+            owner_env.quiet.power_w, owner_env.quiet.temp_c,
+            owner_env.efficient.power_w, owner_env.efficient.temp_c,
+            owner_env.balanced.power_w, owner_env.balanced.temp_c,
+            owner_env.max_hash.power_w, owner_env.max_hash.temp_c,
+        );
+    } else {
+        eprintln!("[nano3s] owner-tune: {} missing/invalid, using built-in cap constants", owner::CALI_PATH);
+    }
+    let mut owner = OwnerTune::with_envelope(owner_env);
+    owner.set_fan_target(persisted_tuning.owner_fan_target_c);
     if let Some(p) = persisted_tuning.owner_tune_profile {
         owner.enable(p);
         eprintln!("[nano3s] owner-tune: resumed profile {p:?} from {TUNING_CONF_PATH}");
@@ -2300,8 +2335,18 @@ fn run_worker(
                 eprintln!("[nano3s] manual RESUME via {MUJINA_CONTROL_FILE} (reapplied pll_freq={last_applied_pll_freq:?} voltage_mv={last_applied_voltage_mv:?})");
             }
             Some(s) if s.starts_with("owner_tune:") => {
-                match owner::parse_directive(&s["owner_tune:".len()..]) {
-                    Ok(Some(profile)) => {
+                let parsed = owner::parse_owner_directive(&s["owner_tune:".len()..]);
+                if let Ok(d) = &parsed
+                    && let Some(c) = d.fan_target_c
+                {
+                    owner.set_fan_target(Some(c));
+                    persist_owner_fan_target(Some(c));
+                    owner.publish(None);
+                    eprintln!("[nano3s] owner-tune: chip-temp fan target {c} C");
+                }
+                match parsed.map(|d| d.profile) {
+                    Ok(None) => {} // `keep`: fan target only
+                    Ok(Some(Some(profile))) => {
                         // Exclusive: the owner tuner takes over frequency,
                         // voltage and fan escalation; aadhi's loops go off
                         // (live and persisted).
@@ -2322,7 +2367,7 @@ fn run_worker(
                         owner.publish(None);
                         eprintln!("[nano3s] owner-tune: enabled profile {profile:?} (power-target/temp-target/autotune-hashrate disabled)");
                     }
-                    Ok(None) => {
+                    Ok(Some(None)) => {
                         if let Some(OwnerCmd::Fan(t)) = owner.disable() {
                             write_harness_control(t);
                         }
@@ -2983,6 +3028,12 @@ fn run_worker(
                     } else {
                         Vec::new()
                     };
+                    // Chip-temp fan loop: runs every owner tick even when the
+                    // tuner had no metrics (missing temp -> 100 %). It is the
+                    // only source of fan writes, so at most one per tick.
+                    let mut cmds = cmds;
+                    let fan_temp = Some(st.temp_max).filter(|t| *t > 0.0);
+                    cmds.extend(owner.fan_tick(fan_temp));
                     for cmd in cmds {
                         match cmd {
                             OwnerCmd::SetMode(f) => {
@@ -3012,6 +3063,10 @@ fn run_worker(
                             OwnerCmd::Fan(t) => {
                                 eprintln!("[nano3s] owner-tune: harness {t}");
                                 write_harness_control(t);
+                            }
+                            OwnerCmd::FanManual(d) => {
+                                eprintln!("[nano3s] owner-tune: fan:manual,{d} (temp_max {:.1}C)", st.temp_max);
+                                write_harness_control(&format!("fan:manual,{d}"));
                             }
                         }
                     }

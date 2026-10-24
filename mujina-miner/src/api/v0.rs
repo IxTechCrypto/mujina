@@ -626,6 +626,7 @@ async fn get_board_owner_tune(
     request_body = OwnerTuneRequest,
     responses(
         (status = OK, description = "Owner-tune directive queued"),
+        (status = BAD_REQUEST, description = "chip_temp_target_c outside 60..88"),
         (status = NOT_FOUND, description = "Board not found"),
         (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support the owner tuner"),
     ),
@@ -645,9 +646,12 @@ async fn patch_board_owner_tune(
     if !known {
         return Err(StatusCode::NOT_FOUND);
     }
+    if req.validate().is_err() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     #[cfg(feature = "nano3s")]
     {
-        crate::board::nano3s::write_owner_tune_command(req.profile)
+        crate::board::nano3s::write_owner_tune_command(req.profile_change(), req.chip_temp_target_c)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         Ok(StatusCode::OK)
     }
