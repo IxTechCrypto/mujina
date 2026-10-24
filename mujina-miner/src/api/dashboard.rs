@@ -358,6 +358,8 @@ fn board_json(b: &BoardTelemetry, series: Vec<f64>) -> Value {
         },
         "asic_c": asic_c,
         "outlet_c": outlet_c,
+        // No discrete VR sensor on this board; key present per the unified contract.
+        "vr_c": Value::Null,
         "fail_rate_pct": fail_rate_pct,
         "best_share_diff": best_share_diff,
         "chips": chips,

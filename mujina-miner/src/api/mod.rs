@@ -8,6 +8,7 @@ pub mod commands;
 mod dashboard;
 mod registry;
 mod server;
+mod system;
 mod v0;
 
 pub use registry::BoardRegistration;

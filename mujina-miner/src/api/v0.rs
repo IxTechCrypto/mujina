@@ -50,6 +50,8 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_board_psu, patch_board_psu))
         .routes(routes!(get_board_autotune_hashrate, patch_board_autotune_hashrate))
         .routes(routes!(get_board_owner_tune, patch_board_owner_tune))
+        .routes(routes!(get_board_tuner, patch_board_tuner))
+        .routes(routes!(get_system))
         .routes(routes!(patch_board_fan))
         .routes(routes!(get_board_fan_curve, patch_board_fan_curve))
         .routes(routes!(patch_board_pause))
@@ -660,6 +662,126 @@ async fn patch_board_owner_tune(
         let _ = req;
         Err(StatusCode::NOT_IMPLEMENTED)
     }
+}
+
+/// Unified-dashboard alias of `GET /boards/{name}/owner-tune`.
+#[utoipa::path(
+    get,
+    path = "/boards/{name}/tuner",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    responses(
+        (status = OK, description = "Current owner-tuner state", body = OwnerTuneStatus),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support the owner tuner"),
+    ),
+)]
+async fn get_board_tuner(
+    state: State<SharedState>,
+    name: Path<String>,
+) -> Result<Json<OwnerTuneStatus>, StatusCode> {
+    get_board_owner_tune(state, name).await
+}
+
+/// Unified-dashboard alias of `PATCH /boards/{name}/owner-tune`.
+#[utoipa::path(
+    patch,
+    path = "/boards/{name}/tuner",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    request_body = OwnerTuneRequest,
+    responses(
+        (status = OK, description = "Tuner directive queued"),
+        (status = BAD_REQUEST, description = "chip_temp_target_c outside 60..88"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support the owner tuner"),
+    ),
+)]
+async fn patch_board_tuner(
+    state: State<SharedState>,
+    name: Path<String>,
+    req: Json<OwnerTuneRequest>,
+) -> Result<StatusCode, StatusCode> {
+    patch_board_owner_tune(state, name, req).await
+}
+
+/// Capability document for the unified dashboard (docs/unified-dashboard-spec.md).
+#[utoipa::path(
+    get,
+    path = "/system",
+    tag = "system",
+    responses(
+        (status = OK, description = "Mode, device, power and per-board capabilities"),
+    ),
+)]
+async fn get_system(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    use super::system::{BoardCaps, SystemBoard, SystemInfo, build_sha, build_system};
+    let names: Vec<(String, String)> = state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .boards()
+        .into_iter()
+        .map(|b| (b.name, b.model))
+        .collect();
+    #[cfg(feature = "nano3s")]
+    let info = {
+        let (_bus_v, _attached, detected_w, override_w, effective_w) = crate::board::nano3s::read_psu_status();
+        let contract_w = override_w.or(detected_w);
+        let base = contract_w.unwrap_or(f64::INFINITY);
+        let ceiling = super::system::ceiling_if_known(
+            contract_w,
+            crate::board::nano3s_owner_tune::owner_power_ceiling(base, effective_w),
+        );
+        let chips = crate::board::nano3s::get_detail_snapshot().map(|d| d.chips.len() as u32).unwrap_or(0);
+        SystemInfo {
+            mode: "embedded",
+            platform: "nano3s-k230".into(),
+            version: env!("CARGO_PKG_VERSION"),
+            build: build_sha(),
+            update: "bundle",
+            device_model: Some("Avalon Nano 3S".into()),
+            can_reboot: true,
+            can_restart_miner: false,
+            pool_apply: "reboot",
+            shared_rail: true,
+            ceiling_w: ceiling,
+            psu_contract_w: contract_w,
+            boards: names
+                .into_iter()
+                .map(|(name, model)| SystemBoard {
+                    caps: BoardCaps::nano3s(&name),
+                    name,
+                    model: Some(model),
+                    chips,
+                })
+                .collect(),
+        }
+    };
+    #[cfg(not(feature = "nano3s"))]
+    let info = SystemInfo {
+        mode: "host",
+        platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        version: env!("CARGO_PKG_VERSION"),
+        build: build_sha(),
+        update: "none",
+        device_model: None,
+        can_reboot: false,
+        can_restart_miner: false,
+        pool_apply: "restart",
+        shared_rail: false,
+        ceiling_w: None,
+        psu_contract_w: None,
+        boards: names
+            .into_iter()
+            .map(|(name, model)| SystemBoard { name, model: Some(model), chips: 0, caps: BoardCaps::generic() })
+            .collect(),
+    };
+    Json(build_system(&info))
 }
 
 /// Live-edit fan control, no reboot required.

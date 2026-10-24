@@ -1,6 +1,15 @@
 use std::path::PathBuf;
 
 fn main() {
+    // Short git sha for GET /api/v0/system (empty when git is unavailable).
+    let sha = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=MUJINA_GIT_SHA={sha}");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NANO3S");
     if std::env::var("CARGO_FEATURE_NANO3S").is_err() {
         return;
