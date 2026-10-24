@@ -393,7 +393,6 @@
     .off { background: var(--amber); box-shadow: 0 0 10px var(--amber); }
     @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
     
-    .controls { display: contents; } /* desktop: wrapper is invisible */
     @media(max-width: 640px) {
       .wrap { padding: 18px 12px 32px; }
       .top { flex-wrap: wrap; gap: 6px; }
@@ -416,9 +415,8 @@
       .sec .sec-sub { margin-left: 0; flex: 1 1 100%; line-height: 1.4; }
       #statuspath { display: none; }
       .chartwrap { height: 220px; }
-      /* phone order: fleet / hashrate / chip temps first, controls last */
+      /* phone order: status line last */
       .wrap { display: flex; flex-direction: column; }
-      .controls { display: block; order: 8; }
       .status { order: 9; }
     }
     @media(max-width: 480px) {
@@ -438,6 +436,23 @@
       .card .val { font-size: 18px; }
       .hero .val { font-size: 32px; }
     }
+
+    /* Menu bar + menu sheets */
+    .menubar { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 14px; }
+    .menubar .menubtn {
+      background: #0a1120; border: 1px solid var(--line); color: var(--cyan); cursor: pointer;
+      font-family: 'Orbitron', sans-serif; font-weight: 700; font-size: 11px; letter-spacing: .14em;
+      text-transform: uppercase; padding: 9px 14px; border-radius: 4px;
+    }
+    .menubar .menubtn:hover, .menubar .menubtn.on { border-color: var(--cyan); box-shadow: 0 0 10px rgba(0,240,255,.3); }
+    .menusheet .sheet { width: min(640px, 96vw); position: relative; }
+    .menusheet .sheetclose { position: sticky; top: 0; float: right; z-index: 2; margin: 0 0 8px 8px; }
+    .menusheet .sheet .sec:first-of-type { margin-top: 4px; }
+    #ownCur { font-size: 13px; color: var(--ink); line-height: 1.5; margin-bottom: 12px; overflow-wrap: anywhere; }
+    @media(max-width: 480px) {
+      .menubar .menubtn { flex: 1 1 30%; padding: 9px 6px; }
+      .menusheet .sheet { width: 100vw; max-width: 100vw; height: 100vh; max-height: 100vh; border-radius: 0; }
+    }
   </style>
 </head>
 <body>
@@ -455,12 +470,23 @@
     </div>
   </div>
 
+  <div class="menubar" id="menubar">
+    <button type="button" class="menubtn" data-menu="power">Power</button>
+    <button type="button" class="menubtn" data-menu="tuning">Tuning</button>
+    <button type="button" class="menubtn" data-menu="fan">Fan</button>
+    <button type="button" class="menubtn" data-menu="curve">Fan Curve</button>
+    <button type="button" class="menubtn" data-menu="pool">Pool</button>
+  </div>
+
   <!-- Alert Banner for Thermal & Hardware Warnings -->
   <div class="alert-banner" id="alertBanner">
     <span id="alertText">⚠️ Thermal Warning: ASIC temperature elevated</span>
   </div>
 
-  <div class="controls">
+  <div class="modal menusheet" id="menu-power">
+    <div class="sheet">
+      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
+      <h2>Power</h2>
   <!-- Power Controls -->
   <div class="sec">Power Controls<span class="sec-sub">Idle the chain or reboot the device</span></div>
   <div class="card" style="max-width:560px">
@@ -474,6 +500,31 @@
     </small>
     <div class="msg" id="powerMsg"></div>
   </div>
+
+    </div>
+  </div>
+
+  <div class="modal menusheet" id="menu-tuning">
+    <div class="sheet">
+      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
+      <h2>Tuning</h2>
+      <div class="modalsec" style="margin-top:12px">Owner Tuner (IxTech)</div>
+      <div id="ownCur">tuner status loading&hellip;</div>
+      <div class="row">
+        <label for="ownProfile">Profile</label>
+        <select id="ownProfile" style="background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit">
+          <option value="off">Off</option>
+          <option value="quiet">Quiet</option>
+          <option value="efficient">Efficient</option>
+          <option value="balanced">Balanced</option>
+          <option value="max_hash">Max hash</option>
+        </select>
+      </div>
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:4px">
+        <button class="btn pri" id="ownApply" type="button">Apply</button>
+      </div>
+      <div class="msg" id="ownMsg"></div>
+      <div class="note">Using any Live Tuning control below switches the owner tuner off.</div>
 
   <!-- Live PLL / Voltage Tuning -->
   <div class="sec">Live Tuning<span class="sec-sub">PLL frequency, core voltage &amp; power target — applies over IPC in ~200ms, no reboot</span></div>
@@ -513,6 +564,13 @@
     <div class="msg" id="tuneMsg"></div>
   </div>
 
+    </div>
+  </div>
+
+  <div class="modal menusheet" id="menu-fan">
+    <div class="sheet">
+      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
+      <h2>Fan</h2>
   <!-- Fan Control -->
   <div class="sec">Fan Control<span class="sec-sub">Real duty-based control on pwmchip0/pwm3 — auto mode runs the fan curve below, escalating to 100% if any chip crosses the active mode's tuning limit</span></div>
   <div class="card" style="max-width:560px">
@@ -533,6 +591,13 @@
     <div class="msg" id="fanMsg"></div>
   </div>
 
+    </div>
+  </div>
+
+  <div class="modal menusheet" id="menu-curve">
+    <div class="sheet">
+      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
+      <h2>Fan Curve</h2>
   <!-- Fan Curve -->
   <div class="sec">Fan Curve<span class="sec-sub">Outlet-temp → duty% baseline, used in Auto mode — saved immediately, applied within ~1s</span></div>
   <div class="card" style="max-width:560px">
@@ -549,6 +614,35 @@
     <div class="msg" id="curveMsg"></div>
   </div>
 
+    </div>
+  </div>
+
+  <div class="modal menusheet" id="menu-pool">
+    <div class="sheet">
+      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
+      <h2>Pool</h2>
+  <div class="sec" id="pool">Pool Settings<span class="sec-sub">saved immediately, applied after a device reboot</span></div>
+  <div class="card" id="poolCard" style="max-width:560px">
+    <div class="prow">
+      <label for="poolUrl">Pool URL</label>
+      <input type="text" id="poolUrl" placeholder="stratum+tcp://pool.example.com:3333" autocomplete="off" autocapitalize="off" spellcheck="false">
+    </div>
+    <div class="prow">
+      <label for="poolUser">Worker <small>(usually address.workername)</small></label>
+      <input type="text" id="poolUser" placeholder="bc1q....worker1" autocomplete="off" autocapitalize="off" spellcheck="false">
+    </div>
+    <div class="prow">
+      <label for="poolPass">Password <small>(blank keeps current; most pools ignore it)</small></label>
+      <input type="password" id="poolPass" placeholder="unchanged" autocomplete="new-password">
+    </div>
+    <div class="pacts">
+      <button class="btn pri" id="poolSave">Save</button>
+      <button class="btn" id="poolReboot" style="display:none;border-color:var(--mag);color:var(--mag)">Reboot now</button>
+    </div>
+    <div class="msg" id="poolMsg"></div>
+  </div>
+
+    </div>
   </div>
 
   <!-- Embedded Per-Board Controls Modal Sub-Menu (Triggered via ⚙ Tune Button) -->
@@ -689,27 +783,6 @@
         <span>Best Share<b id="bestdiff" style="color:var(--lime)">—</b></span>
       </div>
     </div>
-  </div>
-
-  <div class="sec" id="pool">Pool Settings<span class="sec-sub">saved immediately, applied after a device reboot</span></div>
-  <div class="card" id="poolCard" style="max-width:560px">
-    <div class="prow">
-      <label for="poolUrl">Pool URL</label>
-      <input type="text" id="poolUrl" placeholder="stratum+tcp://pool.example.com:3333" autocomplete="off" autocapitalize="off" spellcheck="false">
-    </div>
-    <div class="prow">
-      <label for="poolUser">Worker <small>(usually address.workername)</small></label>
-      <input type="text" id="poolUser" placeholder="bc1q....worker1" autocomplete="off" autocapitalize="off" spellcheck="false">
-    </div>
-    <div class="prow">
-      <label for="poolPass">Password <small>(blank keeps current; most pools ignore it)</small></label>
-      <input type="password" id="poolPass" placeholder="unchanged" autocomplete="new-password">
-    </div>
-    <div class="pacts">
-      <button class="btn pri" id="poolSave">Save</button>
-      <button class="btn" id="poolReboot" style="display:none;border-color:var(--mag);color:var(--mag)">Reboot now</button>
-    </div>
-    <div class="msg" id="poolMsg"></div>
   </div>
 
   <div class="chartcard">
@@ -1856,7 +1929,16 @@ tick(); setInterval(tick, 2000);
 // Owner-tuner panel: separate 5 s poll of GET /api/v0/boards/nano3s-0/owner-tune.
 // All text goes in via textContent (event messages come from the device).
 let OWNER_ACTIVE = false;
+let OWN_SYNCED = false;
 function renderOwnerTune(o) {
+  let ownTxt = 'tuner off';
+  if (o.enabled) {
+    ownTxt = (o.profile || '?') + ' / ' + (o.phase || '?');
+    if (o.fan_duty_percent != null) ownTxt += ' · fan ' + o.fan_duty_percent + '%';
+    if (o.continuous_ceiling_w != null) ownTxt += ' · cap ' + o.continuous_ceiling_w.toFixed(0) + ' W';
+  }
+  $('ownCur').textContent = 'Current: ' + ownTxt;
+  if (!OWN_SYNCED) { $('ownProfile').value = o.enabled ? (o.profile || 'off') : 'off'; OWN_SYNCED = true; }
   const best = $('atbest'), list = $('atlist'), st = $('at-phase-label');
   if (!o.enabled) {
     st.textContent = 'TUNER OFF';
@@ -1898,6 +1980,46 @@ async function pollOwnerTune() {
   } catch (e) { OWNER_ACTIVE = false; }
 }
 pollOwnerTune(); setInterval(pollOwnerTune, 5000);
+// Menu sheets: one open at a time; Esc, backdrop click and Close dismiss.
+function closeMenus() {
+  document.querySelectorAll('.menusheet.show').forEach(m => m.classList.remove('show'));
+  document.querySelectorAll('.menubtn.on').forEach(b => b.classList.remove('on'));
+}
+function openMenu(key) {
+  const m = document.getElementById('menu-' + key);
+  if (!m) return;
+  closeMenus();
+  m.classList.add('show');
+  const b = document.querySelector('.menubtn[data-menu="' + key + '"]');
+  if (b) b.classList.add('on');
+}
+document.querySelectorAll('.menubtn').forEach(b => b.addEventListener('click', () => openMenu(b.dataset.menu)));
+document.querySelectorAll('.menusheet').forEach(m => m.addEventListener('click', e => {
+  if (e.target === m || (e.target.dataset && e.target.dataset.close)) closeMenus();
+}));
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeMenus(); });
+function openFromHash() { if (location.hash === '#pool') openMenu('pool'); }
+window.addEventListener('hashchange', openFromHash);
+openFromHash();
+
+// Owner-tuner apply (single-slot control file: lock the button for 6 s per write).
+$('ownApply').addEventListener('click', async () => {
+  const sel = $('ownProfile'), btn = $('ownApply'), msg = $('ownMsg');
+  const v = sel.value, label = sel.options[sel.selectedIndex].textContent;
+  if (!confirm(v === 'off' ? 'Turn the owner tuner OFF?' : 'Switch the owner tuner to ' + label + '? This replaces any power/temp target.')) return;
+  btn.disabled = true;
+  setTimeout(() => { btn.disabled = false; }, 6000);
+  msg.className = 'msg'; msg.textContent = 'Sending…';
+  try {
+    const r = await fetch('/api/v0/boards/nano3s-0/owner-tune', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile: v === 'off' ? null : v }),
+    });
+    msg.textContent = r.ok ? ('Queued: ' + label + ' (applies within ~1 s)') : ('Failed: HTTP ' + r.status);
+    setTimeout(pollOwnerTune, 2500);
+  } catch (e) { msg.textContent = 'Failed: ' + e; }
+});
+
 
 </script>
 </body>
