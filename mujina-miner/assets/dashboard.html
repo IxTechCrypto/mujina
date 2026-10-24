@@ -392,6 +392,7 @@
     .off { background: var(--amber); box-shadow: 0 0 10px var(--amber); }
     @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
     
+    .controls { display: contents; } /* desktop: wrapper is invisible */
     @media(max-width: 640px) {
       .wrap { padding: 18px 12px 32px; }
       .top { flex-wrap: wrap; gap: 6px; }
@@ -407,6 +408,34 @@
       .span2 { grid-column: span 2; }
       .pool .val { font-size: 14px; }
       .dual .dcell+.dcell { margin-left: 10px; padding-left: 10px; }
+      .span4 { grid-column: span 2; }
+      .board-summary-grid { grid-template-columns: 1fr; }
+      .top > div + div { flex-wrap: wrap; gap: 8px !important; }
+      .sec { flex-wrap: wrap; row-gap: 4px; }
+      .sec .sec-sub { margin-left: 0; flex: 1 1 100%; line-height: 1.4; }
+      #statuspath { display: none; }
+      .chartwrap { height: 220px; }
+      /* phone order: fleet / hashrate / chip temps first, controls last */
+      .wrap { display: flex; flex-direction: column; }
+      .controls { display: block; order: 8; }
+      .status { order: 9; }
+    }
+    @media(max-width: 480px) {
+      .grid { grid-template-columns: 1fr; }
+      .span2, .span4, .hero { grid-column: 1 / -1; }
+      .row { flex-direction: column; align-items: stretch; gap: 6px; }
+      .row label { margin-bottom: 2px; }
+      .row input[type=text], .row input[type=password], .row input[type=number], .row select {
+        width: 100% !important; max-width: 100% !important; text-align: left !important;
+      }
+      .fvgroup { flex-direction: column; }
+      .fvdiv { height: 1px; width: 100%; }
+      .sheet { padding: 16px 16px 14px; }
+      .chipgrid { grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); }
+      .dual { flex-wrap: wrap; row-gap: 10px; }
+      .dual .dcell { min-width: 90px; }
+      .card .val { font-size: 18px; }
+      .hero .val { font-size: 32px; }
     }
   </style>
 </head>
@@ -433,6 +462,7 @@
     <span id="alertText">⚠️ Thermal Warning: ASIC temperature elevated</span>
   </div>
 
+  <div class="controls">
   <!-- Power Controls -->
   <div class="sec">Power Controls<span class="sec-sub">Idle the chain or reboot the device</span></div>
   <div class="card" style="max-width:560px">
@@ -521,16 +551,6 @@
     <div class="msg" id="curveMsg"></div>
   </div>
 
-  <!-- Per-Chip Temperature Block Map -->
-  <div class="sec" id="chipTempSec" style="display:none">Chip Temperatures<span class="sec-sub">Per-chip ASIC temp, live over IPC</span></div>
-  <div class="card" id="chipTempCard" style="max-width:560px;display:none">
-    <div class="chip-grid" id="chipTempGrid"></div>
-    <div class="chip-legend">
-      <span><i style="background:var(--cyan)"></i>&lt; 50&deg;C</span>
-      <span><i style="background:var(--green)"></i>50&ndash;70&deg;C</span>
-      <span><i style="background:var(--amber)"></i>70&ndash;85&deg;C</span>
-      <span><i style="background:var(--mag)"></i>&gt; 85&deg;C</span>
-    </div>
   </div>
 
   <!-- Global Miner Settings Modal -->
@@ -724,6 +744,18 @@
     <div class="chartlegend" id="fleetChartLegend">
       <span class="lg"><i class="sw sw-solid" style="border-color:var(--cyan);box-shadow:0 0 6px var(--cyan)"></i>Fleet Aggregate</span>
       <span class="lg"><i class="sw sw-dash"></i>Moving Avg (10)</span>
+    </div>
+  </div>
+
+  <!-- Per-Chip Temperature Block Map -->
+  <div class="sec" id="chipTempSec" style="display:none">Chip Temperatures<span class="sec-sub">Per-chip ASIC temp, live over IPC</span></div>
+  <div class="card" id="chipTempCard" style="max-width:560px;display:none">
+    <div class="chip-grid" id="chipTempGrid"></div>
+    <div class="chip-legend">
+      <span><i style="background:var(--cyan)"></i>&lt; 50&deg;C</span>
+      <span><i style="background:var(--green)"></i>50&ndash;70&deg;C</span>
+      <span><i style="background:var(--amber)"></i>70&ndash;85&deg;C</span>
+      <span><i style="background:var(--mag)"></i>&gt; 85&deg;C</span>
     </div>
   </div>
 
