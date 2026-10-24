@@ -1866,6 +1866,7 @@ function drawHeroSparkline(series) {
 function renderFleet(d) {
   const f = d.fleet;
   $('fleetsub').textContent = f.boards_online + ' BOARD' + (f.boards_online === 1 ? '' : 'S') + ' REPORTING';
+  if (f.hashrate_ghs == null) { $('fhr').innerHTML = '<span class="na">warming up</span>'; } else
   $('fhr').innerHTML = (f.hashrate_ghs >= 1000) ? f.hashrate_ths.toFixed(2) + ' <small>TH/s</small>' : (+f.hashrate_ghs || 0).toFixed(2) + ' <small>GH/s</small>';
   $('fhrsub').textContent = f.boards_online + ' board' + (f.boards_online === 1 ? '' : 's') + ' online';
   $('ffreq').innerHTML = (f.avg_freq_mhz != null) ? (+f.avg_freq_mhz).toFixed(0) + ' <small>MHz</small>' : '<span class="na">n/a</span>';

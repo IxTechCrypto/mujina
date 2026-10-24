@@ -177,7 +177,9 @@ async fn serve_data(
 ) -> Json<Value> {
     let m = state.miner_telemetry();
 
-    let hr_ghs = m.hashrate as f64 / 1e9;
+    // Fleet rate = sum of the boards' measured rates; the share-based miner
+    // aggregate reads far too high for ~2 min after boot.
+    let fleet_ghs = fleet_hashrate_ghs(m.boards.iter().map(|b| Some(board_hashrate_ghs(b))));
     let src = m.sources.first();
 
     let boards: Vec<Value> = {
@@ -197,7 +199,7 @@ async fn serve_data(
         .hashrate_history
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push_fleet(hr_ghs);
+        .push_fleet(fleet_ghs.unwrap_or(0.0));
 
     let total_power: f64 = m
         .boards
@@ -221,14 +223,13 @@ async fn serve_data(
         "ok": true,
         "boards": boards,
         "fleet": {
-            "hashrate_ghs": round2(hr_ghs),
-            "hashrate_ths": round3(hr_ghs / 1000.0),
+            "hashrate_ghs": fleet_ghs.map(round2),
+            "hashrate_ths": fleet_ghs.map(|g| round3(g / 1000.0)),
             "boards_online": m.boards.len(),
             "total_power_w": if have_power { Some(round1(total_power)) } else { None },
-            "efficiency_jth": if have_power && hr_ghs > 0.0 {
-                Some(round2(total_power / (hr_ghs / 1000.0)))
-            } else {
-                None
+            "efficiency_jth": match fleet_ghs {
+                Some(g) if have_power => Some(round2(total_power / (g / 1000.0))),
+                _ => None,
             },
             "avg_fail_rate_pct": avg_field(&boards, "fail_rate_pct"),
             "avg_freq_mhz": avg_field(&boards, "freq_mhz"),
@@ -271,6 +272,32 @@ fn core_power_w(b: &BoardTelemetry) -> Option<f64> {
         .find(|p| p.name == "core")
         .and_then(|p| p.power_w)
         .map(|w| w as f64)
+}
+
+/// Fleet hashrate (GH/s): the sum of the boards' measured hashrates when any
+/// board reports more than zero, else `None` ("warming up").
+pub(crate) fn fleet_hashrate_ghs(boards: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    let v: Vec<f64> = boards.flatten().collect();
+    let sum: f64 = v.iter().sum();
+    v.iter().any(|g| *g > 0.0).then_some(sum)
+}
+
+#[cfg(test)]
+mod fleet_tests {
+    use super::fleet_hashrate_ghs;
+
+    #[test]
+    fn fleet_is_the_sum_of_board_rates() {
+        assert_eq!(fleet_hashrate_ghs([Some(1000.0), Some(500.5), None].into_iter()), Some(1500.5));
+        assert_eq!(fleet_hashrate_ghs([Some(0.0), Some(2.0)].into_iter()), Some(2.0));
+    }
+
+    #[test]
+    fn fleet_is_none_while_warming_up() {
+        assert_eq!(fleet_hashrate_ghs([Some(0.0), Some(0.0)].into_iter()), None);
+        assert_eq!(fleet_hashrate_ghs([None, None].into_iter()), None);
+        assert_eq!(fleet_hashrate_ghs(std::iter::empty()), None);
+    }
 }
 
 fn board_hashrate_ghs(b: &BoardTelemetry) -> f64 {

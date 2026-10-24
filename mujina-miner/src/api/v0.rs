@@ -737,7 +737,7 @@ async fn get_system(State(state): State<SharedState>) -> Json<serde_json::Value>
             contract_w,
             crate::board::nano3s_owner_tune::owner_power_ceiling(base, effective_w),
         );
-        let chips = crate::board::nano3s::get_detail_snapshot().map(|d| d.chips.len() as u32).unwrap_or(0);
+        let chips = crate::board::nano3s::get_detail_snapshot().map(|d| d.chips.len() as u32).filter(|n| *n > 0).unwrap_or(super::system::NANO3S_CHIPS);
         SystemInfo {
             mode: "embedded",
             platform: "nano3s-k230".into(),

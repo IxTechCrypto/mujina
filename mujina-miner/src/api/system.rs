@@ -60,6 +60,9 @@ pub(crate) struct SystemInfo {
     pub boards: Vec<SystemBoard>,
 }
 
+/// Chips on an Avalon Nano 3S; reported until the detail snapshot is ready.
+pub(crate) const NANO3S_CHIPS: u32 = 12;
+
 /// Git short sha baked in by build.rs, if the build had git.
 pub(crate) fn build_sha() -> Option<String> {
     option_env!("MUJINA_GIT_SHA").filter(|s| !s.is_empty()).map(str::to_owned)

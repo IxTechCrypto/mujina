@@ -10,6 +10,27 @@ fn main() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_default();
     println!("cargo:rustc-env=MUJINA_GIT_SHA={sha}");
+    // Re-run when HEAD moves: watch HEAD and the ref it points to, plus
+    // packed-refs. `git rev-parse --git-path` resolves worktrees correctly.
+    let git_path = |p: &str| {
+        std::process::Command::new("git")
+            .args(["rev-parse", "--git-path", p])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+    };
+    for p in ["HEAD", "packed-refs"] {
+        if let Some(path) = git_path(p) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    if let Ok(o) = std::process::Command::new("git").args(["symbolic-ref", "-q", "HEAD"]).output()
+        && o.status.success()
+        && let Some(path) = git_path(String::from_utf8_lossy(&o.stdout).trim())
+    {
+        println!("cargo:rerun-if-changed={path}");
+    }
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NANO3S");
     if std::env::var("CARGO_FEATURE_NANO3S").is_err() {
         return;
