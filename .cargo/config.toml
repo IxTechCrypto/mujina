@@ -3,4 +3,4 @@ target = "riscv64gc-unknown-linux-gnu"
 
 [target.riscv64gc-unknown-linux-gnu]
 linker = "riscv64-linux-gnu-gcc"
-rustflags = ["-L", "/home/toor/riscv64-sysroot/usr/lib/riscv64-linux-gnu"]
+rustflags = ["-L", "/home/grant/riscv64-sysroot/usr/lib/riscv64-linux-gnu"]
