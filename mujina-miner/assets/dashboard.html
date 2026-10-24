@@ -2007,13 +2007,17 @@ async function applyFan() {
   if (!name || !caps || !caps.fan || caps.fan === 'none') { setMsg('fanMsg', 'no fan control for this board'); return; }
   if (writeBusy('fanMsg')) return;
   const mode = $('fanMode').value;
-  const body = { mode };
-  if (mode === 'manual') body.manual_duty_percent = +$('fanDuty').value;
+  const duty = +$('fanDuty').value;
+  // Host boards (caps.fan "board") take {auto, percent}; the Nano 3S
+  // harness (caps.fan "harness") takes {mode, manual_duty_percent}.
+  const body = caps.fan === 'board'
+    ? (mode === 'manual' ? { auto: false, percent: duty } : { auto: true })
+    : (mode === 'manual' ? { mode, manual_duty_percent: duty } : { mode });
   setMsg('fanMsg', 'applying…');
   lockWrites();
   try {
     await sendJson('PATCH', boardUrl('fan', name), body);
-    setMsg('fanMsg', mode === 'manual' ? 'applied: manual duty ' + body.manual_duty_percent + '% ✓' : 'applied: auto ✓', true);
+    setMsg('fanMsg', mode === 'manual' ? 'applied: manual duty ' + duty + '% ✓' : 'applied: auto ✓', true);
   } catch (e) { setMsg('fanMsg', 'fan command failed (' + e.message + ')'); }
 }
 
