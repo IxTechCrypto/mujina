@@ -159,10 +159,14 @@ pub(crate) fn snap_voltage_mv(mv: i64) -> u16 {
     if snapped == VOLT_GRID_ANCHOR_MV as i64 {
         snapped -= step;
     }
-    snapped.clamp(
-        NANO3S_ENVELOPE.min_voltage_mv as i64,
-        NANO3S_ENVELOPE.max_voltage_mv as i64,
-    ) as u16
+    // Clamp to the highest/lowest values ON the grid inside the envelope:
+    // 3800 itself isn't a value the DC/DC can represent (3600 + k*26), so
+    // commanding it would rely on the shim rounding.
+    let lo = VOLT_GRID_ANCHOR_MV as i64
+        - (VOLT_GRID_ANCHOR_MV as i64 - NANO3S_ENVELOPE.min_voltage_mv as i64) / step * step;
+    let hi = VOLT_GRID_ANCHOR_MV as i64
+        + (NANO3S_ENVELOPE.max_voltage_mv as i64 - VOLT_GRID_ANCHOR_MV as i64) / step * step;
+    snapped.clamp(lo, hi) as u16
 }
 
 /// Clamps a requested base clock to the envelope and spreads it over the four
@@ -358,8 +362,8 @@ mod tests {
         assert_eq!(snap_voltage_mv(1000), 3392);
         assert_eq!(snap_voltage_mv(3380), 3392);
         assert_eq!(snap_voltage_mv(3790), 3782);
-        assert_eq!(snap_voltage_mv(3805), 3800); // 3808 snapped, clamped to 3800
-        assert_eq!(snap_voltage_mv(9000), 3800);
+        assert_eq!(snap_voltage_mv(3805), 3782); // 3808 snapped, clamped to the top grid value
+        assert_eq!(snap_voltage_mv(9000), 3782);
     }
 
     #[test]
@@ -446,6 +450,16 @@ mod tests {
         assert_eq!(owner_power_ceiling(1.0), 0.0);
         assert_eq!(backstop_freqs([338, 358, 378, 398]), [308, 328, 348, 368]);
         assert_eq!(backstop_freqs([110, 120, 130, 140]), [100, 100, 100, 110]);
+    }
+
+    #[test]
+    fn voltage_clamps_stay_on_the_grid() {
+        assert_eq!(snap_voltage_mv(3800), 3782);
+        assert_eq!(snap_voltage_mv(9999), 3782);
+        assert_eq!(snap_voltage_mv(3392), 3392);
+        assert_eq!(snap_voltage_mv(1000), 3392);
+        assert_eq!(snap_voltage_mv(3600), 3574);
+        assert_eq!(snap_voltage_mv(3704), 3704);
     }
 
     #[test]
