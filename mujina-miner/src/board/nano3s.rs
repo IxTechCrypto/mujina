@@ -44,7 +44,7 @@ use bitcoin::hashes::sha256d;
 use tokio::sync::{mpsc, watch};
 
 use super::nano3s_owner_tune::{self as owner, OwnerCmd, OwnerTune};
-use super::nano3s_tuner_core::{TuneProfile, TuneSetpoint};
+use super::nano3s_tuner_core::{SearchMemory, TuneProfile, TuneSetpoint};
 use super::{BackplaneConnector, BoardInfo, VirtualBoardDescriptor};
 use crate::api_client::types::{
     BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor, ThreadTelemetry,
@@ -1307,6 +1307,43 @@ struct PersistedTuning {
     owner_fan_target_c: Option<f32>,
     /// Per-chip clock offsets, MHz; `None` = uniform clocks.
     chip_offset_mhz: Option<[i16; CHIP_COUNT]>,
+    /// Owner-tuner search memory and the profile it belongs to.
+    owner_memory: Option<(TuneProfile, SearchMemory)>,
+}
+
+/// `profile,freq,mv,ths,jth,floor_mv,ceiling_mhz`.
+fn parse_owner_memory(s: &str) -> Option<(TuneProfile, SearchMemory)> {
+    let f: Vec<&str> = s.split(',').map(str::trim).collect();
+    let [p, freq, mv, ths, jth, floor, ceil] = f.as_slice() else { return None };
+    Some((
+        owner::parse_directive(p).ok().flatten()?,
+        SearchMemory {
+            best: TuneSetpoint { frequency_mhz: freq.parse().ok()?, core_voltage_mv: mv.parse().ok()? },
+            best_hashrate_ths: ths.parse().ok()?,
+            best_j_th: jth.parse().ok()?,
+            probe_floor_mv: floor.parse().ok()?,
+            probe_ceiling_mhz: ceil.parse().ok()?,
+        },
+    ))
+}
+
+fn format_owner_memory((p, m): &(TuneProfile, SearchMemory)) -> String {
+    format!(
+        "{},{},{},{},{},{},{}",
+        owner::directive_for(Some(*p)).trim_start_matches("owner_tune:"),
+        m.best.frequency_mhz,
+        m.best.core_voltage_mv,
+        m.best_hashrate_ths,
+        m.best_j_th,
+        m.probe_floor_mv,
+        m.probe_ceiling_mhz
+    )
+}
+
+fn persist_owner_memory(mem: Option<(TuneProfile, SearchMemory)>) {
+    let mut cfg = load_tuning();
+    cfg.owner_memory = mem;
+    write_tuning_conf(&cfg);
 }
 
 /// Reads [`TUNING_CONF_PATH`], or all-`None` if missing/unparseable --
@@ -1344,6 +1381,7 @@ fn load_tuning() -> PersistedTuning {
                     value.parse::<f32>().ok().filter(|c| owner::FAN_TARGET_RANGE_C.contains(c))
             }
             "chip_offset_mhz" => cfg.chip_offset_mhz = parse_chip_offsets(value),
+            "owner_memory" => cfg.owner_memory = parse_owner_memory(value),
             _ => {}
         }
     }
@@ -1381,6 +1419,9 @@ fn write_tuning_conf(cfg: &PersistedTuning) {
     }
     if let Some(c) = cfg.owner_fan_target_c {
         out.push_str(&format!("owner_fan_target_c={c}\n"));
+    }
+    if let Some(m) = &cfg.owner_memory {
+        out.push_str(&format!("owner_memory={}\n", format_owner_memory(m)));
     }
     if let Some(o) = cfg.chip_offset_mhz.filter(|o| o.iter().any(|x| *x != 0)) {
         out.push_str(&format!("chip_offset_mhz={}\n", join_chip_offsets(&o)));
@@ -2354,7 +2395,14 @@ fn run_worker(
         owner.enable(p);
         owner.seed_fan_duty(read_fan_status().and_then(|f| f.percent));
         eprintln!("[nano3s] owner-tune: resumed profile {p:?} from {TUNING_CONF_PATH}");
+        if let Some((mp, mem)) = persisted_tuning.owner_memory
+            && mp == p
+        {
+            owner.restore_memory(mem);
+            eprintln!("[nano3s] owner-tune: restored search memory {mem:?}");
+        }
     }
+    let mut last_owner_memory = owner.profile().zip(owner.memory());
     owner.publish(None);
 
     loop {
@@ -2430,6 +2478,8 @@ fn run_worker(
                         persist_tuning_clear_temp_target();
                         persist_autotune_hashrate_target(None);
                         persist_owner_tune_profile(Some(profile));
+                        persist_owner_memory(None);
+                        last_owner_memory = None;
                         // Keep the throttle/PSU ceilings in step with the
                         // clock we start from (stale-ceiling bug).
                         temp_throttle_base_freq = last_applied_pll_freq;
@@ -3150,6 +3200,11 @@ fn run_worker(
                         frequency_mhz: last_applied_pll_freq[0] as f32,
                         core_voltage_mv: last_applied_voltage_mv.unwrap_or(st.voltage_mv as i32).max(0) as u16,
                     }));
+                    let mem = owner.profile().zip(owner.memory());
+                    if mem.is_some() && mem != last_owner_memory {
+                        persist_owner_memory(mem);
+                        last_owner_memory = mem;
+                    }
                 }
             }
 

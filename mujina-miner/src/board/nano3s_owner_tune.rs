@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::nano3s_tuner_core::{
-    AutoTuner, CapLimits, Metrics, TuneAction, TuneEnvelope, TunePhase, TuneProfile, TuneSetpoint,
+    AutoTuner, CapLimits, Metrics, SearchMemory, TuneAction, TuneEnvelope, TunePhase, TuneProfile, TuneSetpoint,
 };
 
 /// How often the owner tuner is evaluated. The status block of `run_worker`
@@ -647,6 +647,20 @@ impl OwnerTune {
         let force = std::mem::take(&mut self.fan_force_pending);
         let target = self.fan_target_c();
         fan_step(&mut self.fan, temp_max_c, cap, target, force).map(OwnerCmd::FanManual)
+    }
+
+    /// The running profile's search memory (see [`SearchMemory`]).
+    pub(crate) fn memory(&self) -> Option<SearchMemory> {
+        self.profile?;
+        self.tuner.memory()
+    }
+
+    /// Restores a saved search for the running profile. Call right after
+    /// [`Self::enable`] on a boot-time resume.
+    pub(crate) fn restore_memory(&mut self, mem: SearchMemory) {
+        if self.profile.is_some() {
+            self.tuner.restore_memory(mem);
+        }
     }
 
     /// Starts the fan loop from the fan's current duty instead of 100 %.

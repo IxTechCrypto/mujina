@@ -338,6 +338,19 @@ pub struct TuneSetpoint {
     pub core_voltage_mv: u16,
 }
 
+/// What a profile search has learned, so a reboot resumes it instead of
+/// re-walking the voltage down past points already ruled out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SearchMemory {
+    pub best: TuneSetpoint,
+    pub best_hashrate_ths: f32,
+    pub best_j_th: f32,
+    /// Highest voltage ruled out (0 = none).
+    pub probe_floor_mv: u16,
+    /// Lowest clock ruled out (above the envelope max = none).
+    pub probe_ceiling_mhz: f32,
+}
+
 /// Live inputs to one tuner decision.
 #[derive(Clone, Copy, Debug)]
 pub struct Metrics {
@@ -633,6 +646,27 @@ impl AutoTuner {
     /// Best measured point and its efficiency (J/TH).
     pub fn best_point(&self) -> Option<(TuneSetpoint, f32)> {
         self.best.map(|(sp, _, eff)| (sp, eff))
+    }
+
+    /// The search state worth keeping across a reboot; `None` until a best
+    /// point has been measured.
+    pub fn memory(&self) -> Option<SearchMemory> {
+        let (best, best_hashrate_ths, best_j_th) = self.best?;
+        Some(SearchMemory {
+            best,
+            best_hashrate_ths,
+            best_j_th,
+            probe_floor_mv: self.probe_floor_mv,
+            probe_ceiling_mhz: self.probe_ceiling_mhz,
+        })
+    }
+
+    /// Restores a saved search after `enable_profile`. The first settled
+    /// judgement at the best point re-measures it.
+    pub fn restore_memory(&mut self, mem: SearchMemory) {
+        self.best = Some((mem.best, mem.best_hashrate_ths, mem.best_j_th));
+        self.probe_floor_mv = mem.probe_floor_mv;
+        self.probe_ceiling_mhz = mem.probe_ceiling_mhz;
     }
 
     /// Averaging window progress: (samples accumulated, samples needed).
@@ -1944,6 +1978,31 @@ mod tests {
         // Stable now: the efficiency walk never trims back to 3444.
         let a = step_to_action(&mut t, &nano_m(88.0, 3470, Some(3.0)));
         assert_ne!(a, Some(TuneAction::SetVoltage(3444)));
+    }
+
+    #[test]
+    fn restored_memory_keeps_the_trim_above_the_old_floor() {
+        // Learned: best 3652 mV, 3626 ruled out.
+        let mut t = nano_tuner(TuneProfile::Efficient);
+        step_to_action(&mut t, &nano_m(80.0, 3652, Some(1.0)));
+        let mut mem = t.memory().expect("best measured");
+        mem.probe_floor_mv = 3626;
+        // Reboot: fresh tuner, same profile, memory restored.
+        let mut r = nano_tuner(TuneProfile::Efficient);
+        r.restore_memory(mem);
+        assert_eq!(r.memory(), Some(mem));
+        // At best again: the efficiency walk may not trim to 3626 or below.
+        let a = step_to_action(&mut r, &nano_m(80.0, 3652, Some(1.0)));
+        assert!(
+            !matches!(a, Some(TuneAction::SetVoltage(v)) if v <= 3626),
+            "trimmed to a ruled-out voltage: {a:?}"
+        );
+        // Without the memory the same tuner trims straight to 3626.
+        let mut f = nano_tuner(TuneProfile::Efficient);
+        assert_eq!(
+            step_to_action(&mut f, &nano_m(80.0, 3652, Some(1.0))),
+            Some(TuneAction::SetVoltage(3626))
+        );
     }
 
     #[test]
