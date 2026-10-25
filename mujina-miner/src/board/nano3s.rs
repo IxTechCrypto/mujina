@@ -1327,6 +1327,31 @@ fn persist_chip_offsets(o: [i16; CHIP_COUNT]) {
     write_tuning_conf(&cfg);
 }
 
+/// Sends `want` to the firmware unless it is already applied. On failure
+/// `applied` keeps its old value, so the next call retries.
+fn send_chip_offsets(want: [i16; CHIP_COUNT], applied: &mut [i16; CHIP_COUNT], why: &str) {
+    if want == *applied {
+        return;
+    }
+    if unsafe { nano3s_ipc_set_chip_pll_offset(want.as_ptr()) } == 0 {
+        *applied = want;
+        eprintln!("[nano3s] chip offsets {want:?} ({why})");
+    } else {
+        eprintln!("[nano3s] nano3s_ipc_set_chip_pll_offset failed; retrying next tick");
+    }
+}
+
+/// Stops a per-chip tuner without leaving an unjudged trial behind: puts
+/// the trial chip back, applies and persists the committed offsets, and
+/// returns them.
+fn stop_chip_tuner(mut ct: ChipTuner, applied: &mut [i16; CHIP_COUNT]) -> [i16; CHIP_COUNT] {
+    ct.interrupt();
+    let committed = ct.committed_offsets();
+    send_chip_offsets(committed, applied, "per-chip tuner stopped");
+    persist_chip_offsets(committed);
+    committed
+}
+
 fn chip_goal(p: Option<TuneProfile>) -> ChipGoal {
     match p {
         Some(TuneProfile::Efficient | TuneProfile::Quiet) => ChipGoal::Efficiency,
@@ -2444,6 +2469,7 @@ fn run_worker(
         .chip_tune
         .then(|| new_chip_tuner(owner.profile(), chip_offset_mhz));
     let mut chip_base: Option<(u32, Option<i32>)> = None;
+    let mut persisted_chip_offsets = chip_offset_mhz;
     owner.publish(None);
 
     loop {
@@ -2488,6 +2514,7 @@ fn run_worker(
                         eprintln!("[nano3s] nano3s_ipc_set_chip_pll_offset failed");
                     } else {
                         chip_offset_mhz = o;
+                        persisted_chip_offsets = o;
                         eprintln!("[nano3s] chip offsets {o:?} (via dashboard/API)");
                         if chip_tuner.take().is_some() {
                             persist_chip_tune(false);
@@ -2504,7 +2531,12 @@ fn run_worker(
                 let fan_given = parsed.as_ref().is_ok_and(|d| d.fan_target_c.is_some());
                 if let Ok(Some(on)) = parsed.as_ref().map(|d| d.chip_tune) {
                     persist_chip_tune(on);
-                    chip_tuner = on.then(|| new_chip_tuner(owner.profile(), chip_offset_mhz));
+                    let mut start = chip_offset_mhz;
+                    if let Some(ct) = chip_tuner.take() {
+                        start = stop_chip_tuner(ct, &mut chip_offset_mhz);
+                        persisted_chip_offsets = start;
+                    }
+                    chip_tuner = on.then(|| new_chip_tuner(owner.profile(), start));
                     if !on {
                         owner.set_chip_status(None);
                     }
@@ -2541,8 +2573,10 @@ fn run_worker(
                             owner.set_fan_target(None);
                             persist_owner_fan_target(None);
                         }
-                        if chip_tuner.is_some() {
-                            chip_tuner = Some(new_chip_tuner(Some(profile), chip_offset_mhz));
+                        if let Some(ct) = chip_tuner.take() {
+                            let start = stop_chip_tuner(ct, &mut chip_offset_mhz);
+                            persisted_chip_offsets = start;
+                            chip_tuner = Some(new_chip_tuner(Some(profile), start));
                         }
                         // Keep the throttle/PSU ceilings in step with the
                         // clock we start from (stale-ceiling bug).
@@ -3263,9 +3297,14 @@ fn run_worker(
                     if let Some(ct) = chip_tuner.as_mut() {
                         let base = (last_applied_pll_freq[0], last_applied_voltage_mv);
                         let ready = owner.is_locked() && chip_base == Some(base);
-                        let was_running = chip_base.is_some();
+                        if !ready && chip_base.is_some() {
+                            ct.interrupt();
+                        }
                         chip_base = owner.is_locked().then_some(base);
-                        let new = if ready {
+                        // A partial or zeroed status (startup, a missed read)
+                        // would look like dead chips; skip the tick.
+                        let complete = st.chip_count as usize >= CHIP_COUNT && st.ghsspd > 0;
+                        if ready && complete {
                             ct.set_power_cap_w(owner.power_cap_w());
                             let mut m = ChipMetrics {
                                 chip_ghs: [0.0; CHIP_COUNT],
@@ -3278,21 +3317,16 @@ fn run_worker(
                                 m.chip_ghs[i] = c.ghsspd;
                                 m.chip_fail_pct[i] = c.spd_dh;
                             }
-                            ct.tick(&m)
-                        } else if was_running {
-                            ct.interrupt()
-                        } else {
-                            None
-                        };
-                        if let Some(o) = new.filter(|o| *o != chip_offset_mhz) {
-                            let rc = unsafe { nano3s_ipc_set_chip_pll_offset(o.as_ptr()) };
-                            if rc != 0 {
-                                eprintln!("[nano3s] per-chip tuner: nano3s_ipc_set_chip_pll_offset failed");
-                            } else {
-                                chip_offset_mhz = o;
-                                persist_chip_offsets(o);
-                                eprintln!("[nano3s] per-chip tuner: {} -> {o:?}", ct.last_event());
-                            }
+                            ct.tick(&m);
+                        }
+                        // The firmware follows the tuner (a failed send is
+                        // retried next tick); only judged offsets are
+                        // persisted, so a reboot never lands on a trial.
+                        send_chip_offsets(ct.offsets(), &mut chip_offset_mhz, ct.last_event());
+                        let committed = ct.committed_offsets();
+                        if committed != persisted_chip_offsets {
+                            persist_chip_offsets(committed);
+                            persisted_chip_offsets = committed;
                         }
                         let phase = match (ready, ct.phase()) {
                             (false, _) => "waiting",
