@@ -55,6 +55,12 @@ pub struct TuneEnvelope {
     /// (temperature and power are instantaneous readings, not windowed), but
     /// not every 2 s or we overshoot before the previous drop takes effect.
     pub safety_settle_cycles: u32,
+    /// Cycles between successive back-off steps for a power-only breach (a
+    /// temperature breach always uses `safety_settle_cycles`). A profile's
+    /// power cap is an efficiency limit; the board's own PSU trip is the
+    /// safety one. Warming chips draw more (leakage) for minutes after a
+    /// cut, so cutting every tick overshoots well below the cap.
+    pub power_settle_cycles: u32,
     pub quiet: CapLimits,
     pub efficient: CapLimits,
     pub balanced: CapLimits,
@@ -105,6 +111,7 @@ impl TuneEnvelope {
             forbidden_voltages_mv: &[],
             settle_cycles: 150,
             safety_settle_cycles: 6,
+            power_settle_cycles: 6,
             quiet: CapLimits {
                 temp_c: 55.0,
                 power_w: 12.0,
@@ -832,7 +839,12 @@ impl AutoTuner {
                 }
             }
 
-            if self.cycles_since_change < env.safety_settle_cycles {
+            let settle = if m.asic_temp_c > caps.temp_c {
+                env.safety_settle_cycles
+            } else {
+                env.power_settle_cycles
+            };
+            if self.cycles_since_change < settle {
                 return None;
             }
             self.cycles_since_change = 0;
@@ -1761,6 +1773,7 @@ mod tests {
             forbidden_voltages_mv: &[3600],
             settle_cycles: 150,
             safety_settle_cycles: 6,
+            power_settle_cycles: 6,
             quiet: CapLimits {
                 temp_c: 55.0,
                 power_w: 60.0,
@@ -1934,6 +1947,21 @@ mod tests {
     }
 
     #[test]
+    fn power_breach_waits_power_settle_between_cuts() {
+        let env = TuneEnvelope { safety_settle_cycles: 1, power_settle_cycles: 4, ..nano_env() };
+        let mut t = AutoTuner::default();
+        t.set_envelope(env);
+        t.enable_profile(TuneProfile::Efficient); // power cap 90
+        let over = m(50.0, 95.0, 4.0, 300.0, 3704);
+        let cuts = (0..8)
+            .filter(|_| matches!(t.evaluate(&over), Some(TuneAction::SetFrequency(_))))
+            .count();
+        assert_eq!(cuts, 2);
+        // A temperature breach still acts at once (fan first).
+        assert_eq!(t.evaluate(&m(70.0, 80.0, 4.0, 300.0, 3704)), Some(TuneAction::SetFanFull));
+    }
+
+    #[test]
     fn unstable_point_at_power_cap_lowers_the_clock() {
         let mut t = nano_tuner(TuneProfile::Balanced); // power cap 110
         assert_eq!(
@@ -1972,6 +2000,7 @@ mod tests {
         TuneEnvelope {
             settle_cycles: 4,
             safety_settle_cycles: 1,
+            power_settle_cycles: 1,
             average_judgement: true,
             ..nano_env()
         }

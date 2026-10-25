@@ -2352,6 +2352,7 @@ fn run_worker(
     owner.set_fan_target(persisted_tuning.owner_fan_target_c);
     if let Some(p) = persisted_tuning.owner_tune_profile {
         owner.enable(p);
+        owner.seed_fan_duty(read_fan_status().and_then(|f| f.percent));
         eprintln!("[nano3s] owner-tune: resumed profile {p:?} from {TUNING_CONF_PATH}");
     }
     owner.publish(None);
@@ -2434,6 +2435,7 @@ fn run_worker(
                         temp_throttle_base_freq = last_applied_pll_freq;
                         psu_ceiling_freq = last_applied_pll_freq;
                         owner.enable(profile);
+                        owner.seed_fan_duty(read_fan_status().and_then(|f| f.percent));
                         owner.publish(None);
                         eprintln!("[nano3s] owner-tune: enabled profile {profile:?} (power-target/temp-target/autotune-hashrate disabled)");
                     }

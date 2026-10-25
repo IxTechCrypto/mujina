@@ -26,8 +26,12 @@ pub(crate) const OWNER_TICK: Duration = Duration::from_secs(15);
 /// hashrate is 3-5 % noisy window to window), so a step is judged on
 /// hashrate/fail-rate that reflect it.
 pub(crate) const OWNER_SETTLE_CYCLES: u32 = 20;
-/// One tick (15 s) between thermal/power back-off steps (spec: ~12-15 s).
+/// One tick (15 s) between thermal back-off steps (spec: ~12-15 s).
 pub(crate) const OWNER_SAFETY_SETTLE_CYCLES: u32 = 1;
+/// 4 ticks (60 s) between power-cap back-off steps. At one tick, warming
+/// chips (leakage) kept power over Efficient's 95 W cap while the clock was
+/// cut 348 -> 258 MHz in 4 min, landing 11 W under the cap (2026-10-24).
+pub(crate) const OWNER_POWER_SETTLE_CYCLES: u32 = 4;
 
 /// Margin (W) the tuner's own power cap sits below `effective_safety_w`, so
 /// the tuner backs the clock off before aadhi's 137 W / PD safety trip fires.
@@ -77,6 +81,7 @@ pub(crate) const NANO3S_ENVELOPE: TuneEnvelope = TuneEnvelope {
     forbidden_voltages_mv: &[3600],
     settle_cycles: OWNER_SETTLE_CYCLES,
     safety_settle_cycles: OWNER_SAFETY_SETTLE_CYCLES,
+    power_settle_cycles: OWNER_POWER_SETTLE_CYCLES,
     quiet: CapLimits { temp_c: 70.0, power_w: 60.0 },
     efficient: CapLimits { temp_c: 80.0, power_w: 90.0 },
     balanced: CapLimits { temp_c: 85.0, power_w: 110.0 },
@@ -399,6 +404,14 @@ impl FanState {
     pub(crate) fn duty_percent(&self) -> u8 {
         self.duty.round() as u8
     }
+
+    /// Fan state for a takeover from `current` duty (the fan's measured
+    /// percent), so the loop doesn't start at 100 % and chill the chips.
+    /// Unknown duty keeps the safe 100 % start.
+    fn starting_at(current: Option<u8>) -> Self {
+        let duty = current.map_or(100.0, |d| (d as f32).clamp(FAN_DUTY_MIN, 100.0));
+        Self { duty, ..Self::default() }
+    }
 }
 
 fn plausible(temp: Option<f32>) -> Option<f32> {
@@ -634,6 +647,14 @@ impl OwnerTune {
         let force = std::mem::take(&mut self.fan_force_pending);
         let target = self.fan_target_c();
         fan_step(&mut self.fan, temp_max_c, cap, target, force).map(OwnerCmd::FanManual)
+    }
+
+    /// Starts the fan loop from the fan's current duty instead of 100 %.
+    /// Call right after [`Self::enable`].
+    pub(crate) fn seed_fan_duty(&mut self, current: Option<u8>) {
+        if self.profile.is_some() && self.fan.sent.is_none() {
+            self.fan = FanState::starting_at(current);
+        }
     }
 
     pub(crate) fn profile(&self) -> Option<TuneProfile> {
@@ -882,6 +903,7 @@ mod tests {
     fn envelope_is_nano_shaped() {
         let e = NANO3S_ENVELOPE;
         assert_eq!(e.settle_cycles as u64 * OWNER_TICK.as_secs(), 300);
+        assert_eq!(e.power_settle_cycles as u64 * OWNER_TICK.as_secs(), 60);
         assert!(e.average_judgement);
         assert_eq!(e.best_point_margin_w, 3.0);
         assert_eq!(e.voltage_step_mv, 26);
@@ -988,6 +1010,15 @@ mod tests {
         let mut st = st_at(95.0);
         assert_eq!(fan_step(&mut st, Some(82.0), 85.0, 75.0, false), Some(100));
         assert_eq!(fan_step(&mut st, Some(82.0), 85.0, 75.0, false), None); // already 100
+    }
+
+    #[test]
+    fn fan_takeover_starts_from_current_duty() {
+        let mut st = FanState::starting_at(Some(30));
+        // At target: first write is the current duty, not 100 %.
+        assert_eq!(fan_step(&mut st, Some(75.0), 85.0, 75.0, false), Some(30));
+        assert_eq!(FanState::starting_at(Some(5)).duty_percent(), 20);
+        assert_eq!(FanState::starting_at(None).duty_percent(), 100);
     }
 
     #[test]
