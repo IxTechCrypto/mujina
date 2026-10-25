@@ -2479,6 +2479,10 @@ fn run_worker(
                                     // throttle recovers back up to -- see
                                     // temp_throttle_base_freq's doc comment.
                                     temp_throttle_base_freq = last_applied_pll_freq;
+                                    // Same for the PSU ceiling, or a stale one
+                                    // clamps the new clock at any power (it
+                                    // pulled 348 MHz back to 258 at 62 W).
+                                    psu_ceiling_freq = last_applied_pll_freq;
                                     eprintln!("[nano3s] tuning: SET_MODE pll_freq={freq:?} (via dashboard/API)");
                                 }
                             }
