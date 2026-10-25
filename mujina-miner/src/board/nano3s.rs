@@ -1234,33 +1234,41 @@ fn read_fan_status() -> Option<Fan> {
     })
 }
 
-/// Board outlet-air NTC thermistor (Shiheng B57891S0103), wired through
-/// the SoC's own ADC and exposed by the kernel's `ntc-thermistor` driver
-/// as a plain Linux hwmon device -- read directly from sysfs here, no
-/// harness/IPC round-trip needed, since this sensor is entirely on the
-/// Linux side (confirmed via a live `i2cdetect` scan of both i2c buses,
-/// 2026-09-14: only the known INA226/HUSB238A/DC-DC/EEPROM chips are
-/// present, nothing else -- this ADC-based thermistor is the only
-/// discrete external temperature sensor on this board). Named by its
-/// driver ("mf52a104f3950") rather than a hardcoded hwmon index, since
-/// hwmon numbering isn't guaranteed stable across kernel/driver-probe
-/// order. There is no inlet-side sensor on this hardware -- Nano3s is a
-/// single-board design; the vendor's inlet-temp code (`get_inlet_temp()`
-/// in the recovered `mm_miner` source) only exists for larger multi-board
-/// Avalon models this codebase doesn't target.
+/// Board outlet-air NTC thermistor (Shiheng B57891S0103, 10 kOhm), the
+/// only discrete external temperature sensor on this board (no inlet
+/// sensor; i2cdetect scan 2026-09-14). The kernel's `ntc-thermistor`
+/// driver probes it as type "mf52a104f3950" (a 100 kOhm table) and its
+/// hwmon `temp1_input` sits at exactly 50000 whatever the temperature, so
+/// this reads the SoC ADC channel the device tree wires it to and converts
+/// here. Divider from the DT node: 10 kOhm pull-up to 1.8 V, NTC to ground.
+/// Channel 1 tracks heat live (832 raw at 80 C chips, ~1050 at 74 C).
+/// B 3950 is the "f3950" in Canaan's own type name; absolute accuracy
+/// isn't checked against a reference yet.
+const OUTLET_ADC_DIR: &str = "/sys/bus/iio/devices/iio:device0";
+const OUTLET_ADC_RAW: &str = "in_voltage1_raw";
+const OUTLET_PULLUP_OHM: f64 = 10_000.0;
+const OUTLET_PULLUP_MV: f64 = 1_800.0;
+const OUTLET_NTC_R25_OHM: f64 = 10_000.0;
+const OUTLET_NTC_B: f64 = 3950.0;
+
 fn read_outlet_temp_c() -> Option<f64> {
-    for entry in std::fs::read_dir("/sys/class/hwmon").ok()?.flatten() {
-        let path = entry.path();
-        let Ok(name) = std::fs::read_to_string(path.join("name")) else {
-            continue;
-        };
-        if name.trim() != "mf52a104f3950" {
-            continue;
-        }
-        let raw = std::fs::read_to_string(path.join("temp1_input")).ok()?;
-        return raw.trim().parse::<f64>().ok().map(|millideg| millideg / 1000.0);
+    let read = |f: &str| -> Option<f64> {
+        std::fs::read_to_string(format!("{OUTLET_ADC_DIR}/{f}")).ok()?.trim().parse().ok()
+    };
+    // in_voltage_scale is mV per LSB (0.44 on this SoC).
+    let mv = read(OUTLET_ADC_RAW)? * read("in_voltage_scale")?;
+    ntc_temp_c(mv)
+}
+
+/// NTC-to-ground divider voltage (mV) to degrees C; `None` when the
+/// reading is outside the divider's range or the result is implausible.
+fn ntc_temp_c(mv: f64) -> Option<f64> {
+    if !(mv > 0.0 && mv < OUTLET_PULLUP_MV) {
+        return None;
     }
-    None
+    let ohm = OUTLET_PULLUP_OHM * mv / (OUTLET_PULLUP_MV - mv);
+    let t = 1.0 / (1.0 / 298.15 + (ohm / OUTLET_NTC_R25_OHM).ln() / OUTLET_NTC_B) - 273.15;
+    (-20.0..=150.0).contains(&t).then_some(t)
 }
 
 /// Control file this worker's own loop polls for pause/resume/tune
