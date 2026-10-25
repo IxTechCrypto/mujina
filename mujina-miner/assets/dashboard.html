@@ -953,6 +953,15 @@
         <button class="btn pri wbtn" id="ownApply" type="button">Apply</button>
       </div>
       <div class="msg" id="ownMsg"></div>
+      <div class="row" style="margin-top:10px">
+        <label for="ownPerChip" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" id="ownPerChip">
+          <span>Per-chip tuning</span>
+        </label>
+        <button class="btn pri wbtn" id="ownPerChipApply" type="button" style="padding:6px 14px">Apply</button>
+      </div>
+      <small style="color:var(--dim);display:block;margin-top:2px">Runs once the profile has locked; one chip at a time, ~7 min per step.</small>
+      <div class="msg" id="ownPerChipMsg"></div>
       <div class="note">Using any Live Tuning control below switches the owner tuner off.</div>
       </div>
 
@@ -1233,6 +1242,7 @@
           <span class="at-title">Status: <span id="at-phase-label">HOLDING</span></span>
           <span class="at-best-badge" id="atbest">No calibration point established yet</span>
         </div>
+        <div id="at-per-chip" style="font-size:11px;color:var(--dim);margin:4px 0;padding:2px 0"></div>
         <div class="at-feed" id="atlist">—</div>
       </div>
     </div>
@@ -1267,7 +1277,7 @@ function setMsg(id, text, ok) { const m = $(id); m.textContent = text; m.classNa
 
 let SYS = null;                 // last good /api/v0/system document
 let LAST = null, ACTIVE_NAME = null, CHIP_FILTER = 'all';
-let PAUSE_AVAILABLE = false, DETAIL_STATE = 0, PAUSED = false;
+let PAUSE_AVAILABLE = false, DETAIL_STATE = 0, PAUSED = false, CHIP_OFFSETS = [];
 let MOUSE_POS = { fleetChart: null, chart: null };
 let TICKS = 0;
 
@@ -1691,7 +1701,14 @@ function renderChips(chips, perChip) {
   list.forEach(c => {
     const ghs = c.ghs || 0;
     const t = mk('div', 'chiptile' + (ghs < peak * 0.75 ? ' weak' : ''));
-    t.appendChild(mk('div', 'ctname', 'ASIC ' + Number(c.index)));
+    const nameRow = mk('div', 'ctname', 'ASIC ' + Number(c.index));
+    const off = (CHIP_OFFSETS && typeof c.index === 'number') ? CHIP_OFFSETS[c.index] : 0;
+    if (off && typeof off === 'number') {
+      const badge = mk('span', 'badge', (off > 0 ? '+' : '') + off + ' MHz');
+      badge.style.cssText = 'margin-left:5px;font-size:8px;padding:1px 3px;';
+      nameRow.appendChild(badge);
+    }
+    t.appendChild(nameRow);
     const st = mk('div', 'ctstat', (ghs / 1000).toFixed(2) + ' ');
     st.appendChild(mk('small', null, 'TH/s'));
     t.appendChild(st);
@@ -1928,6 +1945,11 @@ async function pollDetail() {
     if (!r.ok) { DETAIL_STATE = -1; if (PAUSE_AVAILABLE) { PAUSE_AVAILABLE = false; applySystem(); } return; }
     const nd = await r.json();
     DETAIL_STATE = 1;
+    if (Array.isArray(nd.chip_offset_mhz)) {
+      const changed = JSON.stringify(CHIP_OFFSETS) !== JSON.stringify(nd.chip_offset_mhz);
+      CHIP_OFFSETS = nd.chip_offset_mhz;
+      if (changed && LAST) render(LAST);
+    }
     if (typeof nd.paused === 'boolean') {
       if (!PAUSE_AVAILABLE) { PAUSE_AVAILABLE = true; applySystem(); }
       if (!pauseBusy) {
@@ -2186,15 +2208,31 @@ function renderOwnerTune(o) {
   let ownTxt = 'tuner off';
   if (o.enabled) {
     ownTxt = (o.profile || '?') + ' / ' + (o.phase || '?');
+    if (o.per_chip && o.per_chip.phase) ownTxt += ' · per-chip ' + o.per_chip.phase;
     if (o.fan_duty_percent != null) ownTxt += ' · fan ' + o.fan_duty_percent + '%';
     if (o.continuous_ceiling_w != null) ownTxt += ' · cap ' + (+o.continuous_ceiling_w).toFixed(0) + ' W';
     const sp = pt(o.setpoint);
     if (sp && sp.f != null) ownTxt += ' · set ' + Math.round(sp.f) + ' MHz' + (sp.v != null ? ' @ ' + sp.v + ' mV' : '');
   }
   $('ownCur').textContent = 'Current: ' + ownTxt;
-  if (!OWN_SYNCED) { $('ownProfile').value = o.enabled ? (o.profile || 'off') : 'off'; OWN_SYNCED = true; }
-  const best = $('atbest'), list = $('atlist'), st = $('at-phase-label');
-  if (!o.enabled) { st.textContent = 'TUNER OFF'; best.textContent = 'tuner off'; list.textContent = 'tuner off'; return; }
+  if (!OWN_SYNCED) {
+    $('ownProfile').value = o.enabled ? (o.profile || 'off') : 'off';
+    $('ownPerChip').checked = !!o.per_chip;
+    OWN_SYNCED = true;
+  }
+  const best = $('atbest'), list = $('atlist'), st = $('at-phase-label'), pcElem = $('at-per-chip');
+  if (pcElem) {
+    if (o.per_chip) {
+      let pcText = 'Per-chip: ' + (o.per_chip.phase || 'on');
+      if (o.per_chip.last_event) pcText += ' · ' + o.per_chip.last_event;
+      pcElem.textContent = pcText;
+      pcElem.style.display = '';
+    } else {
+      pcElem.textContent = 'Per-chip: off';
+      pcElem.style.display = '';
+    }
+  }
+  if (!o.enabled) { st.textContent = 'TUNER OFF'; best.textContent = 'tuner off'; list.textContent = 'tuner off'; if (pcElem) pcElem.textContent = 'Per-chip: off'; return; }
   const parts = [(o.profile || '?') + ' / ' + (o.phase || '?')];
   if (o.fan_duty_percent != null || o.fan_target_c != null) {
     parts.push('fan ' + (o.fan_duty_percent != null ? o.fan_duty_percent + '%' : '—') + ' → ' + (o.fan_target_c != null ? (+o.fan_target_c).toFixed(0) + '°C' : '—'));
@@ -2232,6 +2270,21 @@ async function pollOwnerTune() {
     renderOwnerTune(await r.json());
   } catch (e) { OWNER_ACTIVE = false; }
 }
+async function applyPerChip() {
+  const caps = activeCaps();
+  if (!caps || !safeUrl(caps.tuner)) { setMsg('ownPerChipMsg', 'tuner not available for this board'); return; }
+  if (writeBusy('ownPerChipMsg')) return;
+  const on = $('ownPerChip').checked;
+  const body = { per_chip: on };
+  setMsg('ownPerChipMsg', 'Sending…');
+  lockWrites();
+  try {
+    await sendJson('PATCH', caps.tuner, body);
+    setMsg('ownPerChipMsg', 'Queued: Per-chip ' + (on ? 'ON' : 'OFF') + ' (applies within ~1 s)', true);
+    setTimeout(pollOwnerTune, 2500);
+  } catch (e) { setMsg('ownPerChipMsg', 'Failed: ' + e.message); }
+}
+
 async function applyOwner() {
   const caps = activeCaps();
   if (!caps || !safeUrl(caps.tuner)) { setMsg('ownMsg', 'tuner not available for this board'); return; }
@@ -2284,6 +2337,7 @@ $('restartBtn').addEventListener('click', restartMiner);
 $('poolSave').addEventListener('click', savePool);
 $('poolReboot').addEventListener('click', poolApplyNow);
 $('ownApply').addEventListener('click', applyOwner);
+$('ownPerChipApply').addEventListener('click', applyPerChip);
 $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(b => {
   b.addEventListener('click', () => {
     $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(x => x.classList.remove('active'));
