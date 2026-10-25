@@ -43,6 +43,9 @@ const FIRMWARE_HTML: &str = include_str!("../../assets/firmware.html");
 /// changes buys nothing.
 const LOGO_SVG: &str = include_str!("../../assets/mujina-head-mark.svg");
 
+/// Adds the optional API token to the pages' writes (see `require_token`).
+const AUTH_JS: &str = include_str!("../../assets/auth.js");
+
 /// How many samples the fleet/board hashrate charts keep. Sampled once per
 /// `/data` poll -- the only caller is the dashboard's own `tick()`, on a
 /// 2s interval, so this is ~5 minutes of history. Not a fixed-clock
@@ -95,7 +98,18 @@ pub fn routes() -> Router<SharedState> {
         .route("/firmware", routing::get(serve_firmware_page))
         .route("/nano3s-detail", routing::get(serve_nano3s_detail))
         .route("/mujina-head-mark.svg", routing::get(serve_logo_svg))
+        .route("/auth.js", routing::get(serve_auth_js))
         .route("/doom/launch", routing::post(launch_doom))
+}
+
+async fn serve_auth_js() -> impl IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "application/javascript"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        AUTH_JS,
+    )
 }
 
 async fn serve_page() -> impl IntoResponse {

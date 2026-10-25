@@ -3,7 +3,14 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use axum::{Router, response::Redirect, routing};
+use axum::{
+    Router,
+    extract::{Request, State},
+    http::{Method, StatusCode, header::AUTHORIZATION},
+    middleware::{self, Next},
+    response::{IntoResponse, Redirect, Response},
+    routing,
+};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -55,6 +62,49 @@ impl SharedState {
     }
 }
 
+/// Default token file on the Nano 3S (the writable /data partition).
+const API_TOKEN_FILE: &str = "/data/userconfig/api_token";
+
+/// Shared token required for writes: `MUJINA_API_TOKEN`, else the contents
+/// of the file named by `MUJINA_API_TOKEN_FILE` (default [`API_TOKEN_FILE`]).
+/// `None` (nothing set) leaves writes open, the behavior before tokens.
+pub(crate) fn load_api_token() -> Option<Arc<str>> {
+    let from_file = || {
+        let path = std::env::var("MUJINA_API_TOKEN_FILE").unwrap_or_else(|_| API_TOKEN_FILE.into());
+        std::fs::read_to_string(path).ok()
+    };
+    std::env::var("MUJINA_API_TOKEN")
+        .ok()
+        .or_else(from_file)
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty())
+        .map(Arc::from)
+}
+
+/// With a token configured, every request other than GET/HEAD/OPTIONS must
+/// carry `Authorization: Bearer <token>`. Reads stay open.
+async fn require_token(State(token): State<Option<Arc<str>>>, req: Request, next: Next) -> Response {
+    let read = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    let Some(expected) = token.filter(|_| !read) else {
+        return next.run(req).await;
+    };
+    let given = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if given.is_some_and(|g| ct_eq(g.as_bytes(), expected.as_bytes())) {
+        next.run(req).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "API token required").into_response()
+    }
+}
+
+/// Byte comparison whose time doesn't depend on where the inputs differ.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Start the API server.
 ///
 /// This function starts the HTTP API server and runs until the provided
@@ -84,7 +134,11 @@ pub async fn serve(
         }
     });
 
-    let app = build_router(miner_telemetry_rx, board_registry, scheduler_cmd_tx);
+    let api_token = load_api_token();
+    if api_token.is_some() {
+        info!("API token set: writes require Authorization: Bearer <token>.");
+    }
+    let app = build_router(miner_telemetry_rx, board_registry, scheduler_cmd_tx, api_token);
 
     let listener = TcpListener::bind(&config.bind_addr).await?;
     let actual_addr = listener.local_addr()?;
@@ -115,6 +169,7 @@ pub(crate) fn build_router(
     miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     board_registry: Arc<Mutex<BoardRegistry>>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
+    api_token: Option<Arc<str>>,
 ) -> Router {
     let state = SharedState {
         miner_telemetry_rx,
@@ -135,6 +190,7 @@ pub(crate) fn build_router(
         .route("/api", routing::get(Redirect::permanent("/swagger-ui")))
         .merge(dashboard_router)
         .merge(SwaggerUi::new("/swagger-ui").url("/api/v0/openapi.json", api))
+        .layer(middleware::from_fn_with_state(api_token, require_token))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::TRACE))
@@ -168,6 +224,14 @@ mod tests {
         miner_state: MinerTelemetry,
         board_states: Vec<BoardTelemetry>,
     ) -> TestFixtures {
+        build_test_router_with_token(miner_state, board_states, None)
+    }
+
+    fn build_test_router_with_token(
+        miner_state: MinerTelemetry,
+        board_states: Vec<BoardTelemetry>,
+        api_token: Option<Arc<str>>,
+    ) -> TestFixtures {
         let (miner_tx, miner_rx) = watch::channel(miner_state);
         let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
 
@@ -180,11 +244,55 @@ mod tests {
         }
 
         TestFixtures {
-            router: build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx),
+            router: build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx, api_token),
             _board_senders: board_senders,
             _miner_tx: miner_tx,
             _cmd_rx: cmd_rx,
         }
+    }
+
+    async fn patch_status(app: Router, uri: &str, auth: Option<&str>) -> http::StatusCode {
+        let mut req = Request::builder()
+            .method("PATCH")
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(a) = auth {
+            req = req.header("authorization", a);
+        }
+        let req = req.body(axum::body::Body::from("{}")).unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn writes_need_the_token_when_one_is_set() {
+        let token: Option<Arc<str>> = Some(Arc::from("s3cret"));
+        let app = || build_test_router_with_token(MinerTelemetry::default(), vec![], token.clone()).router;
+        let (status, _) = get(app(), "/api/v0/health").await;
+        assert_eq!(status, http::StatusCode::OK, "reads stay open");
+        assert_eq!(patch_status(app(), "/api/v0/miner", None).await, http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            patch_status(app(), "/api/v0/miner", Some("Bearer wrong")).await,
+            http::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(patch_status(app(), "/api/v0/miner", Some("s3cret")).await, http::StatusCode::UNAUTHORIZED);
+        assert_ne!(
+            patch_status(app(), "/api/v0/miner", Some("Bearer s3cret")).await,
+            http::StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn writes_stay_open_without_a_token() {
+        let app = build_test_router(MinerTelemetry::default(), vec![]).router;
+        assert_ne!(patch_status(app, "/api/v0/miner", None).await, http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn ct_eq_matches_only_equal_bytes() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"ab"));
+        assert!(ct_eq(b"", b""));
     }
 
     async fn get(app: Router, uri: &str) -> (http::StatusCode, String) {
