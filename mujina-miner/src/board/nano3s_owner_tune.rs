@@ -84,7 +84,7 @@ pub(crate) const NANO3S_ENVELOPE: TuneEnvelope = TuneEnvelope {
     power_settle_cycles: OWNER_POWER_SETTLE_CYCLES,
     quiet: CapLimits { temp_c: 70.0, power_w: 60.0 },
     efficient: CapLimits { temp_c: 80.0, power_w: 90.0 },
-    balanced: CapLimits { temp_c: 85.0, power_w: 110.0 },
+    balanced: CapLimits { temp_c: 88.0, power_w: 90.0 },
     max_hash: CapLimits { temp_c: 88.0, power_w: 137.0 },
     target_temp_c: 88.0,
     target_hashrate_power_w: 137.0,
@@ -165,7 +165,9 @@ pub(crate) fn parse_cali(text: &str) -> Option<[CaliMode; 3]> {
 
 /// Builds the owner-tuner envelope from the device calibration: voltage floor
 /// = mode0, Quiet = mode0 (P, T), Efficient = (mode1 P, mode0 T), Balanced =
-/// (midpoint of mode1/mode2 P, mode1 T), MaxHash = mode2 (P, T). Frequency
+/// (mode1 P, mode2 T), MaxHash = mode2 (P, T). mode1 is Canaan's Medium:
+/// Balanced gets stock Medium's power budget and a cap high enough for its
+/// fan target (cap - 5) to match stock Medium's ~85 C chips. Frequency
 /// range, voltage ceiling (3800), step and forbidden voltage stay the
 /// constants; the PSU ceiling is applied on top at runtime.
 pub(crate) fn envelope_from_cali(c: &[CaliMode; 3]) -> TuneEnvelope {
@@ -173,7 +175,7 @@ pub(crate) fn envelope_from_cali(c: &[CaliMode; 3]) -> TuneEnvelope {
         min_voltage_mv: c[0].mv,
         quiet: CapLimits { temp_c: c[0].temp_c, power_w: c[0].power_w },
         efficient: CapLimits { temp_c: c[0].temp_c, power_w: c[1].power_w },
-        balanced: CapLimits { temp_c: c[1].temp_c, power_w: (c[1].power_w + c[2].power_w) / 2.0 },
+        balanced: CapLimits { temp_c: c[2].temp_c, power_w: c[1].power_w },
         max_hash: CapLimits { temp_c: c[2].temp_c, power_w: c[2].power_w },
         target_temp_c: c[2].temp_c,
         target_hashrate_power_w: c[2].power_w,
@@ -986,7 +988,7 @@ mod tests {
         assert_eq!(e.min_voltage_mv, 3392);
         assert_eq!((e.quiet.temp_c, e.quiet.power_w), (80.0, 62.0));
         assert_eq!((e.efficient.temp_c, e.efficient.power_w), (80.0, 95.0));
-        assert_eq!((e.balanced.temp_c, e.balanced.power_w), (85.0, 114.0));
+        assert_eq!((e.balanced.temp_c, e.balanced.power_w), (90.0, 95.0));
         assert_eq!((e.max_hash.temp_c, e.max_hash.power_w), (90.0, 133.0));
         // Hard limits and tuner behavior come from the constants.
         assert_eq!(e.max_voltage_mv, 3800);
@@ -1112,7 +1114,7 @@ mod tests {
         assert_eq!(o.fan_target_c(), 68.0);
         for (p, want) in [
             (TuneProfile::Quiet, 65.0),
-            (TuneProfile::Balanced, 80.0), // cap 85 - 5
+            (TuneProfile::Balanced, 83.0), // cap 88 - 5 (MaxHash's cap, Medium power)
             (TuneProfile::MaxHash, 83.0),  // cap 88 - 5
         ] {
             let mut o = OwnerTune::new();

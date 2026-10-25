@@ -2455,6 +2455,7 @@ fn run_worker(
             },
             Some(s) if s.starts_with("owner_tune:") => {
                 let parsed = owner::parse_owner_directive(&s["owner_tune:".len()..]);
+                let fan_given = parsed.as_ref().is_ok_and(|d| d.fan_target_c.is_some());
                 if let Ok(d) = &parsed
                     && let Some(c) = d.fan_target_c
                 {
@@ -2480,6 +2481,12 @@ fn run_worker(
                         persist_owner_tune_profile(Some(profile));
                         persist_owner_memory(None);
                         last_owner_memory = None;
+                        // A profile pick also means its default fan target
+                        // (cap - 5), unless this request set one.
+                        if !fan_given {
+                            owner.set_fan_target(None);
+                            persist_owner_fan_target(None);
+                        }
                         // Keep the throttle/PSU ceilings in step with the
                         // clock we start from (stale-ceiling bug).
                         temp_throttle_base_freq = last_applied_pll_freq;
