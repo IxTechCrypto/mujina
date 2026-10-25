@@ -44,6 +44,8 @@ use bitcoin::hashes::sha256d;
 use tokio::sync::{mpsc, watch};
 
 use super::nano3s_owner_tune::{self as owner, OwnerCmd, OwnerTune};
+use super::nano3s_chip_tuner::{ChipGoal, ChipMetrics, ChipPhase, ChipTuner, ChipTunerConfig};
+use super::nano3s_owner_tune::ChipTuneStatus;
 use super::nano3s_tuner_core::{SearchMemory, TuneProfile, TuneSetpoint};
 use super::{BackplaneConnector, BoardInfo, VirtualBoardDescriptor};
 use crate::api_client::types::{
@@ -1309,6 +1311,27 @@ struct PersistedTuning {
     chip_offset_mhz: Option<[i16; CHIP_COUNT]>,
     /// Owner-tuner search memory and the profile it belongs to.
     owner_memory: Option<(TuneProfile, SearchMemory)>,
+    /// Per-chip clock tuner switch.
+    chip_tune: bool,
+}
+
+fn persist_chip_tune(on: bool) {
+    let mut cfg = load_tuning();
+    cfg.chip_tune = on;
+    write_tuning_conf(&cfg);
+}
+
+fn persist_chip_offsets(o: [i16; CHIP_COUNT]) {
+    let mut cfg = load_tuning();
+    cfg.chip_offset_mhz = Some(o);
+    write_tuning_conf(&cfg);
+}
+
+fn chip_goal(p: Option<TuneProfile>) -> ChipGoal {
+    match p {
+        Some(TuneProfile::Efficient | TuneProfile::Quiet) => ChipGoal::Efficiency,
+        _ => ChipGoal::Hashrate,
+    }
 }
 
 /// `profile,freq,mv,ths,jth,floor_mv,ceiling_mhz`.
@@ -1382,6 +1405,7 @@ fn load_tuning() -> PersistedTuning {
             }
             "chip_offset_mhz" => cfg.chip_offset_mhz = parse_chip_offsets(value),
             "owner_memory" => cfg.owner_memory = parse_owner_memory(value),
+            "chip_tune" => cfg.chip_tune = value == "on",
             _ => {}
         }
     }
@@ -1422,6 +1446,9 @@ fn write_tuning_conf(cfg: &PersistedTuning) {
     }
     if let Some(m) = &cfg.owner_memory {
         out.push_str(&format!("owner_memory={}\n", format_owner_memory(m)));
+    }
+    if cfg.chip_tune {
+        out.push_str("chip_tune=on\n");
     }
     if let Some(o) = cfg.chip_offset_mhz.filter(|o| o.iter().any(|x| *x != 0)) {
         out.push_str(&format!("chip_offset_mhz={}\n", join_chip_offsets(&o)));
@@ -1520,8 +1547,13 @@ fn disable_owner_for_manual(owner: &mut OwnerTune, why: &str) {
 pub(crate) fn write_owner_tune_command(
     profile: Option<Option<TuneProfile>>,
     fan_target_c: Option<f32>,
+    per_chip: Option<bool>,
 ) -> std::io::Result<()> {
-    std::fs::write(MUJINA_CONTROL_FILE, owner::directive_for_request(profile, fan_target_c))
+    let mut line = owner::directive_for_request(profile, fan_target_c);
+    if let Some(on) = per_chip {
+        line.push_str(if on { ";chip=on" } else { ";chip=off" });
+    }
+    std::fs::write(MUJINA_CONTROL_FILE, line)
 }
 
 /// Queues a `chip_offset:a,b,...` directive (per-chip clock offsets, MHz)
@@ -2403,6 +2435,15 @@ fn run_worker(
         }
     }
     let mut last_owner_memory = owner.profile().zip(owner.memory());
+    // Per-chip tuner: runs on the owner tick while the owner tuner is locked
+    // and its base point hasn't moved since the last tick.
+    let new_chip_tuner = |p: Option<TuneProfile>, o: [i16; CHIP_COUNT]| {
+        ChipTuner::new(ChipTunerConfig::default(), chip_goal(p), o)
+    };
+    let mut chip_tuner = persisted_tuning
+        .chip_tune
+        .then(|| new_chip_tuner(owner.profile(), chip_offset_mhz));
+    let mut chip_base: Option<(u32, Option<i32>)> = None;
     owner.publish(None);
 
     loop {
@@ -2448,6 +2489,11 @@ fn run_worker(
                     } else {
                         chip_offset_mhz = o;
                         eprintln!("[nano3s] chip offsets {o:?} (via dashboard/API)");
+                        if chip_tuner.take().is_some() {
+                            persist_chip_tune(false);
+                            owner.set_chip_status(None);
+                            eprintln!("[nano3s] per-chip tuner off (manual offsets)");
+                        }
                     }
                 }
                 Some(_) => {}
@@ -2456,6 +2502,14 @@ fn run_worker(
             Some(s) if s.starts_with("owner_tune:") => {
                 let parsed = owner::parse_owner_directive(&s["owner_tune:".len()..]);
                 let fan_given = parsed.as_ref().is_ok_and(|d| d.fan_target_c.is_some());
+                if let Ok(Some(on)) = parsed.as_ref().map(|d| d.chip_tune) {
+                    persist_chip_tune(on);
+                    chip_tuner = on.then(|| new_chip_tuner(owner.profile(), chip_offset_mhz));
+                    if !on {
+                        owner.set_chip_status(None);
+                    }
+                    eprintln!("[nano3s] per-chip tuner {}", if on { "on" } else { "off" });
+                }
                 if let Ok(d) = &parsed
                     && let Some(c) = d.fan_target_c
                 {
@@ -2486,6 +2540,9 @@ fn run_worker(
                         if !fan_given {
                             owner.set_fan_target(None);
                             persist_owner_fan_target(None);
+                        }
+                        if chip_tuner.is_some() {
+                            chip_tuner = Some(new_chip_tuner(Some(profile), chip_offset_mhz));
                         }
                         // Keep the throttle/PSU ceilings in step with the
                         // clock we start from (stale-ceiling bug).
@@ -3202,6 +3259,52 @@ fn run_worker(
                                 write_harness_control(&format!("fan:manual,{d}"));
                             }
                         }
+                    }
+                    if let Some(ct) = chip_tuner.as_mut() {
+                        let base = (last_applied_pll_freq[0], last_applied_voltage_mv);
+                        let ready = owner.is_locked() && chip_base == Some(base);
+                        let was_running = chip_base.is_some();
+                        chip_base = owner.is_locked().then_some(base);
+                        let new = if ready {
+                            ct.set_power_cap_w(owner.power_cap_w());
+                            let mut m = ChipMetrics {
+                                chip_ghs: [0.0; CHIP_COUNT],
+                                chip_fail_pct: [0.0; CHIP_COUNT],
+                                board_ths: st.ghsspd as f32 / 1000.0,
+                                board_w: power_w as f32,
+                                temp_max_c: st.temp_max,
+                            };
+                            for (i, c) in st.chips.iter().take(CHIP_COUNT).enumerate() {
+                                m.chip_ghs[i] = c.ghsspd;
+                                m.chip_fail_pct[i] = c.spd_dh;
+                            }
+                            ct.tick(&m)
+                        } else if was_running {
+                            ct.interrupt()
+                        } else {
+                            None
+                        };
+                        if let Some(o) = new.filter(|o| *o != chip_offset_mhz) {
+                            let rc = unsafe { nano3s_ipc_set_chip_pll_offset(o.as_ptr()) };
+                            if rc != 0 {
+                                eprintln!("[nano3s] per-chip tuner: nano3s_ipc_set_chip_pll_offset failed");
+                            } else {
+                                chip_offset_mhz = o;
+                                persist_chip_offsets(o);
+                                eprintln!("[nano3s] per-chip tuner: {} -> {o:?}", ct.last_event());
+                            }
+                        }
+                        let phase = match (ready, ct.phase()) {
+                            (false, _) => "waiting",
+                            (true, ChipPhase::Baseline) => "baseline",
+                            (true, ChipPhase::Trial { .. }) => "trial",
+                            (true, ChipPhase::Converged) => "converged",
+                        };
+                        owner.set_chip_status(Some(ChipTuneStatus {
+                            phase: phase.to_owned(),
+                            last_event: ct.last_event().to_owned(),
+                            offsets_mhz: ct.offsets().to_vec(),
+                        }));
                     }
                     owner.publish(Some(TuneSetpoint {
                         frequency_mhz: last_applied_pll_freq[0] as f32,

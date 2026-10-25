@@ -5,6 +5,9 @@ pub(crate) mod emberone00;
 pub(crate) mod nano3s;
 pub(crate) mod nano3s_owner_tune;
 pub(crate) mod nano3s_tuner_core;
+pub(crate) mod nano3s_chip_tuner;
+#[cfg(test)]
+pub(crate) mod nano3s_chain_sim;
 pub mod pattern;
 
 use anyhow::Result;

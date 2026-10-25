@@ -207,6 +207,10 @@ pub struct OwnerTuneRequest {
     /// tuner is on. Default: the profile's temp cap minus 5 C. Persisted.
     #[serde(default)]
     pub chip_temp_target_c: Option<f32>,
+    /// Per-chip clock tuner on/off while the owner tuner is on (it runs only
+    /// once the owner tuner has locked). Absent leaves it unchanged. Persisted.
+    #[serde(default)]
+    pub per_chip: Option<bool>,
 }
 
 fn present_or_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<TuneProfile>>, D::Error> {
@@ -227,9 +231,9 @@ impl OwnerTuneRequest {
 
     /// The profile change to queue: `Some(None)` = off, `None` = keep.
     pub(crate) fn profile_change(&self) -> Option<Option<TuneProfile>> {
-        match (self.profile, self.chip_temp_target_c) {
-            (None, Some(_)) => None,
-            (None, None) => Some(None),
+        match (self.profile, self.chip_temp_target_c.is_some() || self.per_chip.is_some()) {
+            (None, true) => None,
+            (None, false) => Some(None),
             (p, _) => p,
         }
     }
@@ -261,6 +265,16 @@ pub struct OwnerTuneStatus {
     pub events: Vec<OwnerEvent>,
     /// Best measured point, if any.
     pub best: Option<OwnerBest>,
+    /// Per-chip tuner state; `None` while it is off.
+    pub per_chip: Option<ChipTuneStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct ChipTuneStatus {
+    /// `baseline`, `trial` or `converged`; `waiting` until the owner tuner locks.
+    pub phase: String,
+    pub last_event: String,
+    pub offsets_mhz: Vec<i16>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -325,6 +339,8 @@ pub(crate) struct OwnerDirective {
     /// `Some(None)` = off, `None` = keep (`keep`).
     pub profile: Option<Option<TuneProfile>>,
     pub fan_target_c: Option<f32>,
+    /// `chip=on|off`: per-chip tuner switch; `None` = unchanged.
+    pub chip_tune: Option<bool>,
 }
 
 pub(crate) fn directive_for_request(profile: Option<Option<TuneProfile>>, fan_target_c: Option<f32>) -> String {
@@ -343,14 +359,24 @@ pub(crate) fn parse_owner_directive(v: &str) -> Result<OwnerDirective, ()> {
     let head = parts.next().unwrap_or("").trim();
     let profile = if head == "keep" { None } else { Some(parse_directive(head)?) };
     let mut fan_target_c = None;
+    let mut chip_tune = None;
     for extra in parts {
-        let c: f32 = extra.trim().strip_prefix("fan=").ok_or(())?.trim().parse().map_err(|_| ())?;
+        let extra = extra.trim();
+        if let Some(v) = extra.strip_prefix("chip=") {
+            chip_tune = Some(match v.trim() {
+                "on" => true,
+                "off" => false,
+                _ => return Err(()),
+            });
+            continue;
+        }
+        let c: f32 = extra.strip_prefix("fan=").ok_or(())?.trim().parse().map_err(|_| ())?;
         if !FAN_TARGET_RANGE_C.contains(&c) {
             return Err(());
         }
         fan_target_c = Some(c);
     }
-    Ok(OwnerDirective { profile, fan_target_c })
+    Ok(OwnerDirective { profile, fan_target_c, chip_tune })
 }
 
 // --- chip-temp fan loop ------------------------------------------------------
@@ -599,6 +625,7 @@ pub(crate) struct OwnerTune {
     fan_target_override: Option<f32>,
     fan_force_pending: bool,
     fan_restore_pending: bool,
+    chip_status: Option<ChipTuneStatus>,
 }
 
 impl OwnerTune {
@@ -618,7 +645,23 @@ impl OwnerTune {
             fan_target_override: None,
             fan_force_pending: false,
             fan_restore_pending: false,
+            chip_status: None,
         }
+    }
+
+    /// True once the profile search has locked onto a point.
+    pub(crate) fn is_locked(&self) -> bool {
+        self.profile.is_some() && self.tuner.phase() == TunePhase::Locked
+    }
+
+    /// Power cap (W) of the running profile, PSU ceiling included.
+    pub(crate) fn power_cap_w(&self) -> f32 {
+        self.tuner.power_cap_w()
+    }
+
+    /// Shown in the published status as `per_chip`.
+    pub(crate) fn set_chip_status(&mut self, s: Option<ChipTuneStatus>) {
+        self.chip_status = s;
     }
 
     /// `None` restores the default (profile temp cap - 5 C).
@@ -772,6 +815,7 @@ impl OwnerTune {
                 voltage_mv: sp.core_voltage_mv,
                 j_th: j,
             }),
+            per_chip: self.chip_status.clone(),
         });
     }
 }
@@ -1029,6 +1073,19 @@ mod tests {
     }
 
     #[test]
+    fn owner_directive_parses_the_chip_switch() {
+        let d = parse_owner_directive("keep;chip=on").unwrap();
+        assert_eq!((d.profile, d.chip_tune, d.fan_target_c), (None, Some(true), None));
+        let d = parse_owner_directive("balanced;fan=80;chip=off").unwrap();
+        assert_eq!(d.chip_tune, Some(false));
+        assert_eq!(d.fan_target_c, Some(80.0));
+        assert!(parse_owner_directive("keep;chip=maybe").is_err());
+        // A per-chip switch alone keeps the profile.
+        let r = OwnerTuneRequest { per_chip: Some(true), ..Default::default() };
+        assert_eq!(r.profile_change(), None);
+    }
+
+    #[test]
     fn fan_takeover_starts_from_current_duty() {
         let mut st = FanState::starting_at(Some(30));
         // At target: first write is the current duty, not 100 %.
@@ -1155,9 +1212,9 @@ mod tests {
     #[test]
     fn owner_directive_round_trips_with_fan_target() {
         let d = parse_owner_directive("efficient;fan=72.5").unwrap();
-        assert_eq!(d, OwnerDirective { profile: Some(Some(TuneProfile::Efficient)), fan_target_c: Some(72.5) });
+        assert_eq!(d, OwnerDirective { profile: Some(Some(TuneProfile::Efficient)), fan_target_c: Some(72.5), chip_tune: None });
         let d = parse_owner_directive("keep;fan=75").unwrap();
-        assert_eq!(d, OwnerDirective { profile: None, fan_target_c: Some(75.0) });
+        assert_eq!(d, OwnerDirective { profile: None, fan_target_c: Some(75.0), chip_tune: None });
         assert_eq!(parse_owner_directive("off").unwrap().profile, Some(None));
         assert!(parse_owner_directive("off;fan=95").is_err());
         assert!(parse_owner_directive("off;bogus=1").is_err());

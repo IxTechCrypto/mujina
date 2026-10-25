@@ -700,6 +700,11 @@ impl AutoTuner {
         self.caps().temp_c
     }
 
+    /// nano-mujina addition: power cap (W) of the current mode.
+    pub fn power_cap_w(&self) -> f32 {
+        self.caps().power_w
+    }
+
     /// nano-mujina addition: whether the tuner currently holds the fan at 100 %.
     pub fn fan_forced(&self) -> bool {
         self.fan_forced_full
