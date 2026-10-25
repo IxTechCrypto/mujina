@@ -1278,6 +1278,7 @@ function setMsg(id, text, ok) { const m = $(id); m.textContent = text; m.classNa
 let SYS = null;                 // last good /api/v0/system document
 let LAST = null, ACTIVE_NAME = null, CHIP_FILTER = 'all';
 let PAUSE_AVAILABLE = false, DETAIL_STATE = 0, PAUSED = false, CHIP_OFFSETS = [];
+let LAST_OWNER_STATUS = null, USER_EDITING_PER_CHIP = false;
 let MOUSE_POS = { fleetChart: null, chart: null };
 let TICKS = 0;
 
@@ -1589,6 +1590,15 @@ function applyBoardCaps() {
   const tuner = !!(caps && safeUrl(caps.tuner)), manual = !!(caps && safeUrl(caps.manual_tuning));
   show('ownSection', tuner);
   show('tunerCard', tuner);
+  const pcElem = $('at-per-chip');
+  const chk = $('ownPerChip');
+  if (!tuner) {
+    if (pcElem) pcElem.textContent = '';
+    if (chk) { chk.checked = false; chk.disabled = true; }
+    setMsg('ownPerChipMsg', '');
+  } else {
+    if (chk) chk.disabled = false;
+  }
   show('manualSection', manual);
   show('tuningNone', !!SYS && !tuner && !manual);
   const nano = hasCeiling();
@@ -1691,6 +1701,10 @@ function renderChips(chips, perChip) {
   const card = $('chipcard');
   if (!perChip || !chips || !chips.length) { card.style.display = 'none'; return; }
   card.style.display = '';
+  const b = activeBoard();
+  const caps = activeCaps();
+  const isNano3sTuner = !!(caps && caps.tuner && b && b.model && b.model.indexOf('Nano3s') >= 0);
+  const activeOffsets = isNano3sTuner ? CHIP_OFFSETS : [];
   const peak = Math.max(...chips.map(c => c.ghs || 0)) || 1;
   let list = chips;
   if (CHIP_FILTER === 'lazy') list = chips.filter(c => (c.ghs || 0) < peak * 0.75);
@@ -1702,8 +1716,10 @@ function renderChips(chips, perChip) {
     const ghs = c.ghs || 0;
     const t = mk('div', 'chiptile' + (ghs < peak * 0.75 ? ' weak' : ''));
     const nameRow = mk('div', 'ctname', 'ASIC ' + Number(c.index));
-    const off = (CHIP_OFFSETS && typeof c.index === 'number') ? CHIP_OFFSETS[c.index] : 0;
-    if (off && typeof off === 'number') {
+    const idx = Number(c.index);
+    const rawOff = (activeOffsets && Number.isFinite(idx)) ? activeOffsets[idx] : 0;
+    const off = Number.isFinite(+rawOff) ? Math.round(+rawOff) : 0;
+    if (off !== 0) {
       const badge = mk('span', 'badge', (off > 0 ? '+' : '') + off + ' MHz');
       badge.style.cssText = 'margin-left:5px;font-size:8px;padding:1px 3px;';
       nameRow.appendChild(badge);
@@ -1942,13 +1958,24 @@ async function pollDetail() {
   if (DETAIL_STATE < 0) return;
   try {
     const r = await fetch('/nano3s-detail');
-    if (!r.ok) { DETAIL_STATE = -1; if (PAUSE_AVAILABLE) { PAUSE_AVAILABLE = false; applySystem(); } return; }
+    if (!r.ok) {
+      DETAIL_STATE = -1;
+      if (PAUSE_AVAILABLE) { PAUSE_AVAILABLE = false; applySystem(); }
+      if (CHIP_OFFSETS.length > 0) {
+        CHIP_OFFSETS = [];
+        if (LAST) render(LAST);
+      }
+      return;
+    }
     const nd = await r.json();
     DETAIL_STATE = 1;
     if (Array.isArray(nd.chip_offset_mhz)) {
       const changed = JSON.stringify(CHIP_OFFSETS) !== JSON.stringify(nd.chip_offset_mhz);
       CHIP_OFFSETS = nd.chip_offset_mhz;
       if (changed && LAST) render(LAST);
+    } else if (CHIP_OFFSETS.length > 0) {
+      CHIP_OFFSETS = [];
+      if (LAST) render(LAST);
     }
     if (typeof nd.paused === 'boolean') {
       if (!PAUSE_AVAILABLE) { PAUSE_AVAILABLE = true; applySystem(); }
@@ -2205,6 +2232,7 @@ function pt(p) {
   return { f, v, j: p.j_th != null ? p.j_th : p.efficiency_j_th };
 }
 function renderOwnerTune(o) {
+  LAST_OWNER_STATUS = o;
   let ownTxt = 'tuner off';
   if (o.enabled) {
     ownTxt = (o.profile || '?') + ' / ' + (o.phase || '?');
@@ -2274,14 +2302,24 @@ async function applyPerChip() {
   const caps = activeCaps();
   if (!caps || !safeUrl(caps.tuner)) { setMsg('ownPerChipMsg', 'tuner not available for this board'); return; }
   if (writeBusy('ownPerChipMsg')) return;
+  if (!LAST_OWNER_STATUS || !LAST_OWNER_STATUS.enabled) {
+    setMsg('ownPerChipMsg', 'turn on a profile first');
+    return;
+  }
   const on = $('ownPerChip').checked;
   const body = { per_chip: on };
   setMsg('ownPerChipMsg', 'Sending…');
   lockWrites();
   try {
     await sendJson('PATCH', caps.tuner, body);
-    setMsg('ownPerChipMsg', 'Queued: Per-chip ' + (on ? 'ON' : 'OFF') + ' (applies within ~1 s)', true);
-    setTimeout(pollOwnerTune, 2500);
+    setMsg('ownPerChipMsg', 'Queued: per-chip ' + (on ? 'ON' : 'OFF') + ' (runs once the profile locks)', true);
+    USER_EDITING_PER_CHIP = false;
+    setTimeout(async () => {
+      await pollOwnerTune();
+      if (!USER_EDITING_PER_CHIP && LAST_OWNER_STATUS) {
+        $('ownPerChip').checked = !!LAST_OWNER_STATUS.per_chip;
+      }
+    }, 2500);
   } catch (e) { setMsg('ownPerChipMsg', 'Failed: ' + e.message); }
 }
 
@@ -2338,6 +2376,7 @@ $('poolSave').addEventListener('click', savePool);
 $('poolReboot').addEventListener('click', poolApplyNow);
 $('ownApply').addEventListener('click', applyOwner);
 $('ownPerChipApply').addEventListener('click', applyPerChip);
+$('ownPerChip').addEventListener('change', () => { USER_EDITING_PER_CHIP = true; });
 $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(b => {
   b.addEventListener('click', () => {
     $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(x => x.classList.remove('active'));
