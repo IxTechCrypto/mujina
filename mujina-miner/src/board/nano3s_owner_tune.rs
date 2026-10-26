@@ -724,6 +724,13 @@ impl OwnerTune {
         self.profile.is_some()
     }
 
+    /// A profile picked from the API/UI: a fresh search (no remembered best)
+    /// and the profile's default fan target unless this request set one.
+    pub(crate) fn pick_profile(&mut self, profile: TuneProfile, fan_target_c: Option<f32>) {
+        self.enable(profile);
+        self.set_fan_target(fan_target_c);
+    }
+
     pub(crate) fn enable(&mut self, profile: TuneProfile) {
         self.tuner.enable_profile(profile);
         self.profile = Some(profile);
@@ -1239,5 +1246,44 @@ mod tests {
         assert!(s.events.len() <= 20 && !s.events.is_empty());
         assert!(s.events.iter().all(|e| e.power_w == 80.0 && e.hashrate_ths == 4.0));
         assert!(s.best.is_some_and(|b| (b.j_th - 20.0).abs() < 1e-3));
+    }
+
+    #[test]
+    fn profile_pick_resets_fan_override_and_memory() {
+        let env = envelope_from_cali(&parse_cali(SAMPLE_CALI).unwrap());
+        let mut o = OwnerTune::with_envelope(env);
+        o.set_fan_target(Some(80.0));
+        o.enable(TuneProfile::Balanced);
+        o.restore_memory(SearchMemory {
+            best: TuneSetpoint { frequency_mhz: 308.0, core_voltage_mv: 3756 },
+            best_hashrate_ths: 5.26,
+            best_j_th: 20.21,
+            probe_floor_mv: 0,
+            probe_ceiling_mhz: 450.0,
+        });
+        assert!(o.memory().is_some());
+
+        // pick_profile with None resets fan target to Balanced default (cap 90 - 5 = 85.0) and clears memory
+        o.pick_profile(TuneProfile::Balanced, None);
+        assert_eq!(o.fan_target_c(), 85.0);
+        assert!(o.memory().is_none());
+
+        // pick_profile with Some(78.0) sets fan target to 78.0
+        o.pick_profile(TuneProfile::Balanced, Some(78.0));
+        assert_eq!(o.fan_target_c(), 78.0);
+    }
+
+    #[test]
+    fn pick_profile_cross_profile_switch_adopts_new_profile_default_fan_target() {
+        let env = envelope_from_cali(&parse_cali(SAMPLE_CALI).unwrap());
+        let mut o = OwnerTune::with_envelope(env);
+        // Start on Efficient (default target 68.0 C)
+        o.pick_profile(TuneProfile::Efficient, None);
+        assert_eq!(o.fan_target_c(), 68.0);
+
+        // Switch Efficient -> Balanced with None fan target: must land on Balanced's default (85.0 C),
+        // not keep the old profile's 68.0 C
+        o.pick_profile(TuneProfile::Balanced, None);
+        assert_eq!(o.fan_target_c(), 85.0);
     }
 }

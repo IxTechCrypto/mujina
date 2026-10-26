@@ -2570,7 +2570,6 @@ fn run_worker(
                         // A profile pick also means its default fan target
                         // (cap - 5), unless this request set one.
                         if !fan_given {
-                            owner.set_fan_target(None);
                             persist_owner_fan_target(None);
                         }
                         if let Some(ct) = chip_tuner.take() {
@@ -2582,7 +2581,7 @@ fn run_worker(
                         // clock we start from (stale-ceiling bug).
                         temp_throttle_base_freq = last_applied_pll_freq;
                         psu_ceiling_freq = last_applied_pll_freq;
-                        owner.enable(profile);
+                        owner.pick_profile(profile, parsed.as_ref().ok().and_then(|d| d.fan_target_c));
                         owner.seed_fan_duty(read_fan_status().and_then(|f| f.percent));
                         owner.publish(None);
                         eprintln!("[nano3s] owner-tune: enabled profile {profile:?} (power-target/temp-target/autotune-hashrate disabled)");
@@ -3345,7 +3344,7 @@ fn run_worker(
                         core_voltage_mv: last_applied_voltage_mv.unwrap_or(st.voltage_mv as i32).max(0) as u16,
                     }));
                     let mem = owner.profile().zip(owner.memory());
-                    if mem.is_some() && mem != last_owner_memory {
+                    if mem != last_owner_memory && (mem.is_some() || owner.profile().is_some()) {
                         persist_owner_memory(mem);
                         last_owner_memory = mem;
                     }

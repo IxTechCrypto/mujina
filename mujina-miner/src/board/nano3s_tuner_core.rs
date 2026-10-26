@@ -819,6 +819,32 @@ impl AutoTuner {
         let caps = self.caps();
         let env = self.envelope;
 
+        // A best point that draws more power than the current cap allows
+        // (minus margin) is not known-good under these limits. Restored memory
+        // (or a best measured under a looser cap / higher PSU ceiling) must
+        // not be a revert target, or revert -> breach -> back off -> revert
+        // loops forever. A legitimately recorded best never trips this because
+        // a best is only recorded when its mean power is <= cap - margin.
+        // Keep probe_floor_mv and probe_ceiling_mhz: a lower cap does not
+        // invalidate them (a ceiling found under a looser cap is still above
+        // anything reachable now; the floor is a silicon stability fact).
+        if matches!(self.mode, TuneMode::Profile(_))
+            && let Some((b, hash, eff)) = self.best
+        {
+            let w = hash * eff;
+            if !w.is_finite() || w > caps.power_w - env.best_point_margin_w {
+                self.best = None;
+                self.pending_reject_mhz = None;
+                self.log_event(
+                    format!(
+                        "best {:.0} MHz / {} mV drew {:.1} W, over the {:.0} W cap: discarding it",
+                        b.frequency_mhz, b.core_voltage_mv, w, caps.power_w
+                    ),
+                    m,
+                );
+            }
+        }
+
         // 1. Safety: over a hard cap -> back off on a fast cadence that does
         //    NOT wait for the long tuning settle (temperature and power are
         //    instantaneous). A breach is treated as a transient condition,
@@ -1027,6 +1053,23 @@ impl AutoTuner {
         // below the cap is "at cap" and never becomes the known-good point.
         let near_cap = env.best_point_margin_w > 0.0
             && m.power_w > caps.power_w - env.best_point_margin_w;
+
+        // When there is no known-good point yet, a point sitting inside the cap
+        // margin (or over it on mean) must not become the first best — that
+        // would anchor the search at a near-cap point and recreate the
+        // revert loop. Lower clock until we find a point with headroom.
+        // At the clock floor, fall through (record it; nothing lower to try).
+        if near_cap && self.best.is_none() {
+            let down = m.frequency_mhz - env.freq_step_mhz;
+            if down >= env.min_freq_mhz {
+                self.phase = TunePhase::Seeking;
+                self.log_event(
+                    format!("at cap with no known-good point: lowering to {down:.0} MHz"),
+                    m,
+                );
+                return Some(TuneAction::SetFrequency(down));
+            }
+        }
 
         // 3. At the setpoint recorded as `best`: this is a confirmation, not a
         //    new candidate (e.g. we just returned here after a transient
@@ -2180,9 +2223,9 @@ mod tests {
     fn point_inside_the_margin_is_not_recorded_as_best() {
         let env = TuneEnvelope { best_point_margin_w: 3.0, ..avg_env() };
         let mut t = avg_tuner(TuneProfile::MaxHash, env);
-        // First point 135 W (inside the margin, cap 137): nothing to revert
-        // to, so it is recorded anyway.
-        noisy(&mut t, 135.0, 5.0, 0.0, 3704, 4);
+        // Initial point with headroom (130 W under the 134 W margin line):
+        // recorded as the initial best.
+        noisy(&mut t, 130.0, 5.0, 0.0, 3704, 4);
         assert!(t.best.is_some());
         // A later improving point inside the margin is NOT adopted.
         let before = t.best;
@@ -2254,5 +2297,129 @@ mod tests {
         let mut t = avg_tuner(TuneProfile::Efficient, v3_env());
         noisy(&mut t, 80.0, 4.88, 0.0, 3704, 4);
         assert_eq!(noisy(&mut t, 78.4, 4.73, 0.0, 3626, 4), Some(TuneAction::SetVoltage(3704)));
+    }
+
+    #[test]
+    fn restored_best_over_cap_is_discarded_and_settles_under_cap() {
+        let env = TuneEnvelope {
+            settle_cycles: 4,
+            safety_settle_cycles: 1,
+            power_settle_cycles: 1,
+            balanced: CapLimits { temp_c: 90.0, power_w: 95.0 },
+            best_point_margin_w: 3.0,
+            ..nano_env()
+        };
+        let mut t = AutoTuner::default();
+        t.set_envelope(env);
+        t.enable_profile(TuneProfile::Balanced);
+
+        // Restore stale over-cap memory from 24 h soak: 308 MHz / 3756 mV, 5.26 TH/s, 20.21 J/TH (~106.3 W)
+        t.restore_memory(SearchMemory {
+            best: TuneSetpoint { frequency_mhz: 308.0, core_voltage_mv: 3756 },
+            best_hashrate_ths: 5.26,
+            best_j_th: 20.21,
+            probe_floor_mv: 3496,
+            probe_ceiling_mhz: 380.0,
+        });
+
+        let mut freq = 308.0_f32;
+        let volt = 3756_u16;
+
+        // On the very first evaluation, the over-cap best must be discarded while
+        // retaining probe_floor_mv and probe_ceiling_mhz.
+        let first_metric = Metrics {
+            fail_rate_pct: Some(1.0),
+            ..m(50.0, 91.8 + (freq - 248.0) * 0.26, freq * 0.0182, freq, volt)
+        };
+        let first_action = t.evaluate(&first_metric);
+        assert!(t.best_point().is_none(), "best must be discarded on the first evaluation");
+        assert_eq!(t.probe_floor_mv, 3496, "probe_floor_mv must be retained after discard");
+        assert_eq!(t.probe_ceiling_mhz, 380.0, "probe_ceiling_mhz must be retained after discard");
+        if let Some(TuneAction::SetFrequency(f)) = first_action {
+            freq = f;
+        }
+
+        // Drive the tuner across multiple evaluation cycles with ample headroom.
+        for _ in 0..250 {
+            let power = 91.8 + (freq - 248.0) * 0.26;
+            let hash = freq * 0.0182;
+            let metric = Metrics {
+                fail_rate_pct: Some(1.0),
+                ..m(50.0, power, hash, freq, volt)
+            };
+            if let Some(action) = t.evaluate(&metric) {
+                if let TuneAction::SetFrequency(f) = action {
+                    assert!(
+                        (f - 308.0).abs() > FREQ_TOLERANCE_MHZ,
+                        "reverted to discarded best 308 MHz!"
+                    );
+                    freq = f;
+                }
+            }
+        }
+
+        let best = t.best_point();
+        assert!(best.is_some(), "expected tuner to establish a sub-cap best");
+        let (bp, _) = best.unwrap();
+        assert!((bp.frequency_mhz - 308.0).abs() > FREQ_TOLERANCE_MHZ, "best should not be 308 MHz");
+        let power_at_best = 91.8 + (bp.frequency_mhz - 248.0) * 0.26;
+        assert!(power_at_best <= 92.0, "power at best {power_at_best} should be <= 92 W");
+        assert_eq!(t.phase(), TunePhase::Locked);
+    }
+
+    #[test]
+    fn best_under_cap_is_kept() {
+        let env = TuneEnvelope {
+            balanced: CapLimits { temp_c: 90.0, power_w: 95.0 },
+            best_point_margin_w: 3.0,
+            ..nano_env()
+        };
+        let mut t = AutoTuner::default();
+        t.set_envelope(env);
+        t.enable_profile(TuneProfile::Balanced);
+
+        // Restored best at ~85 W: 248 MHz / 3704 mV, 4.25 TH/s, 20.0 J/TH (4.25 * 20.0 = 85.0 W <= 92.0 W)
+        t.restore_memory(SearchMemory {
+            best: TuneSetpoint { frequency_mhz: 248.0, core_voltage_mv: 3704 },
+            best_hashrate_ths: 4.25,
+            best_j_th: 20.0,
+            probe_floor_mv: 0,
+            probe_ceiling_mhz: 450.0,
+        });
+
+        // Evaluate at a stable reading under cap
+        let metric = Metrics {
+            fail_rate_pct: Some(1.0),
+            ..m(50.0, 85.0, 4.25, 248.0, 3704)
+        };
+        t.evaluate(&metric);
+
+        assert_eq!(
+            t.best_point().map(|(sp, _)| sp.frequency_mhz),
+            Some(248.0),
+            "restored best under cap must be retained"
+        );
+    }
+
+    #[test]
+    fn first_point_at_cap_is_not_recorded() {
+        let env = TuneEnvelope {
+            settle_cycles: 4,
+            safety_settle_cycles: 1,
+            power_settle_cycles: 1,
+            balanced: CapLimits { temp_c: 90.0, power_w: 95.0 },
+            best_point_margin_w: 3.0,
+            ..nano_env()
+        };
+        let mut t = AutoTuner::default();
+        t.set_envelope(env);
+        t.enable_profile(TuneProfile::Balanced);
+
+        assert!(t.best_point().is_none());
+
+        // Settled power inside the margin (93.5 W > 95 - 3 = 92 W; instantaneous 93.5 < 95)
+        let action = noisy(&mut t, 93.5, 5.0, 0.0, 3704, 4);
+        assert_eq!(action, Some(TuneAction::SetFrequency(290.0)));
+        assert!(t.best_point().is_none(), "first point at cap must not be recorded as best");
     }
 }
