@@ -949,19 +949,17 @@
         <label for="ownTemp">Chip temp target <small style="color:var(--dim)">°C, blank = unchanged</small></label>
         <input type="number" id="ownTemp" min="30" max="95" step="1" placeholder="unchanged">
       </div>
-      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:4px">
-        <button class="btn pri wbtn" id="ownApply" type="button">Apply</button>
-      </div>
-      <div class="msg" id="ownMsg"></div>
-      <div class="row" style="margin-top:10px">
+      <div class="row" style="margin-top:6px">
         <label for="ownPerChip" style="display:flex;align-items:center;gap:8px;cursor:pointer">
           <input type="checkbox" id="ownPerChip">
           <span>Per-chip tuning</span>
         </label>
-        <button class="btn pri wbtn" id="ownPerChipApply" type="button" style="padding:6px 14px">Apply</button>
       </div>
       <small style="color:var(--dim);display:block;margin-top:2px">Runs once the profile has locked; one chip at a time, ~7 min per step.</small>
-      <div class="msg" id="ownPerChipMsg"></div>
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
+        <button class="btn pri wbtn" id="ownApply" type="button">Apply</button>
+      </div>
+      <div class="msg" id="ownMsg"></div>
       <div class="note">Using any Live Tuning control below switches the owner tuner off.</div>
       </div>
 
@@ -1595,7 +1593,6 @@ function applyBoardCaps() {
   if (!tuner) {
     if (pcElem) pcElem.textContent = '';
     if (chk) { chk.checked = false; chk.disabled = true; }
-    setMsg('ownPerChipMsg', '');
   } else {
     if (chk) chk.disabled = false;
   }
@@ -2298,45 +2295,60 @@ async function pollOwnerTune() {
     renderOwnerTune(await r.json());
   } catch (e) { OWNER_ACTIVE = false; }
 }
-async function applyPerChip() {
-  const caps = activeCaps();
-  if (!caps || !safeUrl(caps.tuner)) { setMsg('ownPerChipMsg', 'tuner not available for this board'); return; }
-  if (writeBusy('ownPerChipMsg')) return;
-  if (!LAST_OWNER_STATUS || !LAST_OWNER_STATUS.enabled) {
-    setMsg('ownPerChipMsg', 'turn on a profile first');
-    return;
-  }
-  const on = $('ownPerChip').checked;
-  const body = { per_chip: on };
-  setMsg('ownPerChipMsg', 'Sending…');
-  lockWrites();
-  try {
-    await sendJson('PATCH', caps.tuner, body);
-    setMsg('ownPerChipMsg', 'Queued: per-chip ' + (on ? 'ON' : 'OFF') + ' (runs once the profile locks)', true);
-    USER_EDITING_PER_CHIP = false;
-    setTimeout(async () => {
-      await pollOwnerTune();
-      if (!USER_EDITING_PER_CHIP && LAST_OWNER_STATUS) {
-        $('ownPerChip').checked = !!LAST_OWNER_STATUS.per_chip;
-      }
-    }, 2500);
-  } catch (e) { setMsg('ownPerChipMsg', 'Failed: ' + e.message); }
-}
-
 async function applyOwner() {
   const caps = activeCaps();
   if (!caps || !safeUrl(caps.tuner)) { setMsg('ownMsg', 'tuner not available for this board'); return; }
   if (writeBusy('ownMsg')) return;
   const sel = $('ownProfile'), v = sel.value, label = sel.options[sel.selectedIndex].textContent;
+  const curProfile = (LAST_OWNER_STATUS && LAST_OWNER_STATUS.enabled) ? (LAST_OWNER_STATUS.profile || 'off') : 'off';
+  const curPerChip = !!(LAST_OWNER_STATUS && LAST_OWNER_STATUS.per_chip);
+  const newPerChip = $('ownPerChip').checked;
+  const tt = $('ownTemp').value;
+
+  const profileChanged = (v !== curProfile);
+  const tempChanged = (tt !== '');
+  const perChipChanged = (newPerChip !== curPerChip);
+
+  if (!profileChanged && !tempChanged && !perChipChanged) {
+    setMsg('ownMsg', 'No changes to apply');
+    return;
+  }
+
+  // If ONLY per-chip changed and a profile is active, send ONLY { per_chip } to avoid resetting the profile search or fan target
+  if (!profileChanged && !tempChanged && perChipChanged) {
+    if (!LAST_OWNER_STATUS || !LAST_OWNER_STATUS.enabled) {
+      setMsg('ownMsg', 'turn on a profile first');
+      return;
+    }
+    const body = { per_chip: newPerChip };
+    setMsg('ownMsg', 'Sending…');
+    lockWrites();
+    try {
+      await sendJson('PATCH', caps.tuner, body);
+      setMsg('ownMsg', 'Queued: per-chip ' + (newPerChip ? 'ON' : 'OFF') + ' (runs once the profile locks)', true);
+      USER_EDITING_PER_CHIP = false;
+      setTimeout(async () => {
+        await pollOwnerTune();
+        if (!USER_EDITING_PER_CHIP && LAST_OWNER_STATUS) {
+          $('ownPerChip').checked = !!LAST_OWNER_STATUS.per_chip;
+        }
+      }, 2500);
+    } catch (e) { setMsg('ownMsg', 'Failed: ' + e.message); }
+    return;
+  }
+
+  // Profile or temp target changed: confirm and send combined directive
   if (!confirm(v === 'off' ? 'Turn the owner tuner OFF?' : 'Switch the owner tuner to ' + label + '? This replaces any power/temp target.')) return;
   const body = { profile: v === 'off' ? null : v };
-  const tt = $('ownTemp').value;
   if (tt !== '') body.chip_temp_target_c = +tt;
+  if (v !== 'off') body.per_chip = newPerChip;
+
   setMsg('ownMsg', 'Sending…');
   lockWrites();
   try {
     await sendJson('PATCH', caps.tuner, body);
-    setMsg('ownMsg', 'Queued: ' + label + ' (applies within ~1 s)', true);
+    setMsg('ownMsg', 'Queued: ' + label + (newPerChip ? ' + per-chip' : '') + ' (applies within ~1 s)', true);
+    USER_EDITING_PER_CHIP = false;
     setTimeout(pollOwnerTune, 2500);
   } catch (e) { setMsg('ownMsg', 'Failed: ' + e.message); }
 }
@@ -2375,7 +2387,6 @@ $('restartBtn').addEventListener('click', restartMiner);
 $('poolSave').addEventListener('click', savePool);
 $('poolReboot').addEventListener('click', poolApplyNow);
 $('ownApply').addEventListener('click', applyOwner);
-$('ownPerChipApply').addEventListener('click', applyPerChip);
 $('ownPerChip').addEventListener('change', () => { USER_EDITING_PER_CHIP = true; });
 $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(b => {
   b.addEventListener('click', () => {
