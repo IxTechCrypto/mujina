@@ -1179,10 +1179,14 @@ pub(crate) fn read_psu_status() -> (Option<f64>, Option<bool>, Option<f64>, Opti
     let attached = read_pd_attached();
     let detected_ceiling_w = bus_v.map(pd_ceiling_w_for_voltage).filter(|w| w.is_finite());
     let override_max_w = load_psu_override_w();
-    let base_ceiling = override_max_w
-        .or(detected_ceiling_w)
-        .unwrap_or(f64::INFINITY);
-    let effective_ceiling_w = POWER_TARGET_SAFETY_W.min(base_ceiling - PD_CEILING_MARGIN_W);
+    let effective_ceiling_w = if let Some(override_w) = override_max_w {
+        // Explicit continuous power ceiling override (e.g. 130W Aggressive, 140W Mean Well)
+        override_w.clamp(40.0, 140.0)
+    } else {
+        detected_ceiling_w
+            .map(|w| (w * owner::PD_CONTINUOUS_FRACTION).min(POWER_TARGET_SAFETY_W - PD_CEILING_MARGIN_W))
+            .unwrap_or(POWER_TARGET_SAFETY_W - PD_CEILING_MARGIN_W)
+    };
     (bus_v, attached, detected_ceiling_w, override_max_w, effective_ceiling_w)
 }
 
@@ -2909,9 +2913,18 @@ fn run_worker(
             // PSU_CONF_PATH when auto-detection is unavailable/wrong.
             // Only ever tightens the existing POWER_TARGET_SAFETY_W
             // trip, never loosens it.
+            let (tuner_power_ceiling_w, effective_safety_w) = if let Some(override_w) = psu_override_max_w {
+                let ceiling = (override_w as f32).clamp(40.0, 140.0);
+                let safety = POWER_TARGET_SAFETY_W.max(override_w.min(140.0));
+                (ceiling, safety)
+            } else {
+                let pd_contract = pd_ceiling_w_for_voltage(last_bus_v);
+                let safety = POWER_TARGET_SAFETY_W.min(pd_contract - PD_CEILING_MARGIN_W);
+                let ceiling = owner::owner_power_ceiling(pd_contract, safety);
+                (ceiling, safety)
+            };
             let pd_ceiling_w = psu_override_max_w
                 .unwrap_or_else(|| pd_ceiling_w_for_voltage(last_bus_v));
-            let effective_safety_w = POWER_TARGET_SAFETY_W.min(pd_ceiling_w - PD_CEILING_MARGIN_W);
             if pd_ceiling_w.is_finite()
                 && last_pd_ceiling_logged_w != Some(pd_ceiling_w)
                 && pd_ceiling_w - PD_CEILING_MARGIN_W < POWER_TARGET_SAFETY_W
@@ -3228,7 +3241,7 @@ fn run_worker(
             // observes whatever they just did (last_applied_* are current)
             // instead of fighting it.
             if owner.is_enabled() {
-                owner.set_power_ceiling(owner::owner_power_ceiling(pd_ceiling_w, effective_safety_w));
+                owner.set_power_ceiling(tuner_power_ceiling_w);
                 if owner.tick_due(std::time::Instant::now()) {
                     let volt_now = last_applied_voltage_mv.map(|v| v.max(0) as u32).unwrap_or(st.voltage_mv);
                     let cmds: Vec<OwnerCmd> = if (st.temp_max as f64) >= owner::BACKSTOP_TEMP_C {

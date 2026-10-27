@@ -923,6 +923,31 @@
     <div class="msg" id="powerMsg"></div>
   </div>
 
+  <!-- PSU Delivery & Overclock -->
+  <div class="sec" id="psuDeliverySec" style="margin-top:18px">Power Delivery & Overclock<span class="sec-sub">Input power supply limits & continuous VRM headroom</span></div>
+  <div class="card" id="psuDeliveryCard" style="max-width:560px">
+    <div class="note" id="psuCurStatus">Detecting power supply contract…</div>
+    <div class="row" style="margin-top:10px">
+      <label for="psuModeSelect">Power Profile</label>
+      <select id="psuModeSelect" style="background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit">
+        <option value="stock">Standard USB-PD (112W Safe · 80% duty)</option>
+        <option value="aggressive">Aggressive PD (130W · Canaan High Match)</option>
+        <option value="custom">Mean Well / Custom DC (Overclock Bypass)</option>
+      </select>
+    </div>
+    <div class="row" id="psuCustomRow" style="display:none;margin-top:10px">
+      <label for="psuCustomInput">Board Power Ceiling <small style="color:var(--dim)">Watts (50–140W)</small></label>
+      <input type="number" id="psuCustomInput" min="50" max="140" step="1" value="135" style="width:90px">
+    </div>
+    <div id="psuOverclockWarning" style="display:none;margin-top:12px;padding:10px 12px;border-radius:8px;background:rgba(255,170,0,0.12);border:1px solid rgba(255,170,0,0.3);color:var(--amber,#ffaa00);font-size:12px;line-height:1.4">
+      ⚠️ <strong>Overclock / Headroom Warning:</strong> Exceeds the standard 80% USB-PD continuous duty rating. Requires a high-grade 140W+ GaN adapter or a dedicated Mean Well DC power supply (e.g. 24–28V via XT30). Board VRM ceiling (140W) and thermal trip backstops remain permanently enforced.
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px">
+      <button class="btn pri wbtn" id="psuApplyBtn" type="button">Apply Power Profile</button>
+    </div>
+    <div class="msg" id="psuMsg"></div>
+  </div>
+
     </div>
   </div>
 
@@ -2177,6 +2202,93 @@ const rebootDevice = () => powerAction('/api/v0/reboot', 'rebootBtn', 'powerMsg'
 const restartMiner = () => powerAction('/api/v0/restart', 'restartBtn', 'powerMsg',
   'Restart the miner process now? Hashing pauses briefly.', 'restarting miner…');
 
+// ---- PSU Overclock & Power Delivery ----
+async function loadPsuConfig() {
+  const name = activeName();
+  if (!name) return;
+  try {
+    const r = await fetch('/api/v0/boards/' + encodeURIComponent(name) + '/psu');
+    if (!r.ok) {
+      show('psuDeliverySec', false);
+      show('psuDeliveryCard', false);
+      return;
+    }
+    const d = await r.json();
+    show('psuDeliverySec', true);
+    show('psuDeliveryCard', true);
+
+    const bus = d.bus_v != null ? d.bus_v.toFixed(1) + ' V' : 'unknown';
+    const detected = d.detected_ceiling_w != null ? d.detected_ceiling_w + ' W' : 'none';
+    const eff = d.effective_ceiling_w != null ? d.effective_ceiling_w + ' W' : '112 W';
+    const ov = d.override_max_w;
+
+    $('psuCurStatus').innerHTML = 'Rail: <strong>' + bus + '</strong> · Detected PD: <strong>' + detected + '</strong> · Active Ceiling: <strong>' + eff + '</strong>';
+
+    if (ov == null) {
+      $('psuModeSelect').value = 'stock';
+      show('psuCustomRow', false);
+      show('psuOverclockWarning', false);
+    } else if (ov === 130) {
+      $('psuModeSelect').value = 'aggressive';
+      show('psuCustomRow', false);
+      show('psuOverclockWarning', true);
+    } else {
+      $('psuModeSelect').value = 'custom';
+      show('psuCustomRow', true);
+      $('psuCustomInput').value = ov;
+      show('psuOverclockWarning', true);
+    }
+  } catch (e) {
+    show('psuDeliverySec', false);
+    show('psuDeliveryCard', false);
+  }
+}
+
+function syncPsuMode() {
+  const mode = $('psuModeSelect').value;
+  if (mode === 'stock') {
+    show('psuCustomRow', false);
+    show('psuOverclockWarning', false);
+  } else if (mode === 'aggressive') {
+    show('psuCustomRow', false);
+    show('psuOverclockWarning', true);
+  } else if (mode === 'custom') {
+    show('psuCustomRow', true);
+    show('psuOverclockWarning', true);
+  }
+}
+
+async function applyPsuProfile() {
+  const name = activeName();
+  if (!name || writeBusy('psuMsg')) return;
+  const mode = $('psuModeSelect').value;
+  let target = null;
+  if (mode === 'stock') {
+    target = null;
+  } else if (mode === 'aggressive') {
+    target = 130.0;
+  } else if (mode === 'custom') {
+    const val = parseFloat($('psuCustomInput').value);
+    if (isNaN(val) || val < 50 || val > 140) {
+      setMsg('psuMsg', 'Board power ceiling must be between 50 and 140 W');
+      return;
+    }
+    target = val;
+  }
+
+  setMsg('psuMsg', 'Applying power profile…');
+  lockWrites();
+  try {
+    await sendJson('PATCH', '/api/v0/boards/' + encodeURIComponent(name) + '/psu', { override_max_w: target });
+    const label = mode === 'stock' ? 'Standard 112W Safe PD' : mode === 'aggressive' ? 'Aggressive 130W' : target + 'W Custom Ceiling';
+    setMsg('psuMsg', 'Power profile saved ✓ (' + label + ')', true);
+    await loadPsuConfig();
+    if (typeof pollOwnerTune === 'function') setTimeout(pollOwnerTune, 1000);
+  } catch (e) {
+    setMsg('psuMsg', 'Failed: ' + e.message);
+  }
+}
+
 // ---- Pool ----
 async function loadPool() {
   try {
@@ -2365,6 +2477,7 @@ function openMenu(key) {
   m.classList.add('show');
   const b = document.querySelector('.menubtn[data-menu="' + key + '"]');
   if (b) b.classList.add('on');
+  if (key === 'power') loadPsuConfig();
 }
 function openFromHash() { if (location.hash === '#pool') openMenu('pool'); }
 
@@ -2384,6 +2497,8 @@ $('curveApply').addEventListener('click', applyCurve);
 $('pauseBtn').addEventListener('click', togglePause);
 $('rebootBtn').addEventListener('click', rebootDevice);
 $('restartBtn').addEventListener('click', restartMiner);
+$('psuModeSelect').addEventListener('change', syncPsuMode);
+$('psuApplyBtn').addEventListener('click', applyPsuProfile);
 $('poolSave').addEventListener('click', savePool);
 $('poolReboot').addEventListener('click', poolApplyNow);
 $('ownApply').addEventListener('click', applyOwner);

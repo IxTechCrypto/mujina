@@ -514,7 +514,7 @@ async fn patch_board_psu(
         return Err(StatusCode::NOT_FOUND);
     }
     if let Some(w) = req.override_max_w
-        && !(15.0..=140.0).contains(&w)
+        && !(15.0..=300.0).contains(&w)
     {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -788,11 +788,7 @@ async fn get_system(State(state): State<SharedState>) -> Json<serde_json::Value>
     let info = {
         let (_bus_v, _attached, detected_w, override_w, effective_w) = crate::board::nano3s::read_psu_status();
         let contract_w = override_w.or(detected_w);
-        let base = contract_w.unwrap_or(f64::INFINITY);
-        let ceiling = super::system::ceiling_if_known(
-            contract_w,
-            crate::board::nano3s_owner_tune::owner_power_ceiling(base, effective_w),
-        );
+        let ceiling = Some(effective_w);
         let chips = crate::board::nano3s::get_detail_snapshot().map(|d| d.chips.len() as u32).filter(|n| *n > 0).unwrap_or(super::system::NANO3S_CHIPS);
         SystemInfo {
             mode: "embedded",
