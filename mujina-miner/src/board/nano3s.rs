@@ -3293,6 +3293,14 @@ fn run_worker(
                             }
                         }
                     }
+                    // Auto-engage: if owner is locked, operating thermals have settled,
+                    // and chip tuning has not been explicitly disabled by manual directive,
+                    // automatically instantiate the per-chip tuner if absent.
+                    if chip_tuner.is_none() && owner.is_locked() && persisted_tuning.chip_tune {
+                        eprintln!("[nano3s] owner tuner locked: auto-engaging per-chip tuner");
+                        chip_tuner = Some(new_chip_tuner(owner.profile(), chip_offset_mhz));
+                    }
+
                     if let Some(ct) = chip_tuner.as_mut() {
                         let base = (last_applied_pll_freq[0], last_applied_voltage_mv);
                         let ready = owner.is_locked() && chip_base == Some(base);
