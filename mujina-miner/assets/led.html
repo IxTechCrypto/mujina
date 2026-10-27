@@ -147,34 +147,64 @@ function $(id) { return document.getElementById(id); }
 let BOARD = null;
 let STATE = { effect: 'auto', color: '#ff0000', brightness: 128, speed: 128 };
 let DRAGGING = false;
+let LAST_EFFECT = null;
 
 // Effect catalog. `needsColor`/`needsSpeed` drive which controls are
 // enabled per effect; `desc` is shown under the controls.
 const EFFECTS = [
-  { key: 'auto',          label: 'Auto',          needsColor: false, needsSpeed: false, desc: 'Follows board status: blue while connecting, green while hashing, amber when paused, red on fault.' },
-  { key: 'off',            label: 'Off',           needsColor: false, needsSpeed: false, desc: 'Strip off.' },
-  { key: 'solid',          label: 'Solid',         needsColor: true,  needsSpeed: false, desc: 'Whole strip, one fixed color.' },
-  { key: 'rainbow',        label: 'Rainbow',       needsColor: false, needsSpeed: true,  desc: 'Full hue cycle spread across the strip, rotating.' },
-  { key: 'colorloop',      label: 'Colorloop',     needsColor: false, needsSpeed: true,  desc: 'Whole strip one color, that color slowly cycling through hues.' },
-  { key: 'breathe',        label: 'Breathe',       needsColor: true,  needsSpeed: true,  desc: 'Color fades in and out.' },
-  { key: 'blink',          label: 'Blink',         needsColor: true,  needsSpeed: true,  desc: 'Color hard on/off toggle.' },
-  { key: 'chase',          label: 'Chase',         needsColor: true,  needsSpeed: true,  desc: 'Theater chase -- every 3rd LED lit, marching along the strip.' },
-  { key: 'chase_rainbow',  label: 'Chase Rainbow', needsColor: false, needsSpeed: true,  desc: 'Chase, but the lit LEDs cycle through hues.' },
-  { key: 'scanner',        label: 'Scanner',       needsColor: true,  needsSpeed: true,  desc: 'Single LED with a soft tail, bouncing end to end (Cylon eye).' },
-  { key: 'twinkle',        label: 'Twinkle',       needsColor: true,  needsSpeed: true,  desc: 'Random LEDs flash and fade.' },
-  { key: 'fire_flicker',   label: 'Fire Flicker',  needsColor: false, needsSpeed: true,  desc: 'Warm flicker across red/orange/amber. Ignores your color pick -- always warm.' },
+  { key: 'share_pulse',   label: 'Share Pulse (BitHalo)', needsColor: true,  needsSpeed: true,  desc: 'BitHalo share pulse -- whole strip flashes brilliantly on accepted share, then decays to idle glow.' },
+  { key: 'share_wave',    label: 'Share Wave (BitHalo)',  needsColor: true,  needsSpeed: true,  desc: 'BitHalo share wave -- outward ripple radiates symmetrically from center LED on accepted share.' },
+  { key: 'scanner',       label: 'Cylon / K.I.T.T. Scanner', needsColor: true, needsSpeed: true, desc: 'Classic Battlestar Galactica Cylon / Knight Rider K.I.T.T. sweeping beam.' },
+  { key: 'halloween',     label: 'Halloween Twinkle',     needsColor: false, needsSpeed: true,  desc: 'Spooky festive sparkle across Pumpkin Orange, Slime Green, and Witch Purple.' },
+  { key: 'christmas',     label: 'Christmas Sparkle',     needsColor: false, needsSpeed: true,  desc: 'Holiday shimmer alternating Yuletide Red and Pine Green.' },
+  { key: 'patriotic',     label: 'Independence Shimmer',  needsColor: false, needsSpeed: true,  desc: 'Tri-color Red, White, and Blue shimmering wave across the strip.' },
+  { key: 'auto',          label: 'Auto (Status)',         needsColor: false, needsSpeed: false, desc: 'Follows board status: blue while connecting, green while hashing, amber when paused, red on fault.' },
+  { key: 'solid',         label: 'Solid',                 needsColor: true,  needsSpeed: false, desc: 'Whole strip, one fixed color.' },
+  { key: 'breathe',       label: 'Breathe',               needsColor: true,  needsSpeed: true,  desc: 'Color fades in and out.' },
+  { key: 'rainbow',       label: 'Rainbow',               needsColor: false, needsSpeed: true,  desc: 'Full hue cycle spread across the strip, rotating.' },
+  { key: 'chase',         label: 'Chase',                 needsColor: true,  needsSpeed: true,  desc: 'Theater chase -- every 3rd LED lit, marching along the strip.' },
+  { key: 'off',           label: 'Off',                   needsColor: false, needsSpeed: false, desc: 'Strip off.' },
+  { key: 'colorloop',     label: 'Colorloop',             needsColor: false, needsSpeed: true,  desc: 'Whole strip one color, that color slowly cycling through hues.' },
+  { key: 'blink',         label: 'Blink',                 needsColor: true,  needsSpeed: true,  desc: 'Color hard on/off toggle.' },
+  { key: 'chase_rainbow', label: 'Chase Rainbow',         needsColor: false, needsSpeed: true,  desc: 'Chase, but the lit LEDs cycle through hues.' },
+  { key: 'twinkle',       label: 'Twinkle',               needsColor: true,  needsSpeed: true,  desc: 'Random LEDs flash and fade.' },
+  { key: 'fire_flicker',  label: 'Fire Flicker',          needsColor: false, needsSpeed: true,  desc: 'Warm flicker across red/orange/amber. Ignores your color pick -- always warm.' },
 ];
 const EFFECT_MAP = Object.fromEntries(EFFECTS.map(e => [e.key, e]));
 
 // Client-side preview animation state, mirrors the server's AnimState
 // (nano3s.rs) closely enough to look right -- doesn't need to be
 // frame-identical, the server is authoritative for the real strip.
-const P = { phase: 0, chasePos: 0, scannerPos: 0, scannerDir: 1, blinkOn: true, blinkAccum: 0, twinkle: new Array(9).fill(0), fire: new Array(9).fill(0.6) };
+const P = {
+  phase: 0,
+  chasePos: 0,
+  scannerPos: 0,
+  scannerDir: 1,
+  blinkOn: true,
+  blinkAccum: 0,
+  twinkle: new Array(9).fill(0),
+  fire: new Array(9).fill(0.6),
+  sharePulseDecay: 0,
+  shareWavePos: -1,
+  holidayPhase: 0,
+  halloweenTwinkle: new Array(9).fill(0),
+  halloweenColorIdx: new Array(9).fill(0),
+};
+
+function triggerShareFlash() {
+  P.sharePulseDecay = 1.0;
+  P.shareWavePos = 0.0;
+}
 
 function bodyShell() {
   $('body').innerHTML = `
     <div class="sec">Strip Preview</div>
-    <div class="strip" id="strip"></div>
+    <div class="strip-container" style="display:flex;flex-direction:column;align-items:center;background:var(--panel);border:1px solid var(--line);padding:18px 18px 14px;gap:14px;">
+      <div class="strip" id="strip" style="border:none;padding:0;background:transparent;"></div>
+      <button type="button" id="testShareBtn" class="eff-btn" style="padding:7px 18px;border-color:var(--cyan);color:var(--cyan);font-size:10px;cursor:pointer;display:flex;align-items:center;gap:6px;">
+        <span>⚡</span> TEST SHARE FLASH
+      </button>
+    </div>
 
     <div class="sec">Effect</div>
     <div class="panel-card">
@@ -205,6 +235,8 @@ function bodyShell() {
   buildSwatches();
   buildWheel();
   wireSliders();
+  const testBtn = $('testShareBtn');
+  if (testBtn) testBtn.onclick = triggerShareFlash;
 }
 
 function buildStrip() {
@@ -234,17 +266,33 @@ function buildEffectButtons() {
 
 function applyEffectUi() {
   const meta = EFFECT_MAP[STATE.effect] || EFFECT_MAP.auto;
-  document.querySelectorAll('.eff-btn').forEach(b => {
+  const isShareEffect = STATE.effect === 'share_pulse' || STATE.effect === 'share_wave';
+  document.querySelectorAll('.eff-btn[data-effect]').forEach(b => {
     b.classList.toggle('active', b.dataset.effect === STATE.effect);
   });
+  const testBtn = $('testShareBtn');
+  if (testBtn) {
+    testBtn.style.display = isShareEffect ? 'flex' : 'none';
+  }
   $('wheelBlock').classList.toggle('dimmed', !meta.needsColor);
   $('brightnessRow').classList.toggle('dimmed', STATE.effect === 'auto' || STATE.effect === 'off');
   $('speedRow').classList.toggle('dimmed', !meta.needsSpeed);
   $('effDesc').textContent = meta.desc;
   // Reset preview animation memory on effect change so e.g. Scanner
   // doesn't resume mid-sweep with a stale position.
-  P.phase = 0; P.chasePos = 0; P.scannerPos = 0; P.scannerDir = 1; P.blinkOn = true; P.blinkAccum = 0;
-  P.twinkle.fill(0);
+  if (LAST_EFFECT !== STATE.effect) {
+    LAST_EFFECT = STATE.effect;
+    P.phase = 0; P.chasePos = 0; P.scannerPos = 0; P.scannerDir = 1; P.blinkOn = true; P.blinkAccum = 0;
+    P.twinkle.fill(0);
+    P.sharePulseDecay = 0;
+    P.shareWavePos = -1;
+    P.holidayPhase = 0;
+    P.halloweenTwinkle.fill(0);
+    P.halloweenColorIdx.fill(0);
+    if (isShareEffect) {
+      triggerShareFlash();
+    }
+  }
 }
 
 const SWATCHES = ['#ff0000', '#ff8800', '#ffee00', '#1bff9c', '#00f0ff', '#2e6bff', '#b967ff', '#ff2e97', '#ffffff'];
@@ -479,6 +527,66 @@ function updatePreview() {
         P.fire[i] = f;
         const hue = 8 + Math.random() * 22;
         return rgbToHex(...hsvToRgb(hue, 1, v * f));
+      });
+      break;
+    }
+    case 'share_pulse': {
+      const pulse = P.sharePulseDecay;
+      P.sharePulseDecay = Math.max(0, P.sharePulseDecay - (0.08 + speedFrac * 0.16));
+      const level = Math.max(0, Math.min(1, 0.08 + 0.92 * pulse));
+      colors = Array(9).fill(scaleHex(STATE.color, v * level));
+      break;
+    }
+    case 'share_wave': {
+      if (P.shareWavePos >= 0) {
+        colors = Array.from({ length: 9 }, (_, i) => {
+          const dist = Math.abs(i - 4);
+          const delta = Math.abs(dist - P.shareWavePos);
+          const boost = delta < 0.85 ? (1.0 - delta / 0.85) : 0;
+          const level = Math.max(0, Math.min(1, 0.08 + 0.92 * boost));
+          return scaleHex(STATE.color, v * level);
+        });
+        P.shareWavePos += 0.35 + speedFrac * 0.65;
+        if (P.shareWavePos > 4.5) P.shareWavePos = -1;
+      } else {
+        colors = Array(9).fill(scaleHex(STATE.color, v * 0.08));
+      }
+      break;
+    }
+    case 'halloween': {
+      const palette = ['#ff7518', '#39ff14', '#a020f0']; // Pumpkin Orange, Slime Green, Witch Purple
+      const spawnChance = 0.03 + speedFrac * 0.25;
+      colors = Array.from({ length: 9 }, (_, i) => {
+        if (P.halloweenTwinkle[i] <= 0.02 && Math.random() < spawnChance) {
+          P.halloweenTwinkle[i] = 1.0;
+          P.halloweenColorIdx[i] = Math.floor(Math.random() * 3);
+        } else {
+          P.halloweenTwinkle[i] *= 0.82;
+        }
+        const col = palette[P.halloweenColorIdx[i]];
+        const level = Math.max(0, Math.min(1, 0.05 + 0.95 * P.halloweenTwinkle[i]));
+        return scaleHex(col, v * level);
+      });
+      break;
+    }
+    case 'christmas': {
+      const red = '#f51923';
+      const green = '#0fd24b';
+      P.holidayPhase = (P.holidayPhase + 0.2 + speedFrac * 0.4) % (Math.PI * 2);
+      colors = Array.from({ length: 9 }, (_, i) => {
+        const col = (i % 2 === 0) ? red : green;
+        const shimmer = 0.35 + 0.65 * (Math.sin(P.holidayPhase + i * 0.7) * 0.5 + 0.5);
+        return scaleHex(col, v * shimmer);
+      });
+      break;
+    }
+    case 'patriotic': {
+      const triColor = ['#ff1414', '#f0f0ff', '#1428ff']; // Red, White, Blue
+      P.holidayPhase = (P.holidayPhase + 0.2 + speedFrac * 0.4) % (Math.PI * 2);
+      colors = Array.from({ length: 9 }, (_, i) => {
+        const col = triColor[i % 3];
+        const shimmer = 0.35 + 0.65 * (Math.sin(P.holidayPhase + i * 0.7) * 0.5 + 0.5);
+        return scaleHex(col, v * shimmer);
       });
       break;
     }

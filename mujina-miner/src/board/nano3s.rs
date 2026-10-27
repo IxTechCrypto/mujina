@@ -1884,6 +1884,16 @@ enum LedEffect {
     /// jitters brightness and hue within a red/orange/amber range.
     /// Ignores `color` -- always warm.
     FireFlicker,
+    /// BitHalo share pulse -- whole strip flashes brilliantly on accepted share, then decays to idle glow.
+    SharePulse,
+    /// BitHalo share wave -- outward ripple radiates symmetrically from center LED on accepted share.
+    ShareWave,
+    /// Spooky festive sparkle across Pumpkin Orange, Slime Green, and Witch Purple.
+    Halloween,
+    /// Holiday shimmer alternating Yuletide Red and Pine Green.
+    Christmas,
+    /// Tri-color Red, White, and Blue shimmering wave across the strip.
+    Patriotic,
 }
 
 impl LedEffect {
@@ -1901,6 +1911,11 @@ impl LedEffect {
             LedEffect::Scanner => "scanner",
             LedEffect::Twinkle => "twinkle",
             LedEffect::FireFlicker => "fire_flicker",
+            LedEffect::SharePulse => "share_pulse",
+            LedEffect::ShareWave => "share_wave",
+            LedEffect::Halloween => "halloween",
+            LedEffect::Christmas => "christmas",
+            LedEffect::Patriotic => "patriotic",
         }
     }
 
@@ -1918,8 +1933,13 @@ impl LedEffect {
             "scanner" => Ok(LedEffect::Scanner),
             "twinkle" => Ok(LedEffect::Twinkle),
             "fire_flicker" => Ok(LedEffect::FireFlicker),
+            "share_pulse" => Ok(LedEffect::SharePulse),
+            "share_wave" => Ok(LedEffect::ShareWave),
+            "halloween" => Ok(LedEffect::Halloween),
+            "christmas" => Ok(LedEffect::Christmas),
+            "patriotic" => Ok(LedEffect::Patriotic),
             other => Err(format!(
-                "unknown LED effect '{other}' (want auto/off/solid/rainbow/colorloop/breathe/blink/chase/chase_rainbow/scanner/twinkle/fire_flicker)"
+                "unknown LED effect '{other}' (want auto/off/solid/rainbow/colorloop/breathe/blink/chase/chase_rainbow/scanner/twinkle/fire_flicker/share_pulse/share_wave/halloween/christmas/patriotic)"
             )),
         }
     }
@@ -2065,6 +2085,11 @@ struct AnimState {
     blink_accum: f32,
     twinkle: [f32; WS2812_LED_COUNT],
     fire: [f32; WS2812_LED_COUNT],
+    share_pulse_decay: f32,
+    share_wave_pos: f32,
+    holiday_phase: f32,
+    halloween_twinkle: [f32; WS2812_LED_COUNT],
+    halloween_color_idx: [u8; WS2812_LED_COUNT],
     rng: u32,
 }
 
@@ -2081,8 +2106,19 @@ impl AnimState {
             blink_accum: 0.0,
             twinkle: [0.0; WS2812_LED_COUNT],
             fire: [0.6; WS2812_LED_COUNT],
+            share_pulse_decay: 0.0,
+            share_wave_pos: -1.0,
+            holiday_phase: 0.0,
+            halloween_twinkle: [0.0; WS2812_LED_COUNT],
+            halloween_color_idx: [0; WS2812_LED_COUNT],
             rng: seed,
         }
+    }
+
+    /// Triggered whenever an accepted share is submitted.
+    fn on_share(&mut self) {
+        self.share_pulse_decay = 1.0;
+        self.share_wave_pos = 0.0;
     }
 
     /// Resets phase/decay memory when the commanded effect changes, so
@@ -2097,6 +2133,11 @@ impl AnimState {
             self.blink_on = true;
             self.blink_accum = 0.0;
             self.twinkle = [0.0; WS2812_LED_COUNT];
+            self.share_pulse_decay = 0.0;
+            self.share_wave_pos = -1.0;
+            self.holiday_phase = 0.0;
+            self.halloween_twinkle = [0.0; WS2812_LED_COUNT];
+            self.halloween_color_idx = [0; WS2812_LED_COUNT];
         }
     }
 
@@ -2204,6 +2245,82 @@ impl AnimState {
                     self.fire[i] = self.fire[i] * 0.5 + jitter * 0.5;
                     let hue = 8.0 + rand_unit(&mut self.rng) * 22.0;
                     *c = hsv_to_rgb(hue, 1.0, v * self.fire[i]);
+                }
+                colors
+            }
+            LedEffect::SharePulse => {
+                let pulse = self.share_pulse_decay;
+                self.share_pulse_decay = (self.share_pulse_decay - (0.08 + speed_frac * 0.16)).max(0.0);
+                let level = (0.08 + 0.92 * pulse).clamp(0.0, 1.0);
+                [scale_color(ov.color, v * level); WS2812_LED_COUNT]
+            }
+            LedEffect::ShareWave => {
+                let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
+                if self.share_wave_pos >= 0.0 {
+                    for (i, c) in colors.iter_mut().enumerate() {
+                        let dist = (i as f32 - 4.0).abs();
+                        let delta = (dist - self.share_wave_pos).abs();
+                        let boost = if delta < 0.85 {
+                            1.0 - delta / 0.85
+                        } else {
+                            0.0
+                        };
+                        let level = (0.08 + 0.92 * boost).clamp(0.0, 1.0);
+                        *c = scale_color(ov.color, v * level);
+                    }
+                    self.share_wave_pos += 0.35 + speed_frac * 0.65;
+                    if self.share_wave_pos > 4.5 {
+                        self.share_wave_pos = -1.0;
+                    }
+                } else {
+                    colors = [scale_color(ov.color, v * 0.08); WS2812_LED_COUNT];
+                }
+                colors
+            }
+            LedEffect::Halloween => {
+                const PALETTE: [(u8, u8, u8); 3] = [
+                    (255, 117, 24),  // Pumpkin Orange
+                    (57, 255, 20),   // Slime Green
+                    (160, 32, 240),  // Witch Purple
+                ];
+                let spawn_chance = 0.03 + speed_frac * 0.25;
+                let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
+                for i in 0..WS2812_LED_COUNT {
+                    if self.halloween_twinkle[i] <= 0.02 && rand_unit(&mut self.rng) < spawn_chance {
+                        self.halloween_twinkle[i] = 1.0;
+                        self.halloween_color_idx[i] = (xorshift32(&mut self.rng) % 3) as u8;
+                    } else {
+                        self.halloween_twinkle[i] *= 0.82;
+                    }
+                    let color = PALETTE[self.halloween_color_idx[i] as usize % 3];
+                    let level = (0.05 + 0.95 * self.halloween_twinkle[i]).clamp(0.0, 1.0);
+                    colors[i] = scale_color(color, v * level);
+                }
+                colors
+            }
+            LedEffect::Christmas => {
+                const RED: (u8, u8, u8) = (245, 25, 35);
+                const GREEN: (u8, u8, u8) = (15, 210, 75);
+                self.holiday_phase = (self.holiday_phase + 0.2 + speed_frac * 0.4) % std::f32::consts::TAU;
+                let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
+                for i in 0..WS2812_LED_COUNT {
+                    let color = if i % 2 == 0 { RED } else { GREEN };
+                    let shimmer = 0.35 + 0.65 * ((self.holiday_phase + i as f32 * 0.7).sin() * 0.5 + 0.5);
+                    colors[i] = scale_color(color, v * shimmer);
+                }
+                colors
+            }
+            LedEffect::Patriotic => {
+                const RED: (u8, u8, u8) = (255, 20, 20);
+                const WHITE: (u8, u8, u8) = (240, 240, 255);
+                const BLUE: (u8, u8, u8) = (20, 40, 255);
+                const TRI_COLOR: [(u8, u8, u8); 3] = [RED, WHITE, BLUE];
+                self.holiday_phase = (self.holiday_phase + 0.2 + speed_frac * 0.4) % std::f32::consts::TAU;
+                let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
+                for i in 0..WS2812_LED_COUNT {
+                    let color = TRI_COLOR[i % 3];
+                    let shimmer = 0.35 + 0.65 * ((self.holiday_phase + i as f32 * 0.7).sin() * 0.5 + 0.5);
+                    colors[i] = scale_color(color, v * shimmer);
                 }
                 colors
             }
@@ -2882,6 +2999,7 @@ fn run_worker(
                     let (share, _local_verify_passed) =
                         verify_and_build_share(ctx, nonce.nonce2, nonce.nonce, nonce.mid_id);
                     shares_found += 1;
+                    anim.on_share();
                     let _ = ctx.share_tx.blocking_send(share);
                 }
             }
@@ -3517,5 +3635,141 @@ fn run_worker(
         }
 
         std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn led_effect_parse_and_as_str_roundtrip() {
+        let all_effects = [
+            (LedEffect::Auto, "auto"),
+            (LedEffect::Off, "off"),
+            (LedEffect::Solid, "solid"),
+            (LedEffect::Rainbow, "rainbow"),
+            (LedEffect::Colorloop, "colorloop"),
+            (LedEffect::Breathe, "breathe"),
+            (LedEffect::Blink, "blink"),
+            (LedEffect::Chase, "chase"),
+            (LedEffect::ChaseRainbow, "chase_rainbow"),
+            (LedEffect::Scanner, "scanner"),
+            (LedEffect::Twinkle, "twinkle"),
+            (LedEffect::FireFlicker, "fire_flicker"),
+            (LedEffect::SharePulse, "share_pulse"),
+            (LedEffect::ShareWave, "share_wave"),
+            (LedEffect::Halloween, "halloween"),
+            (LedEffect::Christmas, "christmas"),
+            (LedEffect::Patriotic, "patriotic"),
+        ];
+
+        for (effect, name) in all_effects {
+            assert_eq!(effect.as_str(), name);
+            assert_eq!(LedEffect::parse(name), Ok(effect));
+        }
+
+        assert!(LedEffect::parse("nonexistent_effect").is_err());
+    }
+
+    #[test]
+    fn anim_state_on_share_and_pulse_decay() {
+        let mut anim = AnimState::new();
+        assert_eq!(anim.share_pulse_decay, 0.0);
+        assert_eq!(anim.share_wave_pos, -1.0);
+
+        anim.on_share();
+        assert_eq!(anim.share_pulse_decay, 1.0);
+        assert_eq!(anim.share_wave_pos, 0.0);
+
+        let ov = LedOverrideState {
+            effect: LedEffect::SharePulse,
+            color: (255, 255, 255),
+            brightness: 255,
+            speed: 128,
+        };
+
+        // Frame 1 right after share: should be full brightness
+        let frame1 = anim.frame(ov);
+        for pixel in frame1.iter() {
+            assert!(pixel.0 >= 240);
+        }
+
+        // Advance several frames: decay should lower intensity
+        for _ in 0..10 {
+            let _ = anim.frame(ov);
+        }
+        assert_eq!(anim.share_pulse_decay, 0.0);
+
+        // At idle resting level: ~0.08 of 255 is ~20
+        let idle_frame = anim.frame(ov);
+        for pixel in idle_frame.iter() {
+            assert_eq!(pixel.0, 20);
+        }
+    }
+
+    #[test]
+    fn anim_state_share_wave_propagation() {
+        let mut anim = AnimState::new();
+        anim.on_share();
+        let ov = LedOverrideState {
+            effect: LedEffect::ShareWave,
+            color: (0, 0, 255),
+            brightness: 255,
+            speed: 128,
+        };
+
+        // First frame at wave_pos = 0.0: Center LED (index 4) should have highest blue intensity
+        let frame0 = anim.frame(ov);
+        assert!(frame0[4].2 > frame0[0].2);
+
+        // Step through until wave completes (wave_pos > 4.5 -> resets to -1.0)
+        for _ in 0..15 {
+            let _ = anim.frame(ov);
+        }
+        assert_eq!(anim.share_wave_pos, -1.0);
+
+        // Resting idle frame
+        let idle_frame = anim.frame(ov);
+        for pixel in idle_frame.iter() {
+            assert_eq!(pixel.2, 20); // 0.08 * 255 = 20
+        }
+    }
+
+    #[test]
+    fn anim_state_holiday_effects_render() {
+        let mut anim = AnimState::new();
+        let ov_halloween = LedOverrideState {
+            effect: LedEffect::Halloween,
+            color: (255, 255, 255),
+            brightness: 200,
+            speed: 128,
+        };
+        let h_frame = anim.frame(ov_halloween);
+        assert_eq!(h_frame.len(), WS2812_LED_COUNT);
+
+        let ov_xmas = LedOverrideState {
+            effect: LedEffect::Christmas,
+            color: (255, 255, 255),
+            brightness: 255,
+            speed: 128,
+        };
+        let xmas_frame = anim.frame(ov_xmas);
+        assert_eq!(xmas_frame.len(), WS2812_LED_COUNT);
+        // Even indices are Red (r > 0, g < 100), odd indices are Green (g > 0, r < 100)
+        assert!(xmas_frame[0].0 > xmas_frame[0].1);
+        assert!(xmas_frame[1].1 > xmas_frame[1].0);
+
+        let ov_patriotic = LedOverrideState {
+            effect: LedEffect::Patriotic,
+            color: (255, 255, 255),
+            brightness: 255,
+            speed: 128,
+        };
+        let pat_frame = anim.frame(ov_patriotic);
+        assert_eq!(pat_frame.len(), WS2812_LED_COUNT);
+        // Triplets: 0 = Red, 1 = White, 2 = Blue
+        assert!(pat_frame[0].0 > pat_frame[0].2); // Red > Blue
+        assert!(pat_frame[2].2 > pat_frame[2].0); // Blue > Red
     }
 }

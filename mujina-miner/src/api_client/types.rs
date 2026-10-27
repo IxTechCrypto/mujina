@@ -298,10 +298,11 @@ pub struct BoardPauseRequest {
 /// Live-edits a board's status LED strip, no reboot required. `effect`
 /// is one of `"auto"` (default; automatic status indication), `"off"`,
 /// `"solid"`, `"rainbow"`, `"colorloop"`, `"breathe"`, `"blink"`,
-/// `"chase"`, `"chase_rainbow"`, `"scanner"`, `"twinkle"`, or
-/// `"fire_flicker"` -- see `board::nano3s::LedEffect` for what each does.
-/// Not every effect uses every field (e.g. `"rainbow"` ignores `color`).
-/// Any field left unset keeps its current value -- e.g. a
+/// `"chase"`, `"chase_rainbow"`, `"scanner"`, `"twinkle"`,
+/// `"fire_flicker"`, `"share_pulse"`, `"share_wave"`, `"halloween"`,
+/// `"christmas"`, or `"patriotic"` -- see `board::nano3s::LedEffect`
+/// for what each does. Not every effect uses every field (e.g. `"rainbow"`
+/// ignores `color`). Any field left unset keeps its current value -- e.g. a
 /// `brightness`-only request doesn't reset `effect`. `color` is a
 /// `#RRGGBB` hex string.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]

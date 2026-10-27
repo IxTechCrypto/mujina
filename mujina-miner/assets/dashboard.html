@@ -894,6 +894,7 @@
     <button type="button" class="menubtn" data-menu="fan" style="display:none">Fan</button>
     <button type="button" class="menubtn" data-menu="curve" style="display:none">Fan Curve</button>
     <button type="button" class="menubtn" data-menu="pool" style="display:none">Pool</button>
+    <a class="menubtn" data-menu="led" href="/led">LED</a>
     <a class="menubtn" data-menu="firmware" href="/firmware" style="display:none">Firmware</a>
     <button type="button" class="menubtn" data-menu="display">Display</button>
   </div>
@@ -1549,7 +1550,7 @@ async function loadSystem() {
 }
 
 function applySystem() {
-  const on = { power: false, tuning: false, fan: false, curve: false, pool: false, firmware: false, display: true };
+  const on = { power: false, tuning: false, fan: false, curve: false, pool: false, led: true, firmware: false, display: true };
   if (SYS) {
     const boards = SYS.boards || [], dev = SYS.device || {};
     const any = f => boards.some(b => b.caps && f(b.caps));
@@ -1558,6 +1559,7 @@ function applySystem() {
     on.fan = any(c => c.fan && c.fan !== 'none');
     on.curve = any(c => c.fan_curve);
     on.pool = true;
+    on.led = true;
     on.firmware = !!(SYS.firmware && SYS.firmware.update === 'bundle');
   }
   document.querySelectorAll('.menubtn').forEach(b => show(b, !!on[b.dataset.menu]));
