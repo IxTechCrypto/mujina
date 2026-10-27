@@ -1700,7 +1700,7 @@ function renderBoardSummaryCards(boards) {
     meta.append(
       mk('span', null, 'Freq: ' + (b.freq_mhz ? b.freq_mhz + ' MHz' : '—')),
       mk('span', null, 'Eff: ' + (b.efficiency_jth ? b.efficiency_jth + ' J/TH' : '—')),
-      mk('span', null, 'Temp: ' + (b.asic_c ? b.asic_c + '°C' : '—')));
+      mk('span', null, 'Temp: ' + (b.asic_c ? b.asic_c.toFixed(1) + '°C' : '—')));
     card.append(top, mk('div', 'bs-hr', hrText(b)), meta);
     grid.appendChild(card);
   });
@@ -1836,8 +1836,8 @@ function checkAlerts(d) {
   (d.boards || []).forEach(b => {
     const limit = tempLimitC(b.freq_mhz);
     const alertAt = limit != null ? limit - 3 : 70;
-    if (b.asic_c != null && b.asic_c >= alertAt) alerts.push(b.board_name + ' ASIC Temp High (' + b.asic_c + '°C' + (limit != null ? ', limit ' + limit + '°C' : '') + ')');
-    if (b.fail_rate_pct != null && b.fail_rate_pct >= 35) alerts.push(b.board_name + ' SmartSpeed Fail Rate High (' + b.fail_rate_pct + '%)');
+    if (b.asic_c != null && b.asic_c >= alertAt) alerts.push(b.board_name + ' ASIC Temp High (' + b.asic_c.toFixed(1) + '°C' + (limit != null ? ', limit ' + limit.toFixed(0) + '°C' : '') + ')');
+    if (b.fail_rate_pct != null && b.fail_rate_pct >= 35) alerts.push(b.board_name + ' SmartSpeed Fail Rate High (' + (typeof b.fail_rate_pct === 'number' ? b.fail_rate_pct.toFixed(1) : b.fail_rate_pct) + '%)');
   });
   if (alerts.length) { banner.classList.add('show'); text.textContent = '⚠️ ' + alerts.join(' · '); }
   else banner.classList.remove('show');
