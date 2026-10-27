@@ -1156,6 +1156,7 @@ fn load_psu_override_w() -> Option<f64> {
         .lines()
         .find_map(|line| line.strip_prefix("override_max_w="))
         .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|w| w.is_finite() && *w > 0.0)
 }
 
 fn write_psu_override_w(override_max_w: Option<f64>) {
@@ -1163,8 +1164,13 @@ fn write_psu_override_w(override_max_w: Option<f64>) {
         Some(w) => format!("override_max_w={w}\n"),
         None => String::new(),
     };
-    if let Err(e) = std::fs::write(PSU_CONF_PATH, out) {
-        eprintln!("[nano3s] failed to write {PSU_CONF_PATH}: {e}");
+    let tmp_path = format!("{PSU_CONF_PATH}.tmp");
+    if let Err(e) = std::fs::write(&tmp_path, out) {
+        eprintln!("[nano3s] failed to write {tmp_path}: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, PSU_CONF_PATH) {
+        eprintln!("[nano3s] failed to rename {tmp_path} to {PSU_CONF_PATH}: {e}");
     }
 }
 
@@ -1179,7 +1185,7 @@ pub(crate) fn read_psu_status() -> (Option<f64>, Option<bool>, Option<f64>, Opti
     let attached = read_pd_attached();
     let detected_ceiling_w = bus_v.map(pd_ceiling_w_for_voltage).filter(|w| w.is_finite());
     let override_max_w = load_psu_override_w();
-    let effective_ceiling_w = if let Some(override_w) = override_max_w {
+    let effective_ceiling_w = if let Some(override_w) = override_max_w.filter(|w| w.is_finite() && *w > 0.0) {
         // Explicit continuous power ceiling override (e.g. 130W Aggressive, 140W Mean Well)
         override_w.clamp(40.0, 140.0)
     } else {
@@ -2708,12 +2714,13 @@ fn run_worker(
                     eprintln!("[nano3s] psu-override: cleared, trusting auto-detected PD ceiling");
                 } else {
                     match v.parse::<f64>() {
-                        Ok(w) => {
+                        Ok(w) if w.is_finite() && w > 0.0 => {
                             psu_override_max_w = Some(w);
                             write_psu_override_w(Some(w));
                             last_pd_ceiling_logged_w = None;
                             eprintln!("[nano3s] psu-override: manual ceiling set to {w:.1}W via dashboard/API");
                         }
+                        Ok(w) => eprintln!("[nano3s] invalid non-finite/non-positive psu_override directive: {w}"),
                         Err(_) => eprintln!("[nano3s] malformed psu_override directive: {s}"),
                     }
                 }
@@ -2915,7 +2922,7 @@ fn run_worker(
             // trip, never loosens it.
             let (tuner_power_ceiling_w, effective_safety_w) = if let Some(override_w) = psu_override_max_w {
                 let ceiling = (override_w as f32).clamp(40.0, 140.0);
-                let safety = POWER_TARGET_SAFETY_W.max(override_w.min(140.0));
+                let safety = override_w.clamp(40.0, 140.0);
                 (ceiling, safety)
             } else {
                 let pd_contract = pd_ceiling_w_for_voltage(last_bus_v);

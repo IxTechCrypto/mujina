@@ -514,7 +514,7 @@ async fn patch_board_psu(
         return Err(StatusCode::NOT_FOUND);
     }
     if let Some(w) = req.override_max_w
-        && !(15.0..=300.0).contains(&w)
+        && !(15.0..=140.0).contains(&w)
     {
         return Err(StatusCode::BAD_REQUEST);
     }

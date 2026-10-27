@@ -1836,7 +1836,7 @@ function checkAlerts(d) {
   (d.boards || []).forEach(b => {
     const limit = tempLimitC(b.freq_mhz);
     const alertAt = limit != null ? limit - 3 : 70;
-    if (b.asic_c != null && b.asic_c >= alertAt) alerts.push(b.board_name + ' ASIC Temp High (' + b.asic_c.toFixed(1) + '°C' + (limit != null ? ', limit ' + limit.toFixed(0) + '°C' : '') + ')');
+    if (b.asic_c != null && b.asic_c >= alertAt) alerts.push(b.board_name + ' ASIC Temp High (' + (typeof b.asic_c === 'number' ? b.asic_c.toFixed(1) : b.asic_c) + '°C' + (limit != null ? ', limit ' + limit.toFixed(0) + '°C' : '') + ')');
     if (b.fail_rate_pct != null && b.fail_rate_pct >= 35) alerts.push(b.board_name + ' SmartSpeed Fail Rate High (' + (typeof b.fail_rate_pct === 'number' ? b.fail_rate_pct.toFixed(1) : b.fail_rate_pct) + '%)');
   });
   if (alerts.length) { banner.classList.add('show'); text.textContent = '⚠️ ' + alerts.join(' · '); }
@@ -2219,7 +2219,7 @@ async function loadPsuConfig() {
 
     const bus = d.bus_v != null ? d.bus_v.toFixed(1) + ' V' : 'unknown';
     const detected = d.detected_ceiling_w != null ? d.detected_ceiling_w + ' W' : 'none';
-    const eff = d.effective_ceiling_w != null ? d.effective_ceiling_w + ' W' : '112 W';
+    const eff = d.effective_ceiling_w != null ? (typeof d.effective_ceiling_w === 'number' ? d.effective_ceiling_w.toFixed(0) : d.effective_ceiling_w) + ' W' : '112 W';
     const ov = d.override_max_w;
 
     $('psuCurStatus').innerHTML = 'Rail: <strong>' + bus + '</strong> · Detected PD: <strong>' + detected + '</strong> · Active Ceiling: <strong>' + eff + '</strong>';
@@ -2282,8 +2282,8 @@ async function applyPsuProfile() {
     await sendJson('PATCH', '/api/v0/boards/' + encodeURIComponent(name) + '/psu', { override_max_w: target });
     const label = mode === 'stock' ? 'Standard 112W Safe PD' : mode === 'aggressive' ? 'Aggressive 130W' : target + 'W Custom Ceiling';
     setMsg('psuMsg', 'Power profile saved ✓ (' + label + ')', true);
-    await loadPsuConfig();
-    if (typeof pollOwnerTune === 'function') setTimeout(pollOwnerTune, 1000);
+    setTimeout(loadPsuConfig, 1500);
+    if (typeof pollOwnerTune === 'function') setTimeout(pollOwnerTune, 1500);
   } catch (e) {
     setMsg('psuMsg', 'Failed: ' + e.message);
   }
