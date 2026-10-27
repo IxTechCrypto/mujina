@@ -1884,9 +1884,9 @@ enum LedEffect {
     /// jitters brightness and hue within a red/orange/amber range.
     /// Ignores `color` -- always warm.
     FireFlicker,
-    /// BitHalo share pulse -- whole strip flashes brilliantly on accepted share, then decays to idle glow.
+    /// Stratum share pulse -- whole strip flashes brilliantly on accepted share, then decays to idle glow.
     SharePulse,
-    /// BitHalo share wave -- outward ripple radiates symmetrically from center LED on accepted share.
+    /// Stratum share wave -- outward ripple radiates symmetrically from center LED on accepted share.
     ShareWave,
     /// Spooky festive sparkle across Pumpkin Orange, Slime Green, and Witch Purple.
     Halloween,

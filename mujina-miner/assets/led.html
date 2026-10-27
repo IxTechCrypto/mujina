@@ -483,8 +483,8 @@ let LAST_EFFECT = null;
 // Effect catalog. `needsColor`/`needsSpeed` drive which controls are
 // enabled per effect; `desc` is shown under the controls.
 const EFFECTS = [
-  { key: 'share_pulse',   label: 'Share Pulse (BitHalo)', needsColor: true,  needsSpeed: true,  desc: 'BitHalo share pulse -- whole strip flashes brilliantly on accepted share, then decays to idle glow.' },
-  { key: 'share_wave',    label: 'Share Wave (BitHalo)',  needsColor: true,  needsSpeed: true,  desc: 'BitHalo share wave -- outward ripple radiates symmetrically from center LED on accepted share.' },
+  { key: 'share_pulse',   label: 'Share Pulse', needsColor: true,  needsSpeed: true,  desc: 'Stratum share pulse -- whole strip flashes brilliantly on accepted share, then decays to idle glow.' },
+  { key: 'share_wave',    label: 'Share Wave',  needsColor: true,  needsSpeed: true,  desc: 'Stratum share wave -- outward ripple radiates symmetrically from center LED on accepted share.' },
   { key: 'scanner',       label: 'Cylon / K.I.T.T. Scanner', needsColor: true, needsSpeed: true, desc: 'Classic Battlestar Galactica Cylon / Knight Rider K.I.T.T. sweeping beam.' },
   { key: 'halloween',     label: 'Halloween Twinkle',     needsColor: false, needsSpeed: true,  desc: 'Spooky festive sparkle across Pumpkin Orange, Slime Green, and Witch Purple.' },
   { key: 'christmas',     label: 'Christmas Sparkle',     needsColor: false, needsSpeed: true,  desc: 'Holiday shimmer alternating Yuletide Red and Pine Green.' },
@@ -543,9 +543,9 @@ function bodyShell() {
         <label for="effectSelect" class="effect-select-label">Preset Mode</label>
         <div class="select-wrapper">
           <select id="effectSelect">
-            <optgroup label="⚡ Data-Reactive Stratum (BitHalo)">
-              <option value="share_pulse">Share Pulse (BitHalo)</option>
-              <option value="share_wave">Share Wave (BitHalo)</option>
+            <optgroup label="⚡ Data-Reactive Stratum Modes">
+              <option value="share_pulse">Share Pulse</option>
+              <option value="share_wave">Share Wave</option>
             </optgroup>
             <optgroup label="🎬 Sci-Fi & Special FX">
               <option value="scanner">Cylon / K.I.T.T. Scanner</option>
