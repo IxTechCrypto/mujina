@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>MUJINA // LED</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
@@ -23,7 +23,11 @@
     --ink: #d6f7ff;
   }
   * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    overflow-x: hidden;
+  }
   body {
     background: var(--bg);
     color: var(--ink);
@@ -31,83 +35,334 @@
     font-variant-numeric: tabular-nums;
     -webkit-font-smoothing: antialiased;
   }
-  .wrap { max-width: 900px; margin: 0 auto; padding: 24px 20px 60px; }
+  .wrap {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 24px 20px 60px;
+  }
   .top {
-    display: flex; align-items: baseline; justify-content: space-between;
-    border-bottom: 1px solid var(--line); padding-bottom: 14px; margin-bottom: 20px;
-    flex-wrap: wrap; gap: 10px;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 14px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+    gap: 10px;
   }
   h1 {
-    font-family: 'Orbitron', sans-serif; font-weight: 900; margin: 0;
-    font-size: 22px; letter-spacing: .16em; text-transform: uppercase;
+    font-family: 'Orbitron', sans-serif;
+    font-weight: 900;
+    margin: 0;
+    font-size: 22px;
+    letter-spacing: .16em;
+    text-transform: uppercase;
   }
   h1 .chev { color: var(--cyan); text-shadow: 0 0 8px rgba(0,240,255,.5); }
+  .top-meta {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    flex-wrap: wrap;
+    max-width: 100%;
+  }
+  .nav {
+    display: flex;
+    align-items: center;
+  }
   .nav a {
-    color: var(--dim); text-decoration: none; font-size: 12px;
-    letter-spacing: .1em; text-transform: uppercase; margin-left: 18px;
-    border-bottom: 1px solid transparent; padding-bottom: 3px;
+    color: var(--dim);
+    text-decoration: none;
+    font-size: 12px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    margin-left: 18px;
+    border-bottom: 1px solid transparent;
+    padding-bottom: 3px;
   }
   .nav a:hover, .nav a.active { color: var(--cyan); border-color: var(--cyan); }
   .status-strip {
-    display: flex; gap: 8px; align-items: center; font-size: 12px;
-    color: var(--dim); letter-spacing: .05em;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    font-size: 12px;
+    color: var(--dim);
+    letter-spacing: .05em;
   }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); display: inline-block; }
   .dot.ok { background: var(--green); box-shadow: 0 0 8px var(--green); }
   .dot.bad { background: var(--red); box-shadow: 0 0 8px var(--red); }
 
-  .sec { font-family: 'Orbitron', sans-serif; font-weight: 700; font-size: 12px;
-    letter-spacing: .18em; text-transform: uppercase; color: var(--dim);
-    margin: 28px 0 12px; display: flex; align-items: center; gap: 10px; }
+  .sec {
+    font-family: 'Orbitron', sans-serif;
+    font-weight: 700;
+    font-size: 12px;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    color: var(--dim);
+    margin: 28px 0 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
   .sec:first-of-type { margin-top: 0; }
   .sec::after { content: ''; flex: 1; height: 1px; background: var(--line); }
 
   /* Live strip preview -- 9 pixels, mirrors the physical WS2812 strip */
-  .strip { display: flex; gap: 6px; padding: 18px; background: var(--panel);
-    border: 1px solid var(--line); justify-content: center; }
-  .px { width: 34px; height: 34px; border-radius: 50%; background: #000;
-    border: 1px solid var(--line); box-shadow: inset 0 0 6px rgba(0,0,0,.6); transition: background .1s linear; }
+  .strip-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    padding: 18px 18px 14px;
+    gap: 14px;
+    box-sizing: border-box;
+    width: 100%;
+  }
+  .strip {
+    display: flex;
+    gap: clamp(3px, 1.4vw, 8px);
+    justify-content: center;
+    align-items: center;
+    width: 100%;
+    max-width: 100%;
+    overflow: hidden;
+    padding: 0;
+    background: transparent;
+    border: none;
+    box-sizing: border-box;
+  }
+  .px {
+    width: clamp(24px, 7.5vw, 36px);
+    height: clamp(24px, 7.5vw, 36px);
+    border-radius: 50%;
+    background: #000;
+    border: 1px solid var(--line);
+    box-shadow: inset 0 0 6px rgba(0,0,0,.6);
+    transition: background .1s linear;
+    flex-shrink: 0;
+    box-sizing: border-box;
+  }
   .px.lit { border-color: rgba(255,255,255,.25); }
+
+  #testShareBtn {
+    min-height: 44px;
+    padding: 10px 20px;
+    font-size: 11px;
+    border-radius: 6px;
+    border: 1px solid var(--cyan);
+    color: var(--cyan);
+    background: var(--panel2);
+    font-family: 'Orbitron', sans-serif;
+    font-weight: 700;
+    letter-spacing: .07em;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    transition: all .12s;
+  }
+  #testShareBtn:hover {
+    background: rgba(0,240,255,.12);
+    box-shadow: 0 0 12px rgba(0,240,255,.3);
+  }
 
   .panel-card { background: var(--panel); border: 1px solid var(--line); padding: 16px; }
 
-  /* Effect picker */
-  .effects { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  /* Effect dropdown selector */
+  .effect-select-wrap {
+    margin-bottom: 14px;
+  }
+  .effect-select-label {
+    display: block;
+    font-size: 10px;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--dim);
+    margin-bottom: 6px;
+  }
+  .select-wrapper {
+    position: relative;
+    width: 100%;
+  }
+  #effectSelect {
+    width: 100%;
+    min-height: 44px;
+    padding: 10px 36px 10px 12px;
+    background: var(--panel2);
+    border: 1px solid var(--line);
+    color: var(--cyan);
+    font-family: 'Share Tech Mono', ui-monospace, monospace;
+    font-size: 12px;
+    letter-spacing: .06em;
+    border-radius: 4px;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    appearance: none;
+    cursor: pointer;
+    outline: none;
+    transition: border-color .15s, box-shadow .15s;
+    box-sizing: border-box;
+  }
+  #effectSelect:focus {
+    border-color: var(--cyan);
+    box-shadow: 0 0 10px rgba(0,240,255,.25);
+  }
+  #effectSelect optgroup {
+    background: var(--panel);
+    color: var(--dim);
+    font-weight: 700;
+  }
+  #effectSelect option {
+    background: var(--panel2);
+    color: var(--ink);
+  }
+  .select-caret {
+    position: absolute;
+    right: 14px;
+    top: 50%;
+    transform: translateY(-50%);
+    pointer-events: none;
+    font-size: 10px;
+    color: var(--cyan);
+  }
+
+  /* Effect picker button grid */
+  .effects {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 8px;
+  }
   .eff-btn {
-    background: var(--panel2); border: 1px solid var(--line); color: var(--dim);
-    padding: 12px 6px; font-family: 'Orbitron', sans-serif; font-weight: 700;
-    font-size: 10px; letter-spacing: .07em; text-transform: uppercase;
-    cursor: pointer; border-radius: 2px; transition: all .12s;
+    background: var(--panel2);
+    border: 1px solid var(--line);
+    color: var(--dim);
+    padding: 10px 6px;
+    font-family: 'Orbitron', sans-serif;
+    font-weight: 700;
+    font-size: 10px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: all .12s;
+    min-height: 42px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    white-space: normal;
+    word-break: break-word;
+    overflow-wrap: break-word;
+    line-height: 1.25;
+    box-sizing: border-box;
   }
   .eff-btn:hover { border-color: var(--cyan); color: var(--cyan); }
-  .eff-btn.active { border-color: var(--cyan); color: var(--cyan); background: rgba(0,240,255,.1);
-    box-shadow: 0 0 12px rgba(0,240,255,.3); }
-  .eff-btn.active.eff-off { border-color: var(--dim); color: var(--ink); background: var(--panel2); box-shadow: none; }
+  .eff-btn.active {
+    border-color: var(--cyan);
+    color: var(--cyan);
+    background: rgba(0,240,255,.1);
+    box-shadow: 0 0 12px rgba(0,240,255,.3);
+  }
+  .eff-btn.active.eff-off {
+    border-color: var(--dim);
+    color: var(--ink);
+    background: var(--panel2);
+    box-shadow: none;
+  }
 
-  .controls { display: flex; gap: 24px; flex-wrap: wrap; margin-top: 18px; align-items: flex-start; }
-  .wheel-block { display: flex; flex-direction: column; align-items: center; gap: 10px; transition: opacity .15s; }
-  #wheel { border-radius: 50%; cursor: crosshair; touch-action: none; }
-  .swatches { display: flex; gap: 6px; margin-top: 4px; }
-  .swatch { width: 22px; height: 22px; border-radius: 4px; cursor: pointer; border: 1px solid rgba(255,255,255,.2); }
-  .swatch:hover { outline: 1px solid var(--cyan); }
+  .controls {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+    margin-top: 18px;
+    align-items: flex-start;
+  }
+  .wheel-block {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    transition: opacity .15s;
+  }
+  #wheel {
+    border-radius: 50%;
+    cursor: crosshair;
+    touch-action: none;
+    max-width: 100%;
+  }
+  .swatches {
+    display: flex;
+    gap: 8px;
+    margin-top: 6px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .swatch {
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
+    cursor: pointer;
+    border: 1px solid rgba(255,255,255,.2);
+    flex-shrink: 0;
+    transition: transform .1s, outline .1s;
+    box-sizing: border-box;
+  }
+  .swatch:hover, .swatch:active {
+    outline: 2px solid var(--cyan);
+    transform: scale(1.05);
+  }
 
-  .sliders { flex: 1; min-width: 220px; display: flex; flex-direction: column; gap: 18px; }
+  .sliders {
+    flex: 1;
+    min-width: 220px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
   .slider-row { transition: opacity .15s; }
-  .slider-row .label { font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: var(--dim); margin-bottom: 8px;
-    display: flex; justify-content: space-between; }
+  .slider-row .label {
+    font-size: 10px;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--dim);
+    margin-bottom: 8px;
+    display: flex;
+    justify-content: space-between;
+  }
   .slider-row .label .val { color: var(--cyan); font-family: 'Orbitron', sans-serif; }
   input[type=range] {
-    -webkit-appearance: none; width: 100%; height: 6px; border-radius: 3px;
-    background: linear-gradient(90deg, var(--line), var(--line));
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 8px;
+    border-radius: 4px;
+    background: var(--line);
     outline: none;
+    margin: 12px 0;
+    cursor: pointer;
   }
   input[type=range]::-webkit-slider-thumb {
-    -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%;
-    background: var(--cyan); box-shadow: 0 0 8px var(--cyan); cursor: pointer; border: 2px solid #04121a;
+    -webkit-appearance: none;
+    appearance: none;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: var(--cyan);
+    box-shadow: 0 0 8px var(--cyan);
+    cursor: pointer;
+    border: 2px solid #04121a;
   }
   input[type=range]::-moz-range-thumb {
-    width: 18px; height: 18px; border-radius: 50%; background: var(--cyan);
-    box-shadow: 0 0 8px var(--cyan); cursor: pointer; border: 2px solid #04121a;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: var(--cyan);
+    box-shadow: 0 0 8px var(--cyan);
+    cursor: pointer;
+    border: 2px solid #04121a;
   }
   .dimmed { opacity: .25; pointer-events: none; }
 
@@ -116,6 +371,79 @@
 
   .msg { padding: 40px; text-align: center; color: var(--dim); font-size: 13px; letter-spacing: .05em; }
   .msg.err { color: var(--red); }
+
+  /* Mobile viewport optimizations */
+  @media (max-width: 640px) {
+    .wrap {
+      padding: 12px 10px 48px;
+    }
+    .top {
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .top-meta {
+      width: 100%;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .nav {
+      display: flex;
+      gap: 14px;
+      overflow-x: auto;
+      max-width: 100%;
+      width: 100%;
+      -webkit-overflow-scrolling: touch;
+      padding-bottom: 4px;
+      scrollbar-width: none;
+    }
+    .nav::-webkit-scrollbar {
+      display: none;
+    }
+    .nav a {
+      margin-left: 0;
+      font-size: 11px;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .strip-container {
+      padding: 14px 8px 12px;
+    }
+    #testShareBtn {
+      min-height: 44px;
+      padding: 10px 20px;
+      font-size: 11px;
+      border-radius: 6px;
+      width: 100%;
+      max-width: 240px;
+    }
+    .effects {
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+    }
+    .eff-btn {
+      min-height: 44px;
+      font-size: 9px;
+      line-height: 1.2;
+      text-align: center;
+      padding: 8px 4px;
+    }
+    .controls {
+      flex-direction: column;
+      align-items: center;
+      gap: 16px;
+    }
+    .wheel-block {
+      width: 100%;
+      align-items: center;
+    }
+    .sliders {
+      width: 100%;
+      min-width: 0;
+    }
+    .panel-card {
+      padding: 14px 10px;
+    }
+  }
 </style>
 <script src="/auth.js"></script>
 </head>
@@ -123,7 +451,7 @@
 <div class="wrap">
   <div class="top">
     <h1><span class="chev">//</span>MUJINA <span style="color:var(--dim);font-weight:400">/ LED</span></h1>
-    <div style="display:flex;align-items:center;gap:18px">
+    <div class="top-meta">
       <div class="status-strip"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></div>
       <nav class="nav">
         <a href="/dashboard">Dashboard</a>
@@ -199,15 +527,49 @@ function triggerShareFlash() {
 function bodyShell() {
   $('body').innerHTML = `
     <div class="sec">Strip Preview</div>
-    <div class="strip-container" style="display:flex;flex-direction:column;align-items:center;background:var(--panel);border:1px solid var(--line);padding:18px 18px 14px;gap:14px;">
-      <div class="strip" id="strip" style="border:none;padding:0;background:transparent;"></div>
-      <button type="button" id="testShareBtn" class="eff-btn" style="padding:7px 18px;border-color:var(--cyan);color:var(--cyan);font-size:10px;cursor:pointer;display:flex;align-items:center;gap:6px;">
+    <div class="strip-container">
+      <div class="strip" id="strip"></div>
+      <button type="button" id="testShareBtn" style="display:none;">
         <span>⚡</span> TEST SHARE FLASH
       </button>
     </div>
 
     <div class="sec">Effect</div>
     <div class="panel-card">
+      <div class="effect-select-wrap">
+        <label for="effectSelect" class="effect-select-label">Preset Mode</label>
+        <div class="select-wrapper">
+          <select id="effectSelect">
+            <optgroup label="⚡ Data-Reactive Stratum (BitHalo)">
+              <option value="share_pulse">Share Pulse (BitHalo)</option>
+              <option value="share_wave">Share Wave (BitHalo)</option>
+            </optgroup>
+            <optgroup label="🎬 Sci-Fi & Special FX">
+              <option value="scanner">Cylon / K.I.T.T. Scanner</option>
+              <option value="fire_flicker">Fire Flicker</option>
+              <option value="twinkle">Twinkle</option>
+            </optgroup>
+            <optgroup label="🎃 Seasonal & Holiday Themes">
+              <option value="halloween">Halloween Twinkle</option>
+              <option value="christmas">Christmas Sparkle</option>
+              <option value="patriotic">Independence Shimmer</option>
+            </optgroup>
+            <optgroup label="🛠️ Canaan Stock OEM Modes">
+              <option value="auto">Auto (Status)</option>
+              <option value="solid">Solid</option>
+              <option value="breathe">Breathe</option>
+              <option value="rainbow">Rainbow</option>
+              <option value="colorloop">Colorloop</option>
+              <option value="chase">Chase</option>
+              <option value="chase_rainbow">Chase Rainbow</option>
+              <option value="blink">Blink</option>
+              <option value="off">Off</option>
+            </optgroup>
+          </select>
+          <span class="select-caret">▼</span>
+        </div>
+      </div>
+
       <div class="effects" id="effects"></div>
 
       <div class="controls">
@@ -237,6 +599,12 @@ function bodyShell() {
   wireSliders();
   const testBtn = $('testShareBtn');
   if (testBtn) testBtn.onclick = triggerShareFlash;
+  const sel = $('effectSelect');
+  if (sel) {
+    sel.onchange = (e) => {
+      setEffect(e.target.value);
+    };
+  }
 }
 
 function buildStrip() {
@@ -267,6 +635,12 @@ function buildEffectButtons() {
 function applyEffectUi() {
   const meta = EFFECT_MAP[STATE.effect] || EFFECT_MAP.auto;
   const isShareEffect = STATE.effect === 'share_pulse' || STATE.effect === 'share_wave';
+
+  const sel = $('effectSelect');
+  if (sel && sel.value !== STATE.effect) {
+    sel.value = STATE.effect;
+  }
+
   document.querySelectorAll('.eff-btn[data-effect]').forEach(b => {
     b.classList.toggle('active', b.dataset.effect === STATE.effect);
   });
@@ -295,7 +669,7 @@ function applyEffectUi() {
   }
 }
 
-const SWATCHES = ['#ff0000', '#ff8800', '#ffee00', '#1bff9c', '#00f0ff', '#2e6bff', '#b967ff', '#ff2e97', '#ffffff'];
+const SWATCHES = ['#f7931a', '#ff0000', '#ff8800', '#ffee00', '#1bff9c', '#00f0ff', '#2e6bff', '#b967ff', '#ff2e97', '#ffffff'];
 function buildSwatches() {
   const wrap = $('swatches');
   wrap.innerHTML = '';
@@ -340,7 +714,10 @@ function buildWheel() {
 
   const pick = (clientX, clientY) => {
     const rect = canvas.getBoundingClientRect();
-    const x = clientX - rect.left, y = clientY - rect.top;
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const x = (clientX - rect.left) * scaleX;
+    const y = (clientY - rect.top) * scaleY;
     const dx = x - WHEEL_R, dy = y - WHEEL_R;
     const r = Math.min(WHEEL_R, Math.sqrt(dx * dx + dy * dy));
     const hue = (Math.atan2(dy, dx) * 180 / Math.PI + 360) % 360;
