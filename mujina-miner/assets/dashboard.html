@@ -443,6 +443,8 @@
       background: #0a1120; border: 1px solid var(--line); color: var(--cyan); cursor: pointer;
       font-family: 'Orbitron', sans-serif; font-weight: 700; font-size: 11px; letter-spacing: .14em;
       text-transform: uppercase; padding: 9px 14px; border-radius: 4px;
+      display: inline-flex; align-items: center; justify-content: center; text-align: center;
+      text-decoration: none; box-sizing: border-box;
     }
     .menubar .menubtn:hover, .menubar .menubtn.on { border-color: var(--cyan); box-shadow: 0 0 10px rgba(0,240,255,.3); }
     .menusheet .sheet { width: min(640px, 96vw); position: relative; }
@@ -450,7 +452,7 @@
     .menusheet .sheet .sec:first-of-type { margin-top: 4px; }
     #ownCur { font-size: 13px; color: var(--ink); line-height: 1.5; margin-bottom: 12px; overflow-wrap: anywhere; }
     @media(max-width: 480px) {
-      .menubar .menubtn { flex: 1 1 30%; padding: 9px 6px; }
+      .menubar .menubtn { flex: 1 1 30%; padding: 9px 6px; text-align: center; justify-content: center; }
       .menusheet .sheet { width: 100vw; max-width: 100vw; height: 100vh; max-height: 100vh; border-radius: 0; }
     }
     body.theme-minimal {
@@ -861,7 +863,6 @@
     /* Unified dashboard additions */
     .modebadge { font-family: 'Orbitron', sans-serif; font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
       border: 1px solid var(--line); color: var(--cyan); padding: 7px 12px; border-radius: 4px; white-space: nowrap; }
-    .menubar a.menubtn { text-decoration: none; display: inline-block; }
     .sysnotice { border: 1px solid var(--amber); color: var(--amber); padding: 8px 12px; margin: 0 0 14px; font-size: 12px; line-height: 1.4; }
     body.theme-minimal .menubar .menubtn { background: rgba(255,255,255,.45) !important; color: #2d3e50 !important;
       border: 1px solid rgba(255,255,255,.6) !important; border-radius: 10px !important; box-shadow: none !important; }

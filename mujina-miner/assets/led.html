@@ -424,6 +424,9 @@
       min-height: 44px;
       font-size: 9px;
       line-height: 1.2;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       text-align: center;
       padding: 8px 4px;
     }
@@ -931,7 +934,7 @@ function updatePreview() {
       break;
     }
     case 'halloween': {
-      const palette = ['#ff7518', '#39ff14', '#a020f0']; // Pumpkin Orange, Slime Green, Witch Purple
+      const palette = ['#ff3c00', '#00ff00', '#aa00ff'];
       const spawnChance = 0.03 + speedFrac * 0.25;
       colors = Array.from({ length: 9 }, (_, i) => {
         if (P.halloweenTwinkle[i] <= 0.02 && Math.random() < spawnChance) {
@@ -947,8 +950,8 @@ function updatePreview() {
       break;
     }
     case 'christmas': {
-      const red = '#f51923';
-      const green = '#0fd24b';
+      const red = '#ff0000';
+      const green = '#00ff00';
       P.holidayPhase = (P.holidayPhase + 0.2 + speedFrac * 0.4) % (Math.PI * 2);
       colors = Array.from({ length: 9 }, (_, i) => {
         const col = (i % 2 === 0) ? red : green;
@@ -958,7 +961,7 @@ function updatePreview() {
       break;
     }
     case 'patriotic': {
-      const triColor = ['#ff1414', '#f0f0ff', '#1428ff']; // Red, White, Blue
+      const triColor = ['#ff0000', '#ffffff', '#001eff'];
       P.holidayPhase = (P.holidayPhase + 0.2 + speedFrac * 0.4) % (Math.PI * 2);
       colors = Array.from({ length: 9 }, (_, i) => {
         const col = triColor[i % 3];

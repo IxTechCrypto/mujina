@@ -2279,9 +2279,9 @@ impl AnimState {
             }
             LedEffect::Halloween => {
                 const PALETTE: [(u8, u8, u8); 3] = [
-                    (255, 117, 24),  // Pumpkin Orange
-                    (57, 255, 20),   // Slime Green
-                    (160, 32, 240),  // Witch Purple
+                    (255, 60, 0),   // Stark vibrant Pumpkin Orange
+                    (0, 255, 0),    // Stark vibrant Slime Green
+                    (170, 0, 255),  // Stark intense Witch Purple
                 ];
                 let spawn_chance = 0.03 + speed_frac * 0.25;
                 let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
@@ -2299,8 +2299,8 @@ impl AnimState {
                 colors
             }
             LedEffect::Christmas => {
-                const RED: (u8, u8, u8) = (245, 25, 35);
-                const GREEN: (u8, u8, u8) = (15, 210, 75);
+                const RED: (u8, u8, u8) = (255, 0, 0);   // Pure solid Crimson Red (zero green, zero blue)
+                const GREEN: (u8, u8, u8) = (0, 255, 0); // Pure solid Emerald Green (zero red, zero blue)
                 self.holiday_phase = (self.holiday_phase + 0.2 + speed_frac * 0.4) % std::f32::consts::TAU;
                 let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
                 for i in 0..WS2812_LED_COUNT {
@@ -2311,10 +2311,11 @@ impl AnimState {
                 colors
             }
             LedEffect::Patriotic => {
-                const RED: (u8, u8, u8) = (255, 20, 20);
-                const WHITE: (u8, u8, u8) = (240, 240, 255);
-                const BLUE: (u8, u8, u8) = (20, 40, 255);
-                const TRI_COLOR: [(u8, u8, u8); 3] = [RED, WHITE, BLUE];
+                const TRI_COLOR: [(u8, u8, u8); 3] = [
+                    (255, 0, 0),     // Stark pure Red
+                    (255, 255, 255), // Stark brilliant White
+                    (0, 30, 255),    // Stark electric Blue
+                ];
                 self.holiday_phase = (self.holiday_phase + 0.2 + speed_frac * 0.4) % std::f32::consts::TAU;
                 let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
                 for i in 0..WS2812_LED_COUNT {
