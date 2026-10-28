@@ -881,14 +881,31 @@ function updatePreview() {
     }
     case 'scanner': {
       const span = 8;
-      P.scannerPos += P.scannerDir * (0.1 + speedFrac * 0.9);
-      if (P.scannerPos >= span) { P.scannerPos = span; P.scannerDir = -1; }
-      else if (P.scannerPos <= 0) { P.scannerPos = 0; P.scannerDir = 1; }
+      const head = Math.round(P.scannerPos);
+      const d = Math.trunc(P.scannerDir);
+      const tail1 = head - d;
+      const tail2 = head - 2 * d;
+
       colors = Array.from({ length: 9 }, (_, i) => {
-        const dist = Math.abs(i - P.scannerPos);
-        const level = Math.max(0, Math.min(1, 1 - dist / 1.5));
-        return scaleHex(STATE.color, v * level);
+        let level = 0.0;
+        if (i === head) {
+          level = 1.0;
+        } else if (i === tail1) {
+          level = 0.45;
+        } else if (i === tail2) {
+          level = 0.18;
+        }
+        return level > 0 ? scaleHex(STATE.color, v * level) : '#000';
       });
+
+      if (P.scannerPos >= span && P.scannerDir > 0) {
+        P.scannerDir = -1;
+      } else if (P.scannerPos <= 0 && P.scannerDir < 0) {
+        P.scannerDir = 1;
+      }
+      P.scannerPos += P.scannerDir * (0.2 + speedFrac * 0.6);
+      if (P.scannerPos > span) P.scannerPos = span;
+      if (P.scannerPos < 0) P.scannerPos = 0;
       break;
     }
     case 'twinkle': {

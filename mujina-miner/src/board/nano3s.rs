@@ -2198,19 +2198,40 @@ impl AnimState {
             }
             LedEffect::Scanner => {
                 let span = (WS2812_LED_COUNT - 1) as f32;
-                self.scanner_pos += self.scanner_dir * (0.1 + speed_frac * 0.9);
-                if self.scanner_pos >= span {
-                    self.scanner_pos = span;
-                    self.scanner_dir = -1.0;
-                } else if self.scanner_pos <= 0.0 {
-                    self.scanner_pos = 0.0;
-                    self.scanner_dir = 1.0;
-                }
+                let head = self.scanner_pos.round() as i32;
+                let dir = self.scanner_dir as i32;
+                let tail1 = head - dir;
+                let tail2 = head - 2 * dir;
+
                 let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
                 for (i, c) in colors.iter_mut().enumerate() {
-                    let dist = (i as f32 - self.scanner_pos).abs();
-                    let level = (1.0 - dist / 1.5).clamp(0.0, 1.0);
-                    *c = scale_color(ov.color, v * level);
+                    let idx = i as i32;
+                    let level = if idx == head {
+                        1.0
+                    } else if idx == tail1 {
+                        0.45
+                    } else if idx == tail2 {
+                        0.18
+                    } else {
+                        0.0
+                    };
+                    *c = if level > 0.0 {
+                        scale_color(ov.color, v * level)
+                    } else {
+                        (0, 0, 0)
+                    };
+                }
+
+                if self.scanner_pos >= span && self.scanner_dir > 0.0 {
+                    self.scanner_dir = -1.0;
+                } else if self.scanner_pos <= 0.0 && self.scanner_dir < 0.0 {
+                    self.scanner_dir = 1.0;
+                }
+                self.scanner_pos += self.scanner_dir * (0.4 + speed_frac * 1.2);
+                if self.scanner_pos > span {
+                    self.scanner_pos = span;
+                } else if self.scanner_pos < 0.0 {
+                    self.scanner_pos = 0.0;
                 }
                 colors
             }
@@ -3772,5 +3793,46 @@ mod tests {
         // Triplets: 0 = Red, 1 = White, 2 = Blue
         assert!(pat_frame[0].0 > pat_frame[0].2); // Red > Blue
         assert!(pat_frame[2].2 > pat_frame[2].0); // Blue > Red
+    }
+
+    #[test]
+    fn anim_state_scanner_cylon_head_and_tail() {
+        let mut anim = AnimState::new();
+        let ov = LedOverrideState {
+            effect: LedEffect::Scanner,
+            color: (255, 0, 0),
+            brightness: 255,
+            speed: 128,
+        };
+
+        // Frame 0: at pos 0, dir +1 -> Head is at 0, ahead LEDs are dark
+        let f0 = anim.frame(ov);
+        assert_eq!(f0[0].0, 255); // Head at 100%
+        assert_eq!(f0[1].0, 0);   // Ahead is dark
+        assert_eq!(f0[8].0, 0);
+
+        // Advance to pos 2 moving right (dir +1):
+        // Head at 2, Tail 1 at 1 (~45%), Tail 2 at 0 (~18%), Ahead (3..8) are dark
+        anim.scanner_pos = 2.0;
+        anim.scanner_dir = 1.0;
+        let f2 = anim.frame(ov);
+        assert_eq!(f2[2].0, 255); // Head
+        assert!(f2[1].0 >= 100 && f2[1].0 <= 130); // Tail 1 (45% of 255 = 114)
+        assert!(f2[0].0 >= 35 && f2[0].0 <= 55);   // Tail 2 (18% of 255 = 45)
+        for i in 3..WS2812_LED_COUNT {
+            assert_eq!(f2[i].0, 0, "Ahead LED {i} must be dark");
+        }
+
+        // Advance moving left (dir -1) at pos 6:
+        // Head at 6, Tail 1 at 7, Tail 2 at 8, Ahead (0..5) are dark
+        anim.scanner_pos = 6.0;
+        anim.scanner_dir = -1.0;
+        let f6 = anim.frame(ov);
+        assert_eq!(f6[6].0, 255); // Head
+        assert!(f6[7].0 >= 100 && f6[7].0 <= 130); // Tail 1 behind head
+        assert!(f6[8].0 >= 35 && f6[8].0 <= 55);   // Tail 2 behind head
+        for i in 0..6 {
+            assert_eq!(f6[i].0, 0, "Ahead LED {i} must be dark");
+        }
     }
 }
