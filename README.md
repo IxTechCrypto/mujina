@@ -35,6 +35,18 @@ This repository ([`IxTechCrypto/mujina`](https://github.com/IxTechCrypto/mujina)
   * Complete headless deployment configuration for Raspberry Pi 4 (Debian aarch64) with native systemd service daemons (`mujina-miner`, `mujina-dashboard`).
   * **Waveshare 2.13" V4 E-Paper HUD**: Live hardware status monitor (`scripts/waveshare_epaper_monitor.py`) displaying real-time hashrate, temperatures, pool latency, and network IP.
 
+* **⚡ Canaan AvalonNano 3 / Nano 3S Support (Building on Aadhi's Foundation)**:
+  * **Lineage & Upstream Attribution**: Built on top of the pioneering reverse-engineering work by **Aadhi ([`aadhi1014/nano-mujina`](https://github.com/aadhi1014/nano-mujina))**, who mapped the Canaan Kendryte K230 dual-core RISC-V SoC (Big-Core RTOS `rtos_core.elf` + Little-Core Linux `mujina-minerd`), ASIC UART protocol framing, and IOMUX/PWM device tree registers.
+  * **Autonomous Per-Chip Tuning (`OwnerTune` & `ChipTuner`)**: Engineered for the 12x Canaan A3197S series voltage stack. Features a two-phase optimization loop (global frequency/voltage convergence before hunting individual chip offsets) to prevent series rail dynamic impedance imbalances. Confirmed in a 6-hour soak benchmark at **5.37 TH/s @ 105.5W** (338 MHz @ 3652 mV, 0.08% reject rate), matching/exceeding stock Canaan Medium mode efficiency.
+  * **Power Supply Overclock Bypass**: Decoupled consumer wall adapter 80% continuous USB-PD derating (112.0W safe default) from absolute board VRM capability (140W max). Enables high-power DC supplies (e.g. Mean Well 200W @ 28V DC via XT30 harness splice + push-pull 80mm cooling) while strictly preserving thermal (85°C/90°C) and VRM backstops.
+  * **Stratum-Reactive WS2812 LED Telemetry**: 9-pixel front addressable LED strip integrated directly with stratum share events:
+    * **Share Pulse**: Strobes Bitcoin Orange (`#F7931A`) across all 9 LEDs on valid share submission with smooth geometric decay to an 8% resting ambient glow.
+    * **Share Wave**: Center-outward ripple radiating symmetrically from physical center LED 4 to edges on pool submit.
+    * **Cylon / K.I.T.T. Scanner**: Larson scanner beam with decaying phosphor trail.
+    * **Stark Holiday Modes**: Calibrated 100% saturated primary subpixel palettes for Christmas (`#FF0000` Crimson Red & `#00FF00` Emerald Green), Halloween (`#FF3C00` Pumpkin Orange, `#00FF00` Slime Green, `#AA00FF` Witch Purple), and 4th of July.
+  * **Mobile-First Touch Web Interface**: Dedicated `/led` control surface and dashboard integration with fluid 9-LED responsive preview (`clamp()`), Canaan-style categorized `<select>` dropdown, 2-column mobile button cards, 44px touch targets, and centered menubar buttons across mobile and desktop.
+  * **Hardened RISC-V Toolchain & Static Linking**: Compiled strictly for RV64GC (0 illegal vector / Zb instructions) with `-C target-feature=+crt-static` to eliminate glibc dynamic loader dependencies on the K230 Busybox userland, with single-package bundle deployment (`pack_firmware_bundle.py`).
+
 ## Why Mujina
 
 You bought the hardware, but someone else controls the software. Whether
