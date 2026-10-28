@@ -4,10 +4,25 @@ Open-source Bitcoin mining firmware.
 
 ## About This Fork
 
-This is a fork of [256foundation/mujina](https://github.com/256foundation/mujina),
-adapted to run on the **Avalon Nano3s** (Canaan K230 SoC, dual-core
-RISC-V64: a big core running a bare-metal RTOS alongside the ASIC
-chain, and a little core running Linux).
+This is an enhanced distribution of [256foundation/mujina](https://github.com/256foundation/mujina)
+by **IxTech**, building upon the pioneering open-source port by **Aadhi
+([aadhi1014/nano-mujina](https://github.com/aadhi1014/nano-mujina))** for
+the **Canaan AvalonNano 3 / Nano 3S** (Kendryte K230 dual RV64GC SoC, 12x
+Canaan A3197S ASICs in series).
+
+On top of Aadhi's core reverse-engineering of the RTOS UART framing and
+K230 hardware registers, this fork introduces:
+- **Autonomous Per-Chip Tuning (`OwnerTune` & `ChipTuner`)**: Two-phase
+  dynamic tuning solving series voltage impedance shifts (verified
+  rock-solid at 5.37 TH/s @ 105.5W / 0.08% rejects).
+- **Power Delivery & Overclock Bypass**: Unlocking 50–140W VRM headroom
+  for high-current DC power mods (Mean Well 200W @ 28V DC via XT30).
+- **Stratum-Reactive WS2812 Lighting**: Real-time pool share pulse/wave
+  animations on the 9-LED strip, Cylon scanner, and stark holiday modes.
+- **Mobile-First Touch Web Interface**: Responsive fluid strip, Canaan-style
+  optgroup dropdowns, 44px tap targets, and dedicated `/led` controller.
+- **Static RV64GC Compilation Pipeline**: Fully static linking
+  (`+crt-static`) eliminating glibc loader traps on K230 Busybox.
 
 The stock Nano3s ships closed firmware on both cores. This fork
 replaces it end to end:
