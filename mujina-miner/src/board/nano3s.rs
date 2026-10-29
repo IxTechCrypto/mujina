@@ -1598,7 +1598,16 @@ pub(crate) fn write_owner_tune_command(
     continuous: Option<bool>,
 ) -> std::io::Result<()> {
     let mut line = owner::directive_for_request(profile, fan_target_c);
-    if let Some(on) = per_chip {
+    let chip_flag = match per_chip {
+        Some(true) => Some(true),
+        Some(false) => Some(false),
+        None => match profile {
+            Some(Some(_)) => Some(true),
+            Some(None) => Some(false),
+            None => None,
+        },
+    };
+    if let Some(on) = chip_flag {
         line.push_str(if on { ";chip=on" } else { ";chip=off" });
     }
     if let Some(on) = continuous {
@@ -2762,6 +2771,12 @@ fn run_worker(
                         if let Some(OwnerCmd::Fan(t)) = owner.disable() {
                             write_harness_control(t);
                         }
+                        if let Some(ct) = chip_tuner.take() {
+                            let start = stop_chip_tuner(ct, &mut chip_offset_mhz);
+                            persisted_chip_offsets = start;
+                        }
+                        persist_chip_tune(false);
+                        owner.set_chip_status(None);
                         persist_owner_tune_profile(None);
                         owner.publish(None);
                         eprintln!("[nano3s] owner-tune: disabled via dashboard/API");

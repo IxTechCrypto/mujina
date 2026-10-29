@@ -1052,17 +1052,13 @@
         <label for="ownTemp">Chip temp target <small style="color:var(--dim)">°C, blank = unchanged</small></label>
         <input type="number" id="ownTemp" min="30" max="95" step="1" placeholder="unchanged">
       </div>
-      <div class="row" style="margin-top:6px">
-        <label for="ownPerChip" style="display:flex;align-items:center;gap:8px;cursor:pointer">
-          <input type="checkbox" id="ownPerChip">
-          <span>Per-chip tuning</span>
-        </label>
-      </div>
-      <small style="color:var(--dim);display:block;margin-top:2px">Runs once the profile has locked; one chip at a time, ~7 min per step.</small>
       <div class="row" style="margin-top:10px;flex-wrap:wrap">
         <label for="ownContinuous" style="cursor:pointer">Continuous Tuning</label>
         <input type="checkbox" id="ownContinuous">
-        <small style="color:var(--dim);display:block;margin-top:2px;flex-basis:100%">Dynamic Braiins-style autotuning: continuously probes upward when thermal/cooling headroom opens up.</small>
+        <small style="color:var(--dim);display:block;margin-top:3px;flex-basis:100%;line-height:1.4">
+          Disabled: warms up &amp; tunes board, optimizes individual chips, then locks in.<br>
+          Enabled: continuously re-tunes as cooling, fan speeds, or ambient temps change.
+        </small>
       </div>
       <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
         <button class="btn pri wbtn" id="ownApply" type="button">Apply</button>
@@ -1384,7 +1380,7 @@ function setMsg(id, text, ok) { const m = $(id); m.textContent = text; m.classNa
 let SYS = null;                 // last good /api/v0/system document
 let LAST = null, ACTIVE_NAME = null, CHIP_FILTER = 'all';
 let PAUSE_AVAILABLE = false, DETAIL_STATE = 0, PAUSED = false, CHIP_OFFSETS = [], DETAIL_CACHE = null;
-let LAST_OWNER_STATUS = null, USER_EDITING_PER_CHIP = false, USER_EDITING_CONTINUOUS = false;
+let LAST_OWNER_STATUS = null, USER_EDITING_CONTINUOUS = false;
 let MOUSE_POS = { fleetChart: null, chart: null };
 let TICKS = 0;
 
@@ -1698,14 +1694,11 @@ function applyBoardCaps() {
   show('ownSection', tuner);
   show('tunerCard', tuner);
   const pcElem = $('at-per-chip');
-  const chk = $('ownPerChip');
   const contChk = $('ownContinuous');
   if (!tuner) {
     if (pcElem) pcElem.textContent = '';
-    if (chk) { chk.checked = false; chk.disabled = true; }
     if (contChk) { contChk.checked = false; contChk.disabled = true; }
   } else {
-    if (chk) chk.disabled = false;
     if (contChk) contChk.disabled = false;
   }
   show('manualSection', manual);
@@ -2479,7 +2472,6 @@ function renderOwnerTune(o) {
   $('ownCur').textContent = 'Current: ' + ownTxt;
   if (!OWN_SYNCED) {
     $('ownProfile').value = o.enabled ? (o.profile || 'off') : 'off';
-    $('ownPerChip').checked = !!o.per_chip;
     $('ownContinuous').checked = !!o.continuous;
     OWN_SYNCED = true;
   }
@@ -2539,46 +2531,34 @@ async function applyOwner() {
   if (writeBusy('ownMsg')) return;
   const sel = $('ownProfile'), v = sel.value, label = sel.options[sel.selectedIndex].textContent;
   const curProfile = (LAST_OWNER_STATUS && LAST_OWNER_STATUS.enabled) ? (LAST_OWNER_STATUS.profile || 'off') : 'off';
-  const curPerChip = !!(LAST_OWNER_STATUS && LAST_OWNER_STATUS.per_chip);
   const curContinuous = !!(LAST_OWNER_STATUS && LAST_OWNER_STATUS.continuous);
-  const newPerChip = $('ownPerChip').checked;
   const newContinuous = $('ownContinuous').checked;
   const tt = $('ownTemp').value;
 
   const profileChanged = (v !== curProfile);
   const tempChanged = (tt !== '');
-  const perChipChanged = (newPerChip !== curPerChip);
   const continuousChanged = (newContinuous !== curContinuous);
 
-  if (!profileChanged && !tempChanged && !perChipChanged && !continuousChanged) {
+  if (!profileChanged && !tempChanged && !continuousChanged) {
     setMsg('ownMsg', 'No changes to apply');
     return;
   }
 
-  // If ONLY toggles (per-chip or continuous) changed and a profile is active, send ONLY toggles to avoid resetting the profile search or fan target
-  if (!profileChanged && !tempChanged && (perChipChanged || continuousChanged)) {
+  // If ONLY continuous toggle changed and a profile is active, send ONLY continuous to avoid resetting the profile search or fan target
+  if (!profileChanged && !tempChanged && continuousChanged) {
     if (!LAST_OWNER_STATUS || !LAST_OWNER_STATUS.enabled) {
       setMsg('ownMsg', 'turn on a profile first');
       return;
     }
-    const body = {};
-    if (perChipChanged) body.per_chip = newPerChip;
-    if (continuousChanged) body.continuous = newContinuous;
+    const body = { continuous: newContinuous };
     setMsg('ownMsg', 'Sending…');
     lockWrites();
     try {
       await sendJson('PATCH', caps.tuner, body);
-      const msgs = [];
-      if (continuousChanged) msgs.push('continuous ' + (newContinuous ? 'ON' : 'OFF'));
-      if (perChipChanged) msgs.push('per-chip ' + (newPerChip ? 'ON' : 'OFF'));
-      setMsg('ownMsg', 'Queued: ' + msgs.join(' · '), true);
-      USER_EDITING_PER_CHIP = false;
+      setMsg('ownMsg', 'Queued: continuous ' + (newContinuous ? 'ON' : 'OFF'), true);
       USER_EDITING_CONTINUOUS = false;
       setTimeout(async () => {
         await pollOwnerTune();
-        if (!USER_EDITING_PER_CHIP && LAST_OWNER_STATUS) {
-          $('ownPerChip').checked = !!LAST_OWNER_STATUS.per_chip;
-        }
         if (!USER_EDITING_CONTINUOUS && LAST_OWNER_STATUS) {
           $('ownContinuous').checked = !!LAST_OWNER_STATUS.continuous;
         }
@@ -2592,7 +2572,7 @@ async function applyOwner() {
   const body = { profile: v === 'off' ? null : v };
   if (tt !== '') body.chip_temp_target_c = +tt;
   if (v !== 'off') {
-    body.per_chip = newPerChip;
+    body.per_chip = true; // Profiles inherently include per-chip tuning
     body.continuous = newContinuous;
   }
 
@@ -2600,12 +2580,8 @@ async function applyOwner() {
   lockWrites();
   try {
     await sendJson('PATCH', caps.tuner, body);
-    const extras = [];
-    if (newPerChip) extras.push('per-chip');
-    if (newContinuous) extras.push('continuous');
-    const extraTxt = extras.length ? ' + ' + extras.join(' + ') : '';
+    const extraTxt = (v !== 'off' && newContinuous) ? ' + continuous' : '';
     setMsg('ownMsg', 'Queued: ' + label + extraTxt + ' (applies within ~1 s)', true);
-    USER_EDITING_PER_CHIP = false;
     USER_EDITING_CONTINUOUS = false;
     setTimeout(pollOwnerTune, 2500);
   } catch (e) { setMsg('ownMsg', 'Failed: ' + e.message); }
@@ -2656,7 +2632,6 @@ $('psuApplyBtn').addEventListener('click', applyPsuProfile);
 $('poolSave').addEventListener('click', savePool);
 $('poolReboot').addEventListener('click', poolApplyNow);
 $('ownApply').addEventListener('click', applyOwner);
-$('ownPerChip').addEventListener('change', () => { USER_EDITING_PER_CHIP = true; });
 $('ownContinuous').addEventListener('change', () => { USER_EDITING_CONTINUOUS = true; });
 $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(b => {
   b.addEventListener('click', () => {
