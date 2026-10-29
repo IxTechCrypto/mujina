@@ -1323,6 +1323,14 @@ struct PersistedTuning {
     owner_memory: Option<(TuneProfile, SearchMemory)>,
     /// Per-chip clock tuner switch.
     chip_tune: bool,
+    /// Continuous dynamic tuning switch.
+    continuous: bool,
+}
+
+fn persist_continuous(on: bool) {
+    let mut cfg = load_tuning();
+    cfg.continuous = on;
+    write_tuning_conf(&cfg);
 }
 
 fn persist_chip_tune(on: bool) {
@@ -1441,6 +1449,7 @@ fn load_tuning() -> PersistedTuning {
             "chip_offset_mhz" => cfg.chip_offset_mhz = parse_chip_offsets(value),
             "owner_memory" => cfg.owner_memory = parse_owner_memory(value),
             "chip_tune" => cfg.chip_tune = value == "on",
+            "continuous" => cfg.continuous = value == "on",
             _ => {}
         }
     }
@@ -1484,6 +1493,9 @@ fn write_tuning_conf(cfg: &PersistedTuning) {
     }
     if cfg.chip_tune {
         out.push_str("chip_tune=on\n");
+    }
+    if cfg.continuous {
+        out.push_str("continuous=on\n");
     }
     if let Some(o) = cfg.chip_offset_mhz.filter(|o| o.iter().any(|x| *x != 0)) {
         out.push_str(&format!("chip_offset_mhz={}\n", join_chip_offsets(&o)));
@@ -1583,10 +1595,14 @@ pub(crate) fn write_owner_tune_command(
     profile: Option<Option<TuneProfile>>,
     fan_target_c: Option<f32>,
     per_chip: Option<bool>,
+    continuous: Option<bool>,
 ) -> std::io::Result<()> {
     let mut line = owner::directive_for_request(profile, fan_target_c);
     if let Some(on) = per_chip {
         line.push_str(if on { ";chip=on" } else { ";chip=off" });
+    }
+    if let Some(on) = continuous {
+        line.push_str(if on { ";continuous=on" } else { ";continuous=off" });
     }
     std::fs::write(MUJINA_CONTROL_FILE, line)
 }
@@ -2597,6 +2613,7 @@ fn run_worker(
     }
     let mut owner = OwnerTune::with_envelope(owner_env);
     owner.set_fan_target(persisted_tuning.owner_fan_target_c);
+    owner.set_continuous(persisted_tuning.continuous);
     if let Some(p) = persisted_tuning.owner_tune_profile {
         owner.enable(p);
         owner.seed_fan_duty(read_fan_status().and_then(|f| f.percent));
@@ -2690,6 +2707,12 @@ fn run_worker(
                         owner.set_chip_status(None);
                     }
                     eprintln!("[nano3s] per-chip tuner {}", if on { "on" } else { "off" });
+                }
+                if let Ok(Some(c)) = parsed.as_ref().map(|d| d.continuous) {
+                    persist_continuous(c);
+                    owner.set_continuous(c);
+                    owner.publish(None);
+                    eprintln!("[nano3s] continuous tuning {}", if c { "on" } else { "off" });
                 }
                 if let Ok(d) = &parsed
                     && let Some(c) = d.fan_target_c

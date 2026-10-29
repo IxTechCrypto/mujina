@@ -709,8 +709,13 @@ async fn patch_board_owner_tune(
     }
     #[cfg(feature = "nano3s")]
     {
-        crate::board::nano3s::write_owner_tune_command(req.profile_change(), req.chip_temp_target_c, req.per_chip)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        crate::board::nano3s::write_owner_tune_command(
+            req.profile_change(),
+            req.chip_temp_target_c,
+            req.per_chip,
+            req.continuous,
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         Ok(StatusCode::OK)
     }
     #[cfg(not(feature = "nano3s"))]

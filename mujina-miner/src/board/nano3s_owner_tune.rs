@@ -211,6 +211,9 @@ pub struct OwnerTuneRequest {
     /// once the owner tuner has locked). Absent leaves it unchanged. Persisted.
     #[serde(default)]
     pub per_chip: Option<bool>,
+    /// Continuous dynamic tuning: continuously probes upward when thermal/cooling headroom opens up.
+    #[serde(default)]
+    pub continuous: Option<bool>,
 }
 
 fn present_or_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<TuneProfile>>, D::Error> {
@@ -231,7 +234,10 @@ impl OwnerTuneRequest {
 
     /// The profile change to queue: `Some(None)` = off, `None` = keep.
     pub(crate) fn profile_change(&self) -> Option<Option<TuneProfile>> {
-        match (self.profile, self.chip_temp_target_c.is_some() || self.per_chip.is_some()) {
+        match (
+            self.profile,
+            self.chip_temp_target_c.is_some() || self.per_chip.is_some() || self.continuous.is_some(),
+        ) {
             (None, true) => None,
             (None, false) => Some(None),
             (p, _) => p,
@@ -261,6 +267,8 @@ pub struct OwnerTuneStatus {
     pub averaging_progress: Option<AveragingProgress>,
     /// Whole-board watts the tuner may draw continuously (PSU-derived).
     pub continuous_ceiling_w: Option<f32>,
+    /// Continuous dynamic tuning enabled.
+    pub continuous: bool,
     /// Last 20 tuner log entries, newest last.
     pub events: Vec<OwnerEvent>,
     /// Best measured point, if any.
@@ -341,6 +349,8 @@ pub(crate) struct OwnerDirective {
     pub fan_target_c: Option<f32>,
     /// `chip=on|off`: per-chip tuner switch; `None` = unchanged.
     pub chip_tune: Option<bool>,
+    /// `continuous=on|off`: continuous dynamic tuning switch; `None` = unchanged.
+    pub continuous: Option<bool>,
 }
 
 pub(crate) fn directive_for_request(profile: Option<Option<TuneProfile>>, fan_target_c: Option<f32>) -> String {
@@ -360,10 +370,19 @@ pub(crate) fn parse_owner_directive(v: &str) -> Result<OwnerDirective, ()> {
     let profile = if head == "keep" { None } else { Some(parse_directive(head)?) };
     let mut fan_target_c = None;
     let mut chip_tune = None;
+    let mut continuous = None;
     for extra in parts {
         let extra = extra.trim();
         if let Some(v) = extra.strip_prefix("chip=") {
             chip_tune = Some(match v.trim() {
+                "on" => true,
+                "off" => false,
+                _ => return Err(()),
+            });
+            continue;
+        }
+        if let Some(v) = extra.strip_prefix("continuous=") {
+            continuous = Some(match v.trim() {
                 "on" => true,
                 "off" => false,
                 _ => return Err(()),
@@ -376,7 +395,7 @@ pub(crate) fn parse_owner_directive(v: &str) -> Result<OwnerDirective, ()> {
         }
         fan_target_c = Some(c);
     }
-    Ok(OwnerDirective { profile, fan_target_c, chip_tune })
+    Ok(OwnerDirective { profile, fan_target_c, chip_tune, continuous })
 }
 
 // --- chip-temp fan loop ------------------------------------------------------
@@ -659,6 +678,16 @@ impl OwnerTune {
         self.tuner.power_cap_w()
     }
 
+    /// Set continuous dynamic tuning mode.
+    pub(crate) fn set_continuous(&mut self, c: bool) {
+        self.tuner.set_continuous(c);
+    }
+
+    /// Whether continuous dynamic tuning mode is enabled.
+    pub(crate) fn continuous(&self) -> bool {
+        self.tuner.continuous()
+    }
+
     /// Shown in the published status as `per_chip`.
     pub(crate) fn set_chip_status(&mut self, s: Option<ChipTuneStatus>) {
         self.chip_status = s;
@@ -816,6 +845,7 @@ impl OwnerTune {
                 AveragingProgress { ticks, needed }
             }),
             continuous_ceiling_w: self.profile.and(self.continuous_ceiling_w),
+            continuous: self.tuner.continuous(),
             events: self.events(),
             best: self.tuner.best_point().map(|(sp, j)| OwnerBest {
                 freq_mhz: sp.frequency_mhz,
@@ -1093,6 +1123,18 @@ mod tests {
     }
 
     #[test]
+    fn owner_directive_parses_the_continuous_switch() {
+        let d = parse_owner_directive("keep;continuous=on").unwrap();
+        assert_eq!((d.profile, d.continuous, d.fan_target_c), (None, Some(true), None));
+        let d = parse_owner_directive("balanced;continuous=off").unwrap();
+        assert_eq!(d.continuous, Some(false));
+        assert!(parse_owner_directive("keep;continuous=maybe").is_err());
+        // A continuous switch alone keeps the profile.
+        let r = OwnerTuneRequest { continuous: Some(true), ..Default::default() };
+        assert_eq!(r.profile_change(), None);
+    }
+
+    #[test]
     fn fan_takeover_starts_from_current_duty() {
         let mut st = FanState::starting_at(Some(30));
         // At target: first write is the current duty, not 100 %.
@@ -1219,9 +1261,9 @@ mod tests {
     #[test]
     fn owner_directive_round_trips_with_fan_target() {
         let d = parse_owner_directive("efficient;fan=72.5").unwrap();
-        assert_eq!(d, OwnerDirective { profile: Some(Some(TuneProfile::Efficient)), fan_target_c: Some(72.5), chip_tune: None });
+        assert_eq!(d, OwnerDirective { profile: Some(Some(TuneProfile::Efficient)), fan_target_c: Some(72.5), chip_tune: None, continuous: None });
         let d = parse_owner_directive("keep;fan=75").unwrap();
-        assert_eq!(d, OwnerDirective { profile: None, fan_target_c: Some(75.0), chip_tune: None });
+        assert_eq!(d, OwnerDirective { profile: None, fan_target_c: Some(75.0), chip_tune: None, continuous: None });
         assert_eq!(parse_owner_directive("off").unwrap().profile, Some(None));
         assert!(parse_owner_directive("off;fan=95").is_err());
         assert!(parse_owner_directive("off;bogus=1").is_err());
@@ -1243,9 +1285,14 @@ mod tests {
         o.publish(None);
         let s = read_status();
         assert_eq!(s.continuous_ceiling_w, Some(112.0));
+        assert!(!s.continuous);
         assert!(s.events.len() <= 20 && !s.events.is_empty());
         assert!(s.events.iter().all(|e| e.power_w == 80.0 && e.hashrate_ths == 4.0));
         assert!(s.best.is_some_and(|b| (b.j_th - 20.0).abs() < 1e-3));
+
+        o.set_continuous(true);
+        o.publish(None);
+        assert!(read_status().continuous);
     }
 
     #[test]

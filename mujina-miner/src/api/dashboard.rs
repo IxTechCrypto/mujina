@@ -358,7 +358,7 @@ fn board_json(b: &BoardTelemetry, series: Vec<f64>) -> Value {
                 let chips: Vec<Value> = detail
                     .chips
                     .iter()
-                    .map(|c| json!({ "index": c.chip, "ghs": c.ghsspd, "temp_c": c.temp_c }))
+                    .map(|c| json!({ "index": c.chip, "ghs": c.ghsspd, "temp_c": c.temp_c, "spd_dh": c.spd_dh }))
                     .collect();
                 (
                     chips,

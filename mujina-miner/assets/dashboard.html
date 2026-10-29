@@ -137,22 +137,47 @@
     }
     .cfilterbtn.active { color: var(--cyan); border-color: var(--cyan); background: rgba(0,240,255,.1); }
 
-    .chipgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 6px; }
+    .chipgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(105px, 1fr)); gap: 8px; }
     .chiptile {
-      background: rgba(5,7,14,.8); border: 1px solid var(--line); border-radius: 4px; padding: 7px 9px;
+      background: rgba(10, 16, 28, 0.88); border: 1px solid rgba(0, 240, 255, 0.22); border-radius: 6px; padding: 8px 10px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
       position: relative; transition: .2s ease;
     }
-    .chiptile .ctname { font-size: 9px; color: var(--dim); letter-spacing: .1em; }
-    .chiptile .ctstat {
-      font-family: 'Orbitron', sans-serif; font-size: 11px; font-weight: 700; color: var(--cyan);
-      margin-top: 2px; font-variant-numeric: tabular-nums;
+    .chiptile .ctname {
+      color: #a5c7e0; font-family: 'Share Tech Mono', monospace; font-size: 11px; font-weight: bold;
+      display: flex; justify-content: space-between; align-items: center; letter-spacing: .05em;
     }
-    .chiptile .ctstat small { font-family: 'Share Tech Mono', monospace; font-size: 9px; color: var(--dim); font-weight: 400; }
-    .chiptile.weak { border-color: rgba(255,46,151,.6); background: rgba(255,46,151,.08); }
-    .chiptile.weak .ctstat { color: var(--mag); text-shadow: 0 0 6px rgba(255,46,151,.5); }
+    .chiptile .ctoffset {
+      background: rgba(255, 183, 3, 0.15); border: 1px solid rgba(255, 183, 3, 0.5);
+      color: #ffb703; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px;
+      font-family: 'Share Tech Mono', monospace; line-height: 1.1;
+    }
+    .chiptile .ctstat {
+      font-family: 'Share Tech Mono', monospace; font-size: 14px; font-weight: 700; color: #00f0ff;
+      margin-top: 4px; font-variant-numeric: tabular-nums;
+      text-shadow: 0 0 4px rgba(0, 240, 255, 0.35);
+      display: flex; align-items: baseline; gap: 3px;
+    }
+    .chiptile .ctstat small { font-family: 'Share Tech Mono', monospace; font-size: 10px; color: var(--dim); font-weight: 400; }
+    .chiptile .ctsub {
+      font-family: 'Share Tech Mono', monospace; font-size: 10px; color: var(--dim);
+      margin-top: 4px; display: flex; justify-content: space-between; align-items: center; min-height: 14px;
+    }
+    .chiptile .ctsub .cttemp { color: #a0aec0; }
+    .chiptile .ctsub .cttemp.t-hot { color: #ff3366; font-weight: bold; text-shadow: 0 0 4px rgba(255, 51, 102, 0.4); }
+    .chiptile .ctsub .cttemp.t-warm { color: #ffb703; }
+    .chiptile .ctsub .ctdh {
+      background: rgba(255, 46, 151, 0.15); border: 1px solid rgba(255, 46, 151, 0.55);
+      color: #ff2e97; font-size: 8.5px; font-weight: 700; padding: 0 4px; border-radius: 2px;
+      letter-spacing: .03em;
+    }
+    .chiptile.weak { border-color: rgba(255, 46, 151, 0.6); background: rgba(35, 12, 28, 0.88); }
+    .chiptile.weak .ctname { padding-right: 34px; }
+    .chiptile.weak .ctstat { color: var(--mag); text-shadow: 0 0 6px rgba(255, 46, 151, 0.5); }
     .chiptile.weak::after {
-      content: "LAZY"; position: absolute; right: 4px; top: 4px; font-size: 7px; color: var(--mag);
-      letter-spacing: .1em; border: 1px solid var(--mag); border-radius: 2px; padding: 1px 3px;
+      content: "LAZY"; position: absolute; right: 5px; top: 6px; font-size: 7px; color: var(--mag);
+      letter-spacing: .1em; border: 1px solid var(--mag); border-radius: 2px; padding: 1px 3px; line-height: 1;
+      pointer-events: none;
     }
 
     /* Auto-Tuner Live Terminal Console */
@@ -430,7 +455,7 @@
       .fvgroup { flex-direction: column; }
       .fvdiv { height: 1px; width: 100%; }
       .sheet { padding: 16px 16px 14px; }
-      .chipgrid { grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); }
+      .chipgrid { grid-template-columns: repeat(auto-fill, minmax(95px, 1fr)); gap: 6px; }
       .dual { flex-wrap: wrap; row-gap: 10px; }
       .dual .dcell { min-width: 90px; }
       .card .val { font-size: 18px; }
@@ -720,6 +745,24 @@
         0 2px 6px rgba(165, 175, 200, 0.08) !important;
       color: #2d3e50 !important;
     }
+    body.theme-minimal .chiptile .ctname {
+      color: #475569 !important;
+    }
+    body.theme-minimal .chiptile .ctoffset {
+      background: rgba(217, 119, 6, 0.15) !important;
+      border-color: rgba(217, 119, 6, 0.5) !important;
+      color: #b45309 !important;
+    }
+    body.theme-minimal .chiptile .ctstat {
+      color: #0284c7 !important;
+      text-shadow: none !important;
+    }
+    body.theme-minimal .chiptile .ctsub {
+      color: #64748b !important;
+    }
+    body.theme-minimal .chiptile .ctsub .cttemp {
+      color: #475569 !important;
+    }
     body.theme-minimal .chiptile.weak {
       background: rgba(255, 45, 85, 0.1) !important;
       border-color: rgba(255, 45, 85, 0.4) !important;
@@ -859,6 +902,39 @@
     body.theme-parasite .dot.on { background: #ffffff !important; box-shadow: none !important; animation: none !important; }
     body.theme-parasite .dot.off { background: #555555 !important; box-shadow: none !important; }
     body.theme-parasite .at-best-badge { color: #ffffff !important; }
+    body.theme-parasite .chiptile {
+      background: #000000 !important;
+      border: 2px solid #ffffff !important;
+      border-radius: 0 !important;
+    }
+    body.theme-parasite .chiptile .ctname {
+      color: #ffffff !important;
+    }
+    body.theme-parasite .chiptile .ctoffset {
+      background: #000000 !important;
+      border: 1px solid #ffffff !important;
+      color: #ffffff !important;
+      border-radius: 0 !important;
+    }
+    body.theme-parasite .chiptile .ctstat {
+      color: #ffffff !important;
+    }
+    body.theme-parasite .chiptile .ctsub {
+      color: #aaaaaa !important;
+    }
+    body.theme-parasite .chiptile .ctsub .cttemp {
+      color: #ffffff !important;
+    }
+    body.theme-parasite .chiptile .ctsub .ctdh {
+      background: #000000 !important;
+      border: 1px solid var(--mag) !important;
+      color: var(--mag) !important;
+      border-radius: 0 !important;
+    }
+    body.theme-parasite .chiptile.weak {
+      border: 2px solid var(--mag) !important;
+      background: #000000 !important;
+    }
 
     /* Unified dashboard additions */
     .modebadge { font-family: 'Orbitron', sans-serif; font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
@@ -983,6 +1059,11 @@
         </label>
       </div>
       <small style="color:var(--dim);display:block;margin-top:2px">Runs once the profile has locked; one chip at a time, ~7 min per step.</small>
+      <div class="row" style="margin-top:10px;flex-wrap:wrap">
+        <label for="ownContinuous" style="cursor:pointer">Continuous Tuning</label>
+        <input type="checkbox" id="ownContinuous">
+        <small style="color:var(--dim);display:block;margin-top:2px;flex-basis:100%">Dynamic Braiins-style autotuning: continuously probes upward when thermal/cooling headroom opens up.</small>
+      </div>
       <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
         <button class="btn pri wbtn" id="ownApply" type="button">Apply</button>
       </div>
@@ -1302,8 +1383,8 @@ function setMsg(id, text, ok) { const m = $(id); m.textContent = text; m.classNa
 
 let SYS = null;                 // last good /api/v0/system document
 let LAST = null, ACTIVE_NAME = null, CHIP_FILTER = 'all';
-let PAUSE_AVAILABLE = false, DETAIL_STATE = 0, PAUSED = false, CHIP_OFFSETS = [];
-let LAST_OWNER_STATUS = null, USER_EDITING_PER_CHIP = false;
+let PAUSE_AVAILABLE = false, DETAIL_STATE = 0, PAUSED = false, CHIP_OFFSETS = [], DETAIL_CACHE = null;
+let LAST_OWNER_STATUS = null, USER_EDITING_PER_CHIP = false, USER_EDITING_CONTINUOUS = false;
 let MOUSE_POS = { fleetChart: null, chart: null };
 let TICKS = 0;
 
@@ -1618,11 +1699,14 @@ function applyBoardCaps() {
   show('tunerCard', tuner);
   const pcElem = $('at-per-chip');
   const chk = $('ownPerChip');
+  const contChk = $('ownContinuous');
   if (!tuner) {
     if (pcElem) pcElem.textContent = '';
     if (chk) { chk.checked = false; chk.disabled = true; }
+    if (contChk) { contChk.checked = false; contChk.disabled = true; }
   } else {
     if (chk) chk.disabled = false;
+    if (contChk) contChk.disabled = false;
   }
   show('manualSection', manual);
   show('tuningNone', !!SYS && !tuner && !manual);
@@ -1739,20 +1823,54 @@ function renderChips(chips, perChip) {
   const grid = mk('div', 'chipgrid');
   list.forEach(c => {
     const ghs = c.ghs || 0;
-    const t = mk('div', 'chiptile' + (ghs < peak * 0.75 ? ' weak' : ''));
-    const nameRow = mk('div', 'ctname', 'ASIC ' + Number(c.index));
     const idx = Number(c.index);
+    const t = mk('div', 'chiptile' + (ghs < peak * 0.75 ? ' weak' : ''));
+
+    // Header row: ASIC label and offset badge on the right
+    const nameRow = mk('div', 'ctname');
+    nameRow.appendChild(mk('span', null, 'ASIC ' + idx));
+
     const rawOff = (activeOffsets && Number.isFinite(idx)) ? activeOffsets[idx] : 0;
     const off = Number.isFinite(+rawOff) ? Math.round(+rawOff) : 0;
     if (off !== 0) {
-      const badge = mk('span', 'badge', (off > 0 ? '+' : '') + off + ' MHz');
-      badge.style.cssText = 'margin-left:5px;font-size:8px;padding:1px 3px;';
+      const badge = mk('span', 'ctoffset', (off > 0 ? '+' : '') + off + ' MHz');
       nameRow.appendChild(badge);
     }
     t.appendChild(nameRow);
-    const st = mk('div', 'ctstat', (ghs / 1000).toFixed(2) + ' ');
+
+    // Primary Hashrate stat row
+    const st = mk('div', 'ctstat');
+    st.appendChild(document.createTextNode((ghs / 1000).toFixed(2) + ' '));
     st.appendChild(mk('small', null, 'TH/s'));
     t.appendChild(st);
+
+    // Detail lookup for temperature and SmartSpeed fail rate (DH)
+    let dChip = null;
+    if (DETAIL_CACHE && Array.isArray(DETAIL_CACHE.chips)) {
+      dChip = DETAIL_CACHE.chips.find(dc => Number(dc.chip) === idx || Number(dc.index) === idx) || DETAIL_CACHE.chips[idx];
+    }
+    const tempVal = (c.temp_c != null && Number.isFinite(+c.temp_c))
+      ? +c.temp_c
+      : (dChip && dChip.temp_c != null && Number.isFinite(+dChip.temp_c) ? +dChip.temp_c : null);
+    const dhVal = (c.spd_dh != null && Number.isFinite(+c.spd_dh))
+      ? +c.spd_dh
+      : (dChip && dChip.spd_dh != null && Number.isFinite(+dChip.spd_dh) ? +dChip.spd_dh : null);
+
+    // Secondary diagnostic row (live temp & DH warning)
+    const subRow = mk('div', 'ctsub');
+    if (tempVal != null) {
+      const tBand = tempVal >= 85 ? ' t-hot' : tempVal >= 70 ? ' t-warm' : '';
+      subRow.appendChild(mk('span', 'cttemp' + tBand, tempVal.toFixed(1) + '°C'));
+    } else {
+      subRow.appendChild(mk('span', 'cttemp', ''));
+    }
+
+    if (dhVal != null && dhVal > 5) {
+      const dhFormatted = (dhVal % 1 === 0 ? dhVal : dhVal.toFixed(1)) + '%';
+      subRow.appendChild(mk('span', 'ctdh', 'DH ' + dhFormatted));
+    }
+    t.appendChild(subRow);
+
     grid.appendChild(t);
   });
   root.appendChild(grid);
@@ -1985,6 +2103,7 @@ async function pollDetail() {
     const r = await fetch('/nano3s-detail');
     if (!r.ok) {
       DETAIL_STATE = -1;
+      DETAIL_CACHE = null;
       if (PAUSE_AVAILABLE) { PAUSE_AVAILABLE = false; applySystem(); }
       if (CHIP_OFFSETS.length > 0) {
         CHIP_OFFSETS = [];
@@ -1994,6 +2113,7 @@ async function pollDetail() {
     }
     const nd = await r.json();
     DETAIL_STATE = 1;
+    DETAIL_CACHE = nd;
     if (Array.isArray(nd.chip_offset_mhz)) {
       const changed = JSON.stringify(CHIP_OFFSETS) !== JSON.stringify(nd.chip_offset_mhz);
       CHIP_OFFSETS = nd.chip_offset_mhz;
@@ -2013,7 +2133,9 @@ async function pollDetail() {
         btn.style.color = PAUSED ? 'var(--amber)' : '';
       }
     }
-  } catch (e) { /* transient; try again next tick */ }
+  } catch (e) {
+    if (e instanceof SyntaxError) DETAIL_STATE = -1;
+  }
 }
 
 async function tick() {
@@ -2358,6 +2480,7 @@ function renderOwnerTune(o) {
   if (!OWN_SYNCED) {
     $('ownProfile').value = o.enabled ? (o.profile || 'off') : 'off';
     $('ownPerChip').checked = !!o.per_chip;
+    $('ownContinuous').checked = !!o.continuous;
     OWN_SYNCED = true;
   }
   const best = $('atbest'), list = $('atlist'), st = $('at-phase-label'), pcElem = $('at-per-chip');
@@ -2417,35 +2540,47 @@ async function applyOwner() {
   const sel = $('ownProfile'), v = sel.value, label = sel.options[sel.selectedIndex].textContent;
   const curProfile = (LAST_OWNER_STATUS && LAST_OWNER_STATUS.enabled) ? (LAST_OWNER_STATUS.profile || 'off') : 'off';
   const curPerChip = !!(LAST_OWNER_STATUS && LAST_OWNER_STATUS.per_chip);
+  const curContinuous = !!(LAST_OWNER_STATUS && LAST_OWNER_STATUS.continuous);
   const newPerChip = $('ownPerChip').checked;
+  const newContinuous = $('ownContinuous').checked;
   const tt = $('ownTemp').value;
 
   const profileChanged = (v !== curProfile);
   const tempChanged = (tt !== '');
   const perChipChanged = (newPerChip !== curPerChip);
+  const continuousChanged = (newContinuous !== curContinuous);
 
-  if (!profileChanged && !tempChanged && !perChipChanged) {
+  if (!profileChanged && !tempChanged && !perChipChanged && !continuousChanged) {
     setMsg('ownMsg', 'No changes to apply');
     return;
   }
 
-  // If ONLY per-chip changed and a profile is active, send ONLY { per_chip } to avoid resetting the profile search or fan target
-  if (!profileChanged && !tempChanged && perChipChanged) {
+  // If ONLY toggles (per-chip or continuous) changed and a profile is active, send ONLY toggles to avoid resetting the profile search or fan target
+  if (!profileChanged && !tempChanged && (perChipChanged || continuousChanged)) {
     if (!LAST_OWNER_STATUS || !LAST_OWNER_STATUS.enabled) {
       setMsg('ownMsg', 'turn on a profile first');
       return;
     }
-    const body = { per_chip: newPerChip };
+    const body = {};
+    if (perChipChanged) body.per_chip = newPerChip;
+    if (continuousChanged) body.continuous = newContinuous;
     setMsg('ownMsg', 'Sending…');
     lockWrites();
     try {
       await sendJson('PATCH', caps.tuner, body);
-      setMsg('ownMsg', 'Queued: per-chip ' + (newPerChip ? 'ON' : 'OFF') + ' (runs once the profile locks)', true);
+      const msgs = [];
+      if (continuousChanged) msgs.push('continuous ' + (newContinuous ? 'ON' : 'OFF'));
+      if (perChipChanged) msgs.push('per-chip ' + (newPerChip ? 'ON' : 'OFF'));
+      setMsg('ownMsg', 'Queued: ' + msgs.join(' · '), true);
       USER_EDITING_PER_CHIP = false;
+      USER_EDITING_CONTINUOUS = false;
       setTimeout(async () => {
         await pollOwnerTune();
         if (!USER_EDITING_PER_CHIP && LAST_OWNER_STATUS) {
           $('ownPerChip').checked = !!LAST_OWNER_STATUS.per_chip;
+        }
+        if (!USER_EDITING_CONTINUOUS && LAST_OWNER_STATUS) {
+          $('ownContinuous').checked = !!LAST_OWNER_STATUS.continuous;
         }
       }, 2500);
     } catch (e) { setMsg('ownMsg', 'Failed: ' + e.message); }
@@ -2456,14 +2591,22 @@ async function applyOwner() {
   if (!confirm(v === 'off' ? 'Turn the owner tuner OFF?' : 'Switch the owner tuner to ' + label + '? This replaces any power/temp target.')) return;
   const body = { profile: v === 'off' ? null : v };
   if (tt !== '') body.chip_temp_target_c = +tt;
-  if (v !== 'off') body.per_chip = newPerChip;
+  if (v !== 'off') {
+    body.per_chip = newPerChip;
+    body.continuous = newContinuous;
+  }
 
   setMsg('ownMsg', 'Sending…');
   lockWrites();
   try {
     await sendJson('PATCH', caps.tuner, body);
-    setMsg('ownMsg', 'Queued: ' + label + (newPerChip ? ' + per-chip' : '') + ' (applies within ~1 s)', true);
+    const extras = [];
+    if (newPerChip) extras.push('per-chip');
+    if (newContinuous) extras.push('continuous');
+    const extraTxt = extras.length ? ' + ' + extras.join(' + ') : '';
+    setMsg('ownMsg', 'Queued: ' + label + extraTxt + ' (applies within ~1 s)', true);
     USER_EDITING_PER_CHIP = false;
+    USER_EDITING_CONTINUOUS = false;
     setTimeout(pollOwnerTune, 2500);
   } catch (e) { setMsg('ownMsg', 'Failed: ' + e.message); }
 }
@@ -2472,6 +2615,9 @@ async function applyOwner() {
 function closeMenus() {
   document.querySelectorAll('.menusheet.show').forEach(m => m.classList.remove('show'));
   document.querySelectorAll('.menubtn.on').forEach(b => b.classList.remove('on'));
+  if (location.hash) {
+    try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
+  }
 }
 function openMenu(key) {
   const m = document.getElementById('menu-' + key);
@@ -2482,7 +2628,12 @@ function openMenu(key) {
   if (b) b.classList.add('on');
   if (key === 'power') loadPsuConfig();
 }
-function openFromHash() { if (location.hash === '#pool') openMenu('pool'); }
+function openFromHash() {
+  if (location.hash === '#pool') {
+    openMenu('pool');
+    try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
+  }
+}
 
 // ---- wiring ----
 document.querySelectorAll('.menubtn').forEach(b => b.addEventListener('click', () => openMenu(b.dataset.menu)));
@@ -2506,6 +2657,7 @@ $('poolSave').addEventListener('click', savePool);
 $('poolReboot').addEventListener('click', poolApplyNow);
 $('ownApply').addEventListener('click', applyOwner);
 $('ownPerChip').addEventListener('change', () => { USER_EDITING_PER_CHIP = true; });
+$('ownContinuous').addEventListener('change', () => { USER_EDITING_CONTINUOUS = true; });
 $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(b => {
   b.addEventListener('click', () => {
     $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(x => x.classList.remove('active'));
@@ -2526,7 +2678,7 @@ themeSel.addEventListener('change', () => {
 
 loadPool();
 applySystem();
-openFromHash();
+if (location.hash) { try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {} }
 tick(); setInterval(tick, 2000);
 setInterval(pollOwnerTune, 5000);
 </script>

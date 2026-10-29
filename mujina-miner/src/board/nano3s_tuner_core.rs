@@ -243,13 +243,14 @@ pub enum TuneProfile {
 }
 
 /// Hard limits and search bias for a profile.
-struct Caps {
-    temp_c: f32,
-    power_w: f32,
+pub struct Caps {
+    pub temp_c: f32,
+    pub power_w: f32,
     /// Seek higher clock (raising voltage if needed) vs. hold conservative.
-    seek_hash: bool,
+    pub seek_hash: bool,
     /// Trim voltage for efficiency while stable.
-    seek_efficiency: bool,
+    pub seek_efficiency: bool,
+    pub continuous: bool,
 }
 
 impl TuneProfile {
@@ -266,6 +267,7 @@ impl TuneProfile {
             power_w: limits.power_w,
             seek_hash,
             seek_efficiency,
+            continuous: false,
         }
     }
 }
@@ -318,6 +320,7 @@ impl TuneMode {
                 power_w: watts * env.target_power_headroom,
                 seek_hash: false,
                 seek_efficiency: false,
+                continuous: false,
             },
             TuneMode::Target(TuneTarget::Hashrate(_)) => Caps {
                 temp_c: env.target_temp_c,
@@ -326,6 +329,7 @@ impl TuneMode {
                 power_w: env.target_hashrate_power_w,
                 seek_hash: false,
                 seek_efficiency: false,
+                continuous: false,
             },
         }
     }
@@ -449,6 +453,7 @@ fn efficiency_j_th(power_w: f32, hashrate_ths: f32) -> Option<f32> {
 /// and `profile`) and the supervisor task (which calls [`Self::evaluate`]).
 pub struct AutoTuner {
     enabled: bool,
+    continuous: bool,
     mode: TuneMode,
     /// Board limits and timing; BM1370's unless the supervisor sets another.
     envelope: TuneEnvelope,
@@ -556,6 +561,7 @@ impl Default for AutoTuner {
     fn default() -> Self {
         Self {
             enabled: false,
+            continuous: false,
             mode: TuneMode::default(),
             envelope: TuneEnvelope::default(),
             chip_count: 1,
@@ -719,10 +725,21 @@ impl AutoTuner {
         self.log.back().map(|e| e.message.as_str())
     }
 
+    /// Set continuous dynamic tuning mode (Braiins OS DPS style).
+    pub fn set_continuous(&mut self, c: bool) {
+        self.continuous = c;
+    }
+
+    /// Whether continuous dynamic tuning mode is enabled.
+    pub fn continuous(&self) -> bool {
+        self.continuous
+    }
+
     /// Retrieve the safety caps for the current mode, scaled dynamically
     /// by the board's chip count.
     fn caps(&self) -> Caps {
         let mut caps = self.mode.caps(&self.envelope);
+        caps.continuous = self.continuous;
         // Scale profile caps and default hashrate target ceiling by chip count.
         // Power target mode is already board-wide and does not scale.
         if !matches!(self.mode, TuneMode::Target(TuneTarget::Power(_))) {
@@ -1225,6 +1242,23 @@ impl AutoTuner {
             );
             return Some(TuneAction::SetVoltage(best.core_voltage_mv));
         }
+        if self.continuous {
+            let has_continuous_headroom = m.asic_temp_c < caps.temp_c - 6.0
+                && m.power_w < caps.power_w - 4.0 - env.best_point_margin_w;
+            if has_continuous_headroom && m.frequency_mhz < env.max_freq_mhz {
+                self.probe_ceiling_mhz = env.max_freq_mhz + env.freq_step_mhz;
+                self.phase = TunePhase::Seeking;
+                self.log_event(
+                    format!(
+                        "continuous: headroom detected ({:.1}C, {:.1}W): probing upward",
+                        m.asic_temp_c, m.power_w
+                    ),
+                    m,
+                );
+                return Some(TuneAction::SetFrequency(m.frequency_mhz + env.freq_step_mhz));
+            }
+        }
+
         if self.phase != TunePhase::Locked {
             self.phase = TunePhase::Locked;
             self.log_event("converged: holding best known-good point", m);
@@ -1338,6 +1372,23 @@ impl AutoTuner {
         {
             self.log_event(format!("headroom: raising to {next:.0} MHz"), m);
             return Some(TuneAction::SetFrequency(next));
+        }
+
+        if self.continuous {
+            let has_continuous_headroom = m.asic_temp_c < caps.temp_c - 6.0
+                && m.power_w < caps.power_w - 4.0 - env.best_point_margin_w;
+            if has_continuous_headroom && m.frequency_mhz < env.max_freq_mhz {
+                self.probe_ceiling_mhz = env.max_freq_mhz + env.freq_step_mhz;
+                self.phase = TunePhase::Seeking;
+                self.log_event(
+                    format!(
+                        "continuous: headroom detected ({:.1}C, {:.1}W): probing upward",
+                        m.asic_temp_c, m.power_w
+                    ),
+                    m,
+                );
+                return Some(TuneAction::SetFrequency(m.frequency_mhz + env.freq_step_mhz));
+            }
         }
 
         if self.phase != TunePhase::Locked {
@@ -2421,5 +2472,38 @@ mod tests {
         let action = noisy(&mut t, 93.5, 5.0, 0.0, 3704, 4);
         assert_eq!(action, Some(TuneAction::SetFrequency(290.0)));
         assert!(t.best_point().is_none(), "first point at cap must not be recorded as best");
+    }
+
+    #[test]
+    fn continuous_tuning_re_enters_seeking_on_headroom() {
+        let mut t = AutoTuner::default();
+        t.enable_profile(TuneProfile::MaxHash);
+        let v = AUTO_VOLT_CEIL_MV;
+        // Reach convergence and lock at 525 MHz
+        let a1 = step_to_action(&mut t, &m(55.0, 14.0, 1.2, 525.0, v));
+        assert_eq!(a1, Some(TuneAction::SetFrequency(550.0)));
+        assert_eq!(step_to_action(&mut t, &m(56.0, 15.0, 1.2, 550.0, v)), None);
+        let a2 = step_to_action(&mut t, &m(56.0, 15.0, 1.2, 550.0, v));
+        assert_eq!(a2, Some(TuneAction::SetFrequency(525.0)));
+        // Re-confirmed best at 525; locked because 550 is probe ceiling
+        let a3 = step_to_action(&mut t, &m(55.0, 14.0, 1.2, 525.0, v));
+        assert_eq!(a3, None);
+        assert_eq!(t.phase, TunePhase::Locked);
+
+        // Without continuous mode, extra cooling (temp 50 C, power 12 W) still leaves it locked
+        let a4 = step_to_action(&mut t, &m(50.0, 12.0, 1.2, 525.0, v));
+        assert_eq!(a4, None);
+        assert_eq!(t.phase, TunePhase::Locked);
+
+        // Turn on continuous tuning
+        t.set_continuous(true);
+        assert!(t.continuous());
+
+        // With continuous mode and ample headroom (temp 50 C < 62 C, power 12 W < 18 W),
+        // it resets the probe ceiling, transitions to Seeking, and probes upward
+        let a5 = step_to_action(&mut t, &m(50.0, 12.0, 1.2, 525.0, v));
+        assert_eq!(a5, Some(TuneAction::SetFrequency(550.0)));
+        assert_eq!(t.phase, TunePhase::Seeking);
+        assert!(t.last_event().unwrap().contains("continuous: headroom detected"));
     }
 }
