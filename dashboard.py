@@ -353,6 +353,8 @@ def _extract_board(board, all_boards, miner_hashrate_hs, record):
             {
                 "index": c.get("index"),
                 "ghs": round((c.get("hashrate") or 0) / 1e9, 2),
+                "temp_c": c.get("temperature_c") or c.get("temp_c"),
+                "spd_dh": c.get("spd_dh"),
             }
             for t in (board.get("threads") or [])
             for c in (t.get("chips") or [])
@@ -567,8 +569,48 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/data"):
             self._send(200, json.dumps(read_state()).encode())
+        elif self.path.startswith("/api/v0/system"):
+            # Synthesize host-mode system document from connected miner state
+            state = read_state() or {}
+            boards = state.get("boards", [])
+            board_caps = []
+            for b in boards:
+                board_caps.append({
+                    "name": b.get("board_name") or "default",
+                    "model": b.get("model") or "Bitaxe / NerdQAxe",
+                    "chips": len(b.get("chips") or []),
+                    "caps": {
+                        "fan": "harness",
+                        "fan_curve": False,
+                        "manual_tuning": "/tuning",
+                        "temps": ["asic", "vr"]
+                    }
+                })
+            dev_model = "Windows Host"
+            if boards and boards[0].get("model"):
+                dev_model = f"Host ({boards[0]['model']})"
+            self._send(200, json.dumps({
+                "api": 1,
+                "mode": "host",
+                "platform": "windows-x86_64",
+                "device": {
+                    "model": dev_model,
+                    "can_reboot": False,
+                    "can_restart_miner": True
+                },
+                "firmware": {
+                    "name": "mujina-host",
+                    "version": "0.1.0"
+                },
+                "power": {
+                    "shared_rail": False
+                },
+                "boards": board_caps
+            }).encode())
         elif self.path.startswith("/minersettings"):
             self._send(200, json.dumps(fetch_settings() or {}).encode())
+        elif self.path.startswith("/nano3s-detail"):
+            self._send(404, json.dumps({"error": "nano3s-detail not available on host proxy"}).encode())
         elif self.path.startswith("/logs"):
             parsed = urllib.parse.urlparse(self.path)
             query = urllib.parse.parse_qs(parsed.query)
