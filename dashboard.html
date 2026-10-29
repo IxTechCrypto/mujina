@@ -1036,7 +1036,7 @@
       <div class="note" id="powerLine" style="display:none"></div>
       <div class="note" id="tuningNone" style="display:none">No tuning controls for this board.</div>
       <div id="ownSection" style="display:none">
-      <div class="modalsec" style="margin-top:12px">Owner Tuner (IxTech)</div>
+      <div class="modalsec" style="margin-top:12px">Auto Tuner</div>
       <div id="ownCur">tuner status loading&hellip;</div>
       <div class="row">
         <label for="ownProfile">Profile</label>
@@ -1064,7 +1064,7 @@
         <button class="btn pri wbtn" id="ownApply" type="button">Apply</button>
       </div>
       <div class="msg" id="ownMsg"></div>
-      <div class="note">Using any Live Tuning control below switches the owner tuner off.</div>
+      <div class="note">Using any Live Tuning control below switches the auto tuner off.</div>
       </div>
 
   <div id="manualSection" style="display:none">
@@ -2568,7 +2568,7 @@ async function applyOwner() {
   }
 
   // Profile or temp target changed: confirm and send combined directive
-  if (!confirm(v === 'off' ? 'Turn the owner tuner OFF?' : 'Switch the owner tuner to ' + label + '? This replaces any power/temp target.')) return;
+  if (!confirm(v === 'off' ? 'Turn the auto tuner OFF?' : 'Switch the auto tuner to ' + label + '? This replaces any power/temp target.')) return;
   const body = { profile: v === 'off' ? null : v };
   if (tt !== '') body.chip_temp_target_c = +tt;
   if (v !== 'off') {
