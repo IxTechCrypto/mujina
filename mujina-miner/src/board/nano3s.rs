@@ -1970,7 +1970,7 @@ impl LedEffect {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LedOverrideState {
     effect: LedEffect,
     color: (u8, u8, u8),
@@ -1978,16 +1978,97 @@ struct LedOverrideState {
     speed: u8,
 }
 
+impl Default for LedOverrideState {
+    fn default() -> Self {
+        Self {
+            effect: LedEffect::Auto,
+            color: (255, 0, 0),
+            brightness: 128,
+            speed: 128,
+        }
+    }
+}
+
+/// Non-volatile configuration path for status LED strip settings.
+/// Survives reboots, same pattern as [`PSU_CONF_PATH`] and [`TUNING_CONF_PATH`].
+const LED_CONF_PATH: &str = "/data/userconfig/led.conf";
+
+fn load_led_conf() -> LedOverrideState {
+    load_led_conf_from(std::path::Path::new(LED_CONF_PATH))
+}
+
+fn load_led_conf_from(path: &std::path::Path) -> LedOverrideState {
+    let mut state = LedOverrideState::default();
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return state;
+    };
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "effect" => {
+                if let Ok(eff) = LedEffect::parse(value) {
+                    state.effect = eff;
+                }
+            }
+            "color" => {
+                if let Ok(col) = parse_hex_color(value) {
+                    state.color = col;
+                }
+            }
+            "brightness" => {
+                if let Ok(b) = value.parse::<u8>() {
+                    state.brightness = b;
+                }
+            }
+            "speed" => {
+                if let Ok(s) = value.parse::<u8>() {
+                    state.speed = s;
+                }
+            }
+            _ => {}
+        }
+    }
+    state
+}
+
+fn write_led_conf(state: &LedOverrideState) {
+    write_led_conf_to(std::path::Path::new(LED_CONF_PATH), state);
+}
+
+fn write_led_conf_to(path: &std::path::Path, state: &LedOverrideState) {
+    let out = format!(
+        "effect={}\ncolor=#{:02x}{:02x}{:02x}\nbrightness={}\nspeed={}\n",
+        state.effect.as_str(),
+        state.color.0,
+        state.color.1,
+        state.color.2,
+        state.brightness,
+        state.speed
+    );
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp_path = format!("{}.tmp", path.display());
+    if let Err(e) = std::fs::write(&tmp_path, &out) {
+        eprintln!("[nano3s] failed to write {tmp_path}: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        eprintln!("[nano3s] failed to rename {tmp_path} to {}: {e}", path.display());
+    }
+}
+
 /// Global manual LED state, shared between the API handler (async, in the
-/// axum server task) and `run_worker()`'s own OS thread. Defaults to
-/// `Auto`/off-brightness-doesn't-matter until a `PATCH .../led` request
-/// sets something else.
-static LED_OVERRIDE: std::sync::Mutex<LedOverrideState> = std::sync::Mutex::new(LedOverrideState {
-    effect: LedEffect::Auto,
-    color: (255, 0, 0),
-    brightness: 128,
-    speed: 128,
-});
+/// axum server task) and `run_worker()`'s own OS thread. Initialized from
+/// [`LED_CONF_PATH`] (defaults to `Auto` if file is missing/unconfigured).
+static LED_OVERRIDE: std::sync::LazyLock<std::sync::Mutex<LedOverrideState>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(load_led_conf()));
 
 fn parse_hex_color(s: &str) -> Result<(u8, u8, u8), String> {
     let s = s.trim().trim_start_matches('#');
@@ -2002,7 +2083,7 @@ fn parse_hex_color(s: &str) -> Result<(u8, u8, u8), String> {
 /// required. See [`crate::api_client::types::BoardLedRequest`] for field
 /// semantics. Any argument left `None` keeps that field's current value.
 /// Returns an error string (for the handler to turn into a 400) on an
-/// unknown effect name or malformed color.
+/// unknown effect name or malformed color. Persists changes to [`LED_CONF_PATH`].
 pub(crate) fn write_led_command(effect: Option<String>, color: Option<String>, brightness: Option<u8>, speed: Option<u8>) -> Result<(), String> {
     let mut state = LED_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(e) = effect {
@@ -2017,6 +2098,7 @@ pub(crate) fn write_led_command(effect: Option<String>, color: Option<String>, b
     if let Some(s) = speed {
         state.speed = s;
     }
+    write_led_conf(&state);
     Ok(())
 }
 
@@ -3872,5 +3954,41 @@ mod tests {
         for i in 0..6 {
             assert_eq!(f6[i].0, 0, "Ahead LED {i} must be dark");
         }
+    }
+
+    #[test]
+    fn led_config_persistence_roundtrip() {
+        let tmp_dir = std::env::temp_dir().join(format!("nano3s_led_test_{}", std::process::id()));
+        let path = tmp_dir.join("led.conf");
+        let _ = std::fs::remove_file(&path);
+
+        // Missing file -> default state (Auto, #ff0000, 128, 128)
+        let def = load_led_conf_from(&path);
+        assert_eq!(def, LedOverrideState::default());
+
+        // Custom state
+        let custom = LedOverrideState {
+            effect: LedEffect::Scanner,
+            color: (0x12, 0x34, 0x56),
+            brightness: 200,
+            speed: 42,
+        };
+        write_led_conf_to(&path, &custom);
+
+        let loaded = load_led_conf_from(&path);
+        assert_eq!(loaded, custom);
+
+        // Corrupted / partial content ignores invalid lines and keeps defaults
+        let corrupt_path = tmp_dir.join("corrupt_led.conf");
+        std::fs::write(&corrupt_path, "effect=invalid_junk\ncolor=#bad\nbrightness=999\nspeed=77\n").unwrap();
+        let loaded_corrupt = load_led_conf_from(&corrupt_path);
+        assert_eq!(loaded_corrupt.effect, LedEffect::Auto);
+        assert_eq!(loaded_corrupt.color, (255, 0, 0));
+        assert_eq!(loaded_corrupt.brightness, 128); // 999 overflows u8
+        assert_eq!(loaded_corrupt.speed, 77);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&corrupt_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
     }
 }
