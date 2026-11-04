@@ -1033,6 +1033,7 @@
     <div class="sheet">
       <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
       <h2>Tuning</h2>
+      <div class="boardtabs" id="tuneBoardTabs" style="display:none;margin:10px 0 14px 0"></div>
       <div class="note" id="powerLine" style="display:none"></div>
       <div class="note" id="tuningNone" style="display:none">No tuning controls for this board.</div>
       <div id="ownSection" style="display:none">
@@ -1113,6 +1114,7 @@
     <div class="sheet">
       <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
       <h2>Fan</h2>
+      <div class="boardtabs" id="fanBoardTabs" style="display:none;margin:10px 0 14px 0"></div>
   <div id="fanSection" style="display:none">
   <!-- Fan Control -->
   <div class="sec">Fan Control<span class="sec-sub" id="fanNote"></span></div>
@@ -1795,7 +1797,13 @@ function setActive(name) {
   if (name === ACTIVE_NAME) return;
   ACTIVE_NAME = name;
   OWN_SYNCED = false;
+  TUNE_FOR = null;
+  setMsg('ownMsg', '');
+  setMsg('tuneMsg', '');
+  setMsg('fanMsg', '');
   if (LAST) render(LAST);
+  renderModalBoardTabs('tuneBoardTabs');
+  renderModalBoardTabs('fanBoardTabs');
   pollOwnerTune();
 }
 
@@ -1927,10 +1935,36 @@ function boardDot(b) {
   return 'ok';
 }
 
+function renderModalBoardTabs(elemId) {
+  const root = $(elemId);
+  if (!root) return;
+  const boards = (LAST && LAST.boards) ? LAST.boards : [];
+  if (boards.length < 2) {
+    show(root, false);
+    return;
+  }
+  show(root, true);
+  root.textContent = '';
+  boards.forEach((b, i) => {
+    const isAct = (b.board_name === activeName()), col = getBoardColor(b);
+    const tab = mk('div', 'btab' + (isAct ? ' active' : ''));
+    if (isAct) tab.style.cssText = 'border-color:' + col + ';box-shadow:0 0 12px ' + col + '33 inset';
+    tab.append(mk('span', 'tdot ' + boardDot(b)), document.createTextNode((b.board_name || ('board-' + (i + 1))).toUpperCase()));
+    tab.addEventListener('click', () => {
+      setActive(b.board_name);
+      renderModalBoardTabs('tuneBoardTabs');
+      renderModalBoardTabs('fanBoardTabs');
+    });
+    root.appendChild(tab);
+  });
+}
+
 function renderTabs(boards) {
   if (ACTIVE_NAME == null || !boards.some(b => b.board_name === ACTIVE_NAME)) {
     ACTIVE_NAME = boards.length ? boards[0].board_name : null;
   }
+  renderModalBoardTabs('tuneBoardTabs');
+  renderModalBoardTabs('fanBoardTabs');
   const root = $('boardTabs');
   root.textContent = '';
   if (boards.length < 2) return;
@@ -2183,6 +2217,7 @@ async function applyTuning() {
     body = { frequency_mhz: f, core_voltage_mv: volt };
     label = f + 'MHz @ ' + volt + 'mV';
   }
+  body.board_name = name;
   setMsg('tuneMsg', 'applying…');
   lockWrites();
   try {
@@ -2466,7 +2501,7 @@ function renderOwnerTune(o) {
     if (o.per_chip && o.per_chip.phase) ownTxt += ' · per-chip ' + o.per_chip.phase;
     if (o.fan_duty_percent != null) ownTxt += ' · fan ' + o.fan_duty_percent + '%';
     if (o.continuous_ceiling_w != null) ownTxt += ' · cap ' + (+o.continuous_ceiling_w).toFixed(0) + ' W';
-    const sp = pt(o.setpoint);
+    const sp = pt(o.setpoint) || (o.frequency_mhz != null ? { f: o.frequency_mhz, v: o.core_voltage_mv } : null);
     if (sp && sp.f != null) ownTxt += ' · set ' + Math.round(sp.f) + ' MHz' + (sp.v != null ? ' @ ' + sp.v + ' mV' : '');
   }
   $('ownCur').textContent = 'Current: ' + ownTxt;
@@ -2487,32 +2522,46 @@ function renderOwnerTune(o) {
       pcElem.style.display = '';
     }
   }
-  if (!o.enabled) { st.textContent = 'TUNER OFF'; best.textContent = 'tuner off'; list.textContent = 'tuner off'; if (pcElem) pcElem.textContent = 'Per-chip: off'; return; }
+  if (!o.enabled) {
+    if (st) st.textContent = 'TUNER OFF';
+    if (best) best.textContent = 'tuner off';
+    if (list) list.textContent = 'tuner off';
+    if (pcElem) pcElem.textContent = 'Per-chip: off';
+    return;
+  }
   const parts = [(o.profile || '?') + ' / ' + (o.phase || '?')];
   if (o.fan_duty_percent != null || o.fan_target_c != null) {
     parts.push('fan ' + (o.fan_duty_percent != null ? o.fan_duty_percent + '%' : '—') + ' → ' + (o.fan_target_c != null ? (+o.fan_target_c).toFixed(0) + '°C' : '—'));
   }
   if (o.averaging_progress) parts.push('avg ' + o.averaging_progress.ticks + '/' + o.averaging_progress.needed);
   if (o.continuous_ceiling_w != null) parts.push('cap ' + (+o.continuous_ceiling_w).toFixed(0) + ' W');
-  st.textContent = parts.join(' · ');
+  if (st) st.textContent = parts.join(' · ');
   const b = pt(o.best);
-  best.textContent = (b && b.f != null)
-    ? ('Best: ' + Math.round(b.f) + ' MHz' + (b.v != null ? ' @ ' + b.v + ' mV' : '') + (b.j != null ? ' · ' + (+b.j).toFixed(1) + ' J/TH' : ''))
-    : 'No calibration point established yet';
-  list.textContent = '';
-  const ev = (o.events || []).slice().reverse();
-  if (!ev.length) { list.textContent = 'Warming up…'; return; }
-  for (const e of ev) {
-    const row = mk('div', 'entry');
-    row.append(mk('b', null, e.t_secs_ago != null ? '[-' + fmtAgo(e.t_secs_ago) + ']' : '[log]'), ' ');
-    if (e.freq_mhz != null) row.append(mk('i', null, Math.round(e.freq_mhz) + 'MHz' + (e.voltage_mv != null ? '/' + e.voltage_mv + 'mV' : '')), ' ');
-    let msg = String(e.message == null ? '' : e.message);
-    const extra = [];
-    if (e.power_w != null) extra.push((+e.power_w).toFixed(0) + ' W');
-    if (e.hashrate_ths != null) extra.push((+e.hashrate_ths).toFixed(2) + ' TH/s');
-    if (extra.length) msg += ' (' + extra.join(', ') + ')';
-    row.append(mk('span', null, msg));
-    list.appendChild(row);
+  if (best) {
+    best.textContent = (b && b.f != null)
+      ? ('Best: ' + Math.round(b.f) + ' MHz' + (b.v != null ? ' @ ' + b.v + ' mV' : '') + (b.j != null ? ' · ' + (+b.j).toFixed(1) + ' J/TH' : ''))
+      : 'No calibration point established yet';
+  }
+  if (list) {
+    list.textContent = '';
+    const ev = (o.events || o.log || []).slice().reverse();
+    if (!ev.length) { list.textContent = 'Warming up…'; return; }
+    for (const e of ev) {
+      const row = mk('div', 'entry');
+      row.append(mk('b', null, e.t_secs_ago != null ? '[-' + fmtAgo(e.t_secs_ago) + ']' : '[log]'), ' ');
+      const fm = e.frequency_mhz != null ? e.frequency_mhz : e.freq_mhz;
+      const vm = e.core_voltage_mv != null ? e.core_voltage_mv : e.voltage_mv;
+      if (fm != null) row.append(mk('i', null, Math.round(fm) + 'MHz' + (vm != null ? '/' + vm + 'mV' : '')), ' ');
+      let msg = String(e.message == null ? '' : e.message);
+      const extra = [];
+      if (e.power_w != null) extra.push((+e.power_w).toFixed(0) + ' W');
+      if (e.hashrate_ths != null) extra.push((+e.hashrate_ths).toFixed(2) + ' TH/s');
+      if (e.efficiency_j_th != null) extra.push((+e.efficiency_j_th).toFixed(1) + ' J/TH');
+      if (e.asic_temp_c != null) extra.push((+e.asic_temp_c).toFixed(1) + '°C');
+      if (extra.length) msg += ' (' + extra.join(', ') + ')';
+      row.append(mk('span', null, msg));
+      list.appendChild(row);
+    }
   }
 }
 async function pollOwnerTune() {
@@ -2526,7 +2575,7 @@ async function pollOwnerTune() {
   } catch (e) { OWNER_ACTIVE = false; }
 }
 async function applyOwner() {
-  const caps = activeCaps();
+  const name = activeName(), caps = activeCaps();
   if (!caps || !safeUrl(caps.tuner)) { setMsg('ownMsg', 'tuner not available for this board'); return; }
   if (writeBusy('ownMsg')) return;
   const sel = $('ownProfile'), v = sel.value, label = sel.options[sel.selectedIndex].textContent;
@@ -2550,7 +2599,7 @@ async function applyOwner() {
       setMsg('ownMsg', 'turn on a profile first');
       return;
     }
-    const body = { continuous: newContinuous };
+    const body = { enabled: true, continuous: newContinuous, board_name: name };
     setMsg('ownMsg', 'Sending…');
     lockWrites();
     try {
@@ -2569,9 +2618,14 @@ async function applyOwner() {
 
   // Profile or temp target changed: confirm and send combined directive
   if (!confirm(v === 'off' ? 'Turn the auto tuner OFF?' : 'Switch the auto tuner to ' + label + '? This replaces any power/temp target.')) return;
-  const body = { profile: v === 'off' ? null : v };
+  const enabled = (v !== 'off');
+  const body = {
+    enabled: enabled,
+    profile: enabled ? v : null,
+    board_name: name
+  };
   if (tt !== '') body.chip_temp_target_c = +tt;
-  if (v !== 'off') {
+  if (enabled) {
     body.per_chip = true; // Profiles inherently include per-chip tuning
     body.continuous = newContinuous;
   }
@@ -2603,6 +2657,15 @@ function openMenu(key) {
   const b = document.querySelector('.menubtn[data-menu="' + key + '"]');
   if (b) b.classList.add('on');
   if (key === 'power') loadPsuConfig();
+  if (key === 'tuning') {
+    renderModalBoardTabs('tuneBoardTabs');
+    applyBoardCaps();
+    pollOwnerTune();
+  }
+  if (key === 'fan') {
+    renderModalBoardTabs('fanBoardTabs');
+    applyBoardCaps();
+  }
 }
 function openFromHash() {
   if (location.hash === '#pool') {

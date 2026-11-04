@@ -148,22 +148,42 @@ def patch_autotune(board, payload):
     if not board:
         return False, "no board connected"
     url = f"{API_ROOT}/boards/{urllib.parse.quote(board)}/autotune"
+
+    # Ensure required enabled flag for Rust API contract
+    enabled = payload.get("enabled")
+    if enabled is None:
+        prof = payload.get("profile")
+        enabled = (prof is not None and prof != "off")
+
+    clean_body = {"enabled": bool(enabled)}
+    prof = payload.get("profile")
+    if enabled and prof and prof != "off":
+        clean_body["profile"] = prof
+    if payload.get("target"):
+        clean_body["target"] = payload["target"]
+
     req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(), method="PATCH",
+        url, data=json.dumps(clean_body).encode(), method="PATCH",
         headers={"Content-Type": "application/json"},
     )
     try:
         with urllib.request.urlopen(req, timeout=8) as r:
             store = load_autotune_store()
             bstore = store.setdefault(board, {})
-            bstore["enabled"] = bool(payload.get("enabled"))
-            if payload.get("profile"):
-                bstore["profile"] = payload["profile"]
-            if payload.get("target"):
-                bstore["target"] = payload["target"]
+            bstore["enabled"] = bool(clean_body["enabled"])
+            if clean_body.get("profile"):
+                bstore["profile"] = clean_body["profile"]
+            if clean_body.get("target"):
+                bstore["target"] = clean_body["target"]
             bstore["updated_at"] = time.time()
             save_autotune_store(store)
             return True, r.status
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode(errors="replace").strip()
+        except Exception:
+            detail = ""
+        return False, detail or str(e)
     except Exception as e:
         return False, str(e)
 
@@ -575,14 +595,16 @@ class H(http.server.BaseHTTPRequestHandler):
             boards = state.get("boards", [])
             board_caps = []
             for b in boards:
+                b_name = b.get("board_name") or "default"
                 board_caps.append({
-                    "name": b.get("board_name") or "default",
+                    "name": b_name,
                     "model": b.get("model") or "Bitaxe / NerdQAxe",
                     "chips": len(b.get("chips") or []),
                     "caps": {
                         "fan": "harness",
                         "fan_curve": False,
-                        "manual_tuning": "/tuning",
+                        "manual_tuning": f"/api/v0/boards/{b_name}/tuning",
+                        "tuner": f"/api/v0/boards/{b_name}/autotune",
                         "temps": ["asic", "vr"]
                     }
                 })
@@ -607,6 +629,27 @@ class H(http.server.BaseHTTPRequestHandler):
                 },
                 "boards": board_caps
             }).encode())
+        elif "/autotune" in self.path:
+            board = None
+            if "/boards/" in self.path:
+                try:
+                    board = urllib.parse.unquote(self.path.split("/boards/")[1].split("/")[0])
+                except Exception:
+                    board = None
+            if not board:
+                parsed = urllib.parse.urlparse(self.path)
+                query = urllib.parse.parse_qs(parsed.query)
+                board = query.get("board", [None])[0]
+            if not board:
+                state = read_state() or {}
+                boards = state.get("boards", [])
+                if boards:
+                    board = boards[0].get("board_name")
+            data = fetch_autotune(board) if board else None
+            if data is not None:
+                self._send(200, json.dumps(data).encode())
+            else:
+                self._send(404, json.dumps({"error": f"autotune not found for board {board}"}).encode())
         elif self.path.startswith("/minersettings"):
             self._send(200, json.dumps(fetch_settings() or {}).encode())
         elif self.path.startswith("/nano3s-detail"):
@@ -640,11 +683,16 @@ class H(http.server.BaseHTTPRequestHandler):
         else:
             self._send(200, load_page_html().encode(), "text/html; charset=utf-8")
 
+    def do_PATCH(self):
+        self.do_POST()
+
     def do_POST(self):
-        if not (self.path.startswith("/settings") or self.path.startswith("/tuning")
-                or self.path.startswith("/autotune")
-                or self.path.startswith("/minersettings")
-                or self.path.startswith("/restart")):
+        clean_path = self.path.split("?")[0]
+        if not (clean_path.startswith("/settings") or clean_path.startswith("/tuning")
+                or clean_path.startswith("/autotune")
+                or clean_path.startswith("/minersettings")
+                or clean_path.startswith("/restart")
+                or clean_path.startswith("/api/v0/boards/")):
             self._send(404, b'{"ok":false}')
             return
         try:
@@ -654,7 +702,7 @@ class H(http.server.BaseHTTPRequestHandler):
             self._send(400, json.dumps({"ok": False, "reason": str(e)}).encode())
             return
 
-        if self.path.startswith("/restart"):
+        if clean_path.startswith("/restart"):
             ok, detail = restart_miner()
             self._send(200 if ok else 502,
                        json.dumps({"ok": ok, "detail": detail}).encode())
@@ -662,7 +710,7 @@ class H(http.server.BaseHTTPRequestHandler):
 
         # Miner-wide, so it names no board and is handled before the
         # board_name requirement below.
-        if self.path.startswith("/minersettings"):
+        if clean_path.startswith("/minersettings"):
             ok, detail = patch_settings(req)
             body = {"ok": ok}
             if ok:
@@ -672,33 +720,42 @@ class H(http.server.BaseHTTPRequestHandler):
             self._send(200 if ok else 502, json.dumps(body).encode())
             return
 
-        # The client always names the target board explicitly now that a
-        # daemon may report more than one -- there's no single implicit
-        # default to fall back to.
+        # Extract board name either from URL (/api/v0/boards/<name>/...) or from JSON body
         board = req.get("board_name")
+        action = None
+        if "/boards/" in clean_path:
+            parts = clean_path.split("/boards/")[1].split("/")
+            board = urllib.parse.unquote(parts[0])
+            if len(parts) > 1:
+                action = parts[1]
+
+        if not board:
+            state = read_state() or {}
+            boards = state.get("boards", [])
+            if len(boards) == 1:
+                board = boards[0].get("board_name")
+
         if not board:
             self._send(400, json.dumps({"ok": False, "reason": "board_name required"}).encode())
             return
 
-        if self.path.startswith("/autotune"):
-            payload = {"enabled": bool(req.get("enabled"))}
-            if req.get("target"):
-                payload["target"] = req["target"]
-            elif req.get("profile"):
-                payload["profile"] = req["profile"]
-            ok, detail = patch_autotune(board, payload)
-        elif self.path.startswith("/tuning"):
+        if action == "autotune" or clean_path.startswith("/autotune"):
+            ok, detail = patch_autotune(board, req)
+        elif action == "tuning" or clean_path.startswith("/tuning"):
             payload = {}
             for k in ("frequency_mhz", "core_voltage_mv"):
                 if req.get(k) is not None:
                     payload[k] = req[k]
             ok, detail = patch_tuning(board, payload)
-        else:
+        elif action == "fan" or clean_path.startswith("/settings"):
             payload = {"auto": bool(req.get("auto"))}
             for k in ("target_c", "min_percent", "percent"):
                 if req.get(k) is not None:
                     payload[k] = req[k]
             ok, detail = patch_fan(board, payload)
+        else:
+            self._send(404, b'{"ok":false,"reason":"unknown action"}')
+            return
 
         code = 200 if ok else 502
         self._send(code, json.dumps({"ok": ok, "detail": detail}).encode())
