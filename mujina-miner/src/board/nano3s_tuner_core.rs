@@ -259,7 +259,7 @@ impl TuneProfile {
         let (seek_hash, seek_efficiency) = match self {
             TuneProfile::Quiet => (false, false),
             TuneProfile::Efficient => (false, true),
-            TuneProfile::Balanced => (true, false),
+            TuneProfile::Balanced => (true, true),
             TuneProfile::MaxHash => (true, false),
         };
         Caps {
@@ -1134,17 +1134,19 @@ impl AutoTuner {
         let strictly_improved = !at_cap_candidate && match self.best {
             None => true,
             Some((_, best_hash, best_eff)) => {
-                if caps.seek_efficiency {
-                    // Multi-step envelopes also accept equal-hashrate power
-                    // savings: mean power down >= 1.5 % with mean hashrate
-                    // within -1 % (power is far less noisy than hashrate).
-                    let best_power = best_eff * best_hash;
-                    let power_win = env.trim_steps_per_judgement > 1
-                        && m.power_w <= best_power * (1.0 - POWER_SAVING_MARGIN)
-                        && hashrate >= best_hash * (1.0 - HASHRATE_EQUAL_TOLERANCE);
-                    power_win || efficiency < best_eff * (1.0 - IMPROVEMENT_MARGIN)
+                let best_power = best_eff * best_hash;
+                let power_win = env.trim_steps_per_judgement > 1
+                    && m.power_w <= best_power * (1.0 - POWER_SAVING_MARGIN)
+                    && hashrate >= best_hash * (1.0 - HASHRATE_EQUAL_TOLERANCE);
+                let eff_win = power_win || efficiency < best_eff * (1.0 - IMPROVEMENT_MARGIN);
+                let hash_win = hashrate > best_hash * (1.0 + IMPROVEMENT_MARGIN);
+
+                if caps.seek_hash && caps.seek_efficiency {
+                    hash_win || eff_win
+                } else if caps.seek_efficiency {
+                    eff_win
                 } else {
-                    hashrate > best_hash * (1.0 + IMPROVEMENT_MARGIN)
+                    hash_win
                 }
             }
         };
@@ -1352,6 +1354,29 @@ impl AutoTuner {
             .map(|k| env.voltage_down_n(current_v, k))
             .find(|t| *t >= env.min_voltage_mv && *t > self.probe_floor_mv)
             .unwrap_or_else(|| env.voltage_down(current_v));
+        if caps.seek_hash {
+            let power_margin = caps.power_w - m.power_w;
+            let temp_margin = caps.temp_c - m.asic_temp_c;
+            let step = if power_margin >= 15.0 && temp_margin >= 10.0 {
+                2.0 * env.freq_step_mhz
+            } else {
+                env.freq_step_mhz
+            };
+            let mut next = m.frequency_mhz + step;
+            if next >= self.probe_ceiling_mhz || next > env.max_freq_mhz {
+                next = m.frequency_mhz + env.freq_step_mhz;
+            }
+            let has_headroom = temp_margin > 3.0
+                && power_margin > (1.0 + env.best_point_margin_w);
+            if next <= env.max_freq_mhz
+                && next < self.probe_ceiling_mhz
+                && has_headroom
+            {
+                self.log_event(format!("headroom: raising to {next:.0} MHz"), m);
+                return Some(TuneAction::SetFrequency(next));
+            }
+        }
+
         if caps.seek_efficiency && trimmed >= env.min_voltage_mv && trimmed > self.probe_floor_mv {
             self.pending_trim_from_mv = Some(current_v);
             self.last_commanded_voltage_mv = Some(trimmed);
@@ -1360,18 +1385,6 @@ impl AutoTuner {
                 m,
             );
             return Some(TuneAction::SetVoltage(trimmed));
-        }
-
-        let next = m.frequency_mhz + env.freq_step_mhz;
-        let has_headroom = m.asic_temp_c < caps.temp_c - 3.0
-            && m.power_w < caps.power_w - 1.0 - env.best_point_margin_w;
-        if caps.seek_hash
-            && next <= env.max_freq_mhz
-            && next < self.probe_ceiling_mhz
-            && has_headroom
-        {
-            self.log_event(format!("headroom: raising to {next:.0} MHz"), m);
-            return Some(TuneAction::SetFrequency(next));
         }
 
         if self.continuous {
@@ -2505,5 +2518,40 @@ mod tests {
         assert_eq!(a5, Some(TuneAction::SetFrequency(550.0)));
         assert_eq!(t.phase, TunePhase::Seeking);
         assert!(t.last_event().unwrap().contains("continuous: headroom detected"));
+    }
+    #[test]
+    fn fast_climb_when_ample_headroom() {
+        let mut t = AutoTuner::default();
+        // Envelope with whole-board 112W cap
+        let mut env = t.envelope;
+        env.max_hash.power_w = 112.0;
+        env.max_hash.temp_c = 88.0;
+        env.freq_step_mhz = 10.0;
+        t.set_envelope(env);
+        t.enable_profile(TuneProfile::MaxHash);
+
+        // Power margin = 112 - 70 = 42W (> 15W), Temp margin = 88 - 60 = 28C (> 10C)
+        let a = step_to_action(&mut t, &m(60.0, 70.0, 3.5, 300.0, 3600));
+        // Climbs by 2 * 10 = 20 MHz to 320 MHz
+        assert_eq!(a, Some(TuneAction::SetFrequency(320.0)));
+
+        // Once close to cap (power margin = 112 - 100 = 12W < 15W), climbs single step (10 MHz)
+        let a2 = step_to_action(&mut t, &m(60.0, 100.0, 4.0, 320.0, 3600));
+        assert_eq!(a2, Some(TuneAction::SetFrequency(330.0)));
+    }
+
+    #[test]
+    fn balanced_climbs_then_undervolts_for_efficiency() {
+        let mut t = AutoTuner::default();
+        t.enable_profile(TuneProfile::Balanced);
+        // Initial point at 525 MHz / 1200 mV, cool (55C, 12W, 1.2 TH/s)
+        let a1 = step_to_action(&mut t, &m(55.0, 12.0, 1.2, 525.0, 1200));
+        // Headroom exists -> climbs to 550 MHz
+        assert_eq!(a1, Some(TuneAction::SetFrequency(550.0)));
+
+        // 550 MHz improves hashrate (1.3 TH/s), but sits close to the 15W cap (14.5W >= 15 - 1 = 14W)
+        let a2 = step_to_action(&mut t, &m(56.0, 14.5, 1.3, 550.0, 1200));
+        // Headroom for climbing is exhausted -> trims voltage to 1190 mV for efficiency!
+        assert_eq!(a2, Some(TuneAction::SetVoltage(1190)));
     }
 }

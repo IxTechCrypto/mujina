@@ -2,217 +2,59 @@
 
 Open-source Bitcoin mining firmware.
 
-## About This Fork
+## ⚡ IxTech Distribution — Repository Updates & Windows Bring-Up
 
-This is an enhanced distribution of [256foundation/mujina](https://github.com/256foundation/mujina)
-by **IxTech**, building upon the pioneering open-source port by **Aadhi
-([aadhi1014/nano-mujina](https://github.com/aadhi1014/nano-mujina))** for
-the **Canaan AvalonNano 3 / Nano 3S** (Kendryte K230 dual RV64GC SoC, 12x
-Canaan A3197S ASICs in series).
+This repository ([`IxTechCrypto/mujina`](https://github.com/IxTechCrypto/mujina)) is an active, production-hardened fork of [256foundation/mujina](https://github.com/256foundation/mujina) engineered for enterprise stability, native Windows USB CDC-ACM support, multi-chip ASIC bring-up, real-time fleet telemetry, and automated fan/frequency autotuning.
 
-On top of Aadhi's core reverse-engineering of the RTOS UART framing and
-K230 hardware registers, this fork introduces:
-- **Autonomous Per-Chip Tuning (`OwnerTune` & `ChipTuner`)**: Two-phase
-  dynamic tuning solving series voltage impedance shifts (verified
-  rock-solid at 5.37 TH/s @ 105.5W / 0.08% rejects).
-- **Power Delivery & Overclock Bypass**: Unlocking 50–140W VRM headroom
-  for high-current DC power mods (Mean Well 200W @ 28V DC via XT30).
-- **Stratum-Reactive WS2812 Lighting**: Real-time pool share pulse/wave
-  animations on the 9-LED strip, Cylon scanner, and stark holiday modes.
-- **Mobile-First Touch Web Interface**: Responsive fluid strip, Canaan-style
-  optgroup dropdowns, 44px tap targets, and dedicated `/led` controller.
-- **Static RV64GC Compilation Pipeline**: Fully static linking
-  (`+crt-static`) eliminating glibc loader traps on K230 Busybox.
+### 🚀 Major Improvements & Features in this Fork
 
-The stock Nano3s ships closed firmware on both cores. This fork
-replaces it end to end:
+* **🪟 Native Windows Transport & CDC-ACM Hardening**:
+  * **Custom Win32 Serial Driver (`src/transport/serial_windows.rs`)**: Complete native Windows `SerialStream` implementation utilizing Win32 overlapped asynchronous I/O and custom byte ringbuffers, eliminating external Unix serial dependencies.
+  * **0-Byte EOF Prevention**: Intercepts 0-byte `ReadFile` in `SerialReader::poll_read` on Windows to return `Poll::Pending` with waker re-poll instead of premature EOF, permanently resolving `Control stream closed` errors during board initialization.
+  * **COM Port Lifecycle Resiliency**: DTR/RTS auto-reset pulse handling, port settling delay, and COM handle preservation preventing USB disconnects.
+  * **Detached Console Protection**: Graceful handling of `tokio::signal::windows::ctrl_c` disconnections so the daemon stays continuously hashing in background/headless runs.
 
-- **[`rtos_core/`](rtos_core/)** -- a from-scratch big-core firmware
-  (`rtos_core.elf`) that replaces the stock RTOS: ASIC chain
-  enumeration and job/nonce framing over UART, PLL/voltage control, and
-  IPC to the Linux side. Also includes `mujina_test_harness.c`, a
-  Linux-side helper for power/fan control (real duty-based PWM control
-  on the board's fan channel, driven by a proportional+integral
-  controller against the chip's real thermal limits).
-- **[`mujina-miner/src/board/nano3s.rs`](mujina-miner/src/board/nano3s.rs)**
-  -- the board driver wiring this hardware into Mujina's normal
-  scheduler/job-source/API pipeline, same as any other supported board.
-- A [web dashboard](mujina-miner/assets/dashboard.html) (served by
-  `mujina-minerd` itself) with live telemetry, tuning, and fan control
-  specific to this board.
+* **⛏️ Multi-Chip Hardware Bring-Up & Fleet Expansion**:
+  * **NerdQAxe++ (BM1370 4-Chip Chain)**: Full board driver (`src/board/nerdqaxe_pp.rs`), multi-chip PLL and chain enumeration, TI TPS53647 multi-phase core buck regulator driver, and Microchip EMC2302 dual-fan controller over I2C/PMBus.
+  * **Bitaxe Gamma Multi-Device Fleet Support**: Concurrently run multiple Bitaxe Gammas (BM1370) on Windows over native USB CDC-ACM without port collisions or key clashes (~1.7+ TH/s verified aggregate).
+  * **Per-Chip Hashrate & Thermal Telemetry**: Reports individual chip frequencies, core voltages, and temperatures in JSON REST APIs.
 
-Everything here was built by independently reverse-engineering the
-device's real behavior -- device-tree GPIO/PWM mapping, the ASIC UART
-wire protocol, PLL/voltage calibration tables, real fan hardware
-characteristics.
+* **🧠 Advanced Auto-Tuning Supervisor & Intelligent Cooling**:
+  * **AxeOS-Style Fan Controller**: Closed-loop PI fan controller with EMA smoothing to eliminate acoustic oscillation while locking target ASIC junction temperatures.
+  * **Adaptive Autotuner (`src/autotune.rs`)**: Dynamic frequency and core voltage tuning engine with multiple operational profiles (`Efficiency`, `Balanced`, `Max Hash`, `Target Power/Hashrate`).
+  * **Chip-Count Scaled Power Capping**: Dynamic power cap calculations that scale by active ASIC count to prevent false trip-offs on multi-chip boards.
+  * **Profile Persistence**: State-saving to `mujina-autotune.json` with fallback mechanisms and delta updates.
 
-## Installing on Nano3s Hardware
+* **📊 Cyberpunk Fleet HUD & Real-Time Telemetry Dashboard**:
+  * **Interactive Web Interface**: Live responsive web dashboard (`dashboard.html` / `dashboard.py`) hosted on port 8088.
+  * **Sub-50ms Delta Updates**: Decoupled control modals submit only modified settings, eliminating board timeout errors.
+  * **Memory-Capped Log Viewer**: Real-time log streaming capped at 500 DOM elements to prevent browser lag during long runs.
+  * **Promoted Mining Logs**: Elevated share submission, pool acceptance, and pool difficulty updates to `INFO` level for transparent live monitoring.
 
-This installs custom firmware on both cores of a real device. Two
-ways to get there: flash a pre-built image (fastest, no build
-environment needed), or build from source and deploy over SSH
-(below, for development).
+* **🍓 Raspberry Pi 4 & Embedded Linux Deployment**:
+  * Complete headless deployment configuration for Raspberry Pi 4 (Debian aarch64) with native systemd service daemons (`mujina-miner`, `mujina-dashboard`).
+  * **Waveshare 2.13" V4 E-Paper HUD**: Live hardware status monitor (`scripts/waveshare_epaper_monitor.py`) displaying real-time hashrate, temperatures, pool latency, and network IP.
 
-### Quick Install: Flash a Pre-built Image
-
-Download **[nano-mujina-alpha-v3.kdimg](https://github.com/aadhi1014/nano-mujina/releases/download/alpha-v3/nano-mujina-alpha-v3.kdimg)**
-(123MB, see the [release notes](https://github.com/aadhi1014/nano-mujina/releases/tag/alpha-v3)
-for what's in it -- pool config page, outlet-temp display, a PLL
-temp-target throttle, a user-editable fan curve, and a network firmware
-updater) and burn it with the same official K230 Burning Tool
-Canaan's own [flashing instructions](https://github.com/Canaan-Creative/Avalon_Nano3s#3-imges-burning)
-use. Unlike the stock image, no WiFi credentials or other
-device-specific data are baked in -- the device boots straight into
-first-time BLE setup.
-
-1) **Get the burning tool**:
-
-   **Windows** -- [K230BurningTool-Windows-v2.1.0](https://kendryte-download.canaan-creative.com/k230/downloads/burn_tool/v2.1.0/K230BurningTool-Windows-v2.1.0-0-gd24909e.zip)
-   (unzip it, no install needed), a GUI tool.
-
-   **Linux / macOS** -- [`k230-flash`](https://github.com/kendryte/k230_flash_py),
-   the same vendor's official cross-platform CLI (and optional GUI):
-   ```bash
-   pip install k230-flash
-   ```
-   On Linux, add a udev rule first so it doesn't need `sudo`:
-   ```bash
-   echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="29f1", ATTRS{idProduct}=="0230", MODE="0666"' | sudo tee /etc/udev/rules.d/99-k230.rules
-   sudo udevadm control --reload-rules && sudo udevadm trigger
-   ```
-   On macOS it works out of the box (`brew install libusb` if you hit
-   permission errors). A GUI build (AppImage on Linux) is also on that
-   repo's [Releases](https://github.com/kendryte/k230_flash_py/releases)
-   page if you'd rather not use the CLI.
-
-2) **Open and select the image**:
-
-   **Windows** -- run `K230BurningTool.exe`, click Open, select
-   `nano-mujina-alpha-v3.kdimg`, set Image part name to "all", and set
-   Medium to "SPI NAND".
-   ![](https://raw.githubusercontent.com/Canaan-Creative/Avalon_Nano3s/master/docs/burn_tool_open.png)
-   ![](https://raw.githubusercontent.com/Canaan-Creative/Avalon_Nano3s/master/docs/burn_tool_select.png)
-
-   **Linux / macOS** -- put the device in burn mode first (step 3
-   below), then run:
-   ```bash
-   k230-flash -m SPI_NAND nano-mujina-alpha-v3.kdimg
-   ```
-   `k230-flash --list-devices` confirms it's detected before flashing,
-   if you want to check first.
-
-3) **Put the device in burn mode**: use a double type-A USB cable to
-   connect the Nano3s to your PC, hold the recessed button, then power
-   the device on while still holding it.
-   ![](https://raw.githubusercontent.com/Canaan-Creative/Avalon_Nano3s/master/docs/nano3s_pin_press.png)
-   On Windows, the tool's debug box on the right confirms burn mode
-   once it's detected.
-   ![](https://raw.githubusercontent.com/Canaan-Creative/Avalon_Nano3s/master/docs/burn_tool_debug_box_burn_mode.png)
-   On Linux/macOS, `k230-flash` (run just before this step, or already
-   running and waiting) detects it automatically -- no separate action
-   needed.
-
-4) **Start the flash and wait**: on Windows, click Start and wait a
-   few minutes until "Downloading Completed" appears.
-   ![](https://raw.githubusercontent.com/Canaan-Creative/Avalon_Nano3s/master/docs/burn_tool_start.png)
-   ![](https://raw.githubusercontent.com/Canaan-Creative/Avalon_Nano3s/master/docs/burn_tool_upgrade_completed.png)
-   On Linux/macOS, `k230-flash` starts writing as soon as it detects
-   the device (step 2 above) and shows its own progress bar -- nothing
-   further to click.
-
-5) **First boot**: the device comes up advertising over Bluetooth
-   (look for a name starting `nan3s_` in the official
-   [Avalon Family app](https://play.google.com/store/apps/details?id=com.canaan.avalon)
-   -- also on the [App Store](https://apps.apple.com/us/app/avalon-family/id6479229114)),
-   with the LCD showing a setup progress ring. Connect, enter your
-   WiFi network's SSID and password in the app, and the device joins
-   your network and starts mining -- the LCD tracks each step (waiting
-   for phone, credentials received, connecting, connected). No serial
-   console or SSH access needed.
-
-Burning-tool screenshots and the recovery-pin photo above are from
-Canaan's own [Avalon_Nano3s](https://github.com/Canaan-Creative/Avalon_Nano3s)
-repository, since it's literally the same official tool.
-
-#### Already Have a Working Device? Update Over the Network Instead
-
-If you've already flashed and set up a Nano3s, you don't need to
-re-burn the whole image for a software update. Download
-**[nano-mujina-alpha-v3-bundle.bin](https://github.com/aadhi1014/nano-mujina/releases/download/alpha-v3/nano-mujina-alpha-v3-bundle.bin)**
-and either upload it from the device's own dashboard (`/firmware`
-page), or:
-
-```bash
-curl -X POST --data-binary @nano-mujina-alpha-v3-bundle.bin \
-  -H "Content-Type: application/octet-stream" \
-  http://<device-ip>/api/v0/firmware/bundle
-```
-
-This updates both `mujina-minerd` and the fan/power harness in a
-single reboot and keeps everything else as-is -- WiFi, pool config,
-fan curve. No USB cable, no burning tool, no BLE re-setup.
-
-### Build From Source
-
-The rest of this section covers building both firmwares yourself and
-deploying over SSH -- useful for development, or if you want to modify
-the firmware before flashing.
-
-### 1. Get the cross-toolchains
-
-Two separate toolchains are needed, one per core:
-
-- **Big core (`rtos_core.elf`)**: a real musl RISC-V64 cross-compiler
-  (not glibc -- a glibc binary silently fails to start under RT-Smart's
-  `msh`). Get one from e.g. [musl.cc](https://musl.cc)'s
-  `riscv64-linux-musl` cross toolchain. Point `TOOLCHAIN_BIN` at its
-  `bin/` directory, or extract it to
-  `../toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/` next to
-  this repo (`rtos_core/build_wsl.sh`'s default).
-- **Little core (`mujina-minerd`)**: the `riscv64gc-unknown-linux-gnu`
-  Rust target (`rustup target add riscv64gc-unknown-linux-gnu`) plus a
-  `riscv64-linux-gnu-gcc` cross-compiler and a matching riscv64 sysroot
-  (for `libudev`/`libssl`) -- see `rtos_core/tools/build_mujina_minerd.sh`
-  for the exact `PKG_CONFIG_SYSROOT_DIR`/`PKG_CONFIG_PATH` it expects;
-  adjust the paths there to wherever your sysroot actually lives.
-
-The one vendor dependency `rtos_core.elf` links against
-(`libipcmsg_slave.a`, Canaan's IPC library) is fetched automatically by
-`build_wsl.sh` the first time you build -- see
-`rtos_core/tools/install_sdk.sh`.
-
-### 2. Build and deploy
-
-From WSL, with both toolchains on `PATH` (or their paths set via the
-env vars above), one command builds both firmwares and pushes the
-entire stack to the device over SSH:
-
-```bash
-DEVICE_IP=192.168.1.x bash rtos_core/tools/build_and_deploy_all.sh
-```
-
-This chains three independently-runnable scripts, if you'd rather run
-them one at a time or re-run just one after a small change:
-
-```bash
-bash rtos_core/build_wsl.sh                              # builds rtos_core.elf
-bash rtos_core/tools/build_mujina_minerd.sh               # builds mujina-minerd
-DEVICE_IP=192.168.1.x bash rtos_core/tools/deploy_stock_to_nano3s.sh  # pushes everything, reboots
-```
-
-`deploy_stock_to_nano3s.sh` only runs against a device still on stock
-firmware (it checks the target's `/etc/init.d/rcS` first and refuses if
-it looks already-migrated), and it backs up the device's original
-`rcS` and `mm_miner` binary, timestamped, before changing anything --
-see the script for exact paths if you ever need to revert.
-
-### 3. Verify
-
-Once the device reboots, the dashboard is served on port 80:
-
-```
-http://192.168.1.x/
-```
+* **⚡ Canaan AvalonNano 3 / Nano 3S Support (Building on Aadhi's Foundation)**:
+  * **Lineage & Upstream Attribution**: Built on top of the pioneering reverse-engineering work by **Aadhi ([`aadhi1014/nano-mujina`](https://github.com/aadhi1014/nano-mujina))**, who mapped the Canaan Kendryte K230 dual-core RISC-V SoC (Big-Core RTOS `rtos_core.elf` + Little-Core Linux `mujina-minerd`), ASIC UART protocol framing, and IOMUX/PWM device tree registers.
+  * **Autonomous Per-Chip Tuning (`OwnerTune` & `ChipTuner`)**: Engineered for the 12x Canaan A3197S series voltage stack. Features a two-phase optimization loop (global frequency/voltage convergence before hunting individual chip offsets) to prevent series rail dynamic impedance imbalances. Confirmed in a 6-hour soak benchmark at **5.37 TH/s @ 105.5W** (338 MHz @ 3652 mV, 0.08% reject rate), matching/exceeding stock Canaan Medium mode efficiency.
+  * **Power Supply Overclock Bypass**: Decoupled consumer wall adapter 80% continuous USB-PD derating (112.0W safe default) from absolute board VRM capability (140W max). Enables high-power DC supplies (e.g. Mean Well 200W @ 28V DC via XT30 harness splice + push-pull 80mm cooling) while strictly preserving thermal (85°C/90°C) and VRM backstops.
+  * **Stratum-Reactive WS2812 LED Telemetry**: 9-pixel front addressable LED strip integrated directly with stratum share events:
+    * **Share Pulse**: Strobes Bitcoin Orange (`#F7931A`) across all 9 LEDs on valid share submission with smooth geometric decay to an 8% resting ambient glow.
+    * **Share Wave**: Center-outward ripple radiating symmetrically from physical center LED 4 to edges on pool submit.
+    * **Cylon / K.I.T.T. Scanner**: Larson scanner beam with decaying phosphor trail.
+    * **Stark Holiday Modes**: Calibrated 100% saturated primary subpixel palettes for Christmas (`#FF0000` Crimson Red & `#00FF00` Emerald Green), Halloween (`#FF3C00` Pumpkin Orange, `#00FF00` Slime Green, `#AA00FF` Witch Purple), and 4th of July.
+  * **Mobile-First Touch Web Interface**: Dedicated `/led` control surface and dashboard integration with fluid 9-LED responsive preview (`clamp()`), Canaan-style categorized `<select>` dropdown, 2-column mobile button cards, 44px touch targets, and centered menubar buttons across mobile and desktop.
+  * **Hardened RISC-V Toolchain & Static Linking**: Compiled strictly for RV64GC (0 illegal vector / Zb instructions) with `-C target-feature=+crt-static` to eliminate glibc dynamic loader dependencies on the K230 Busybox userland, with single-package bundle deployment (`pack_firmware_bundle.py`).
+* **🧠 Auto-Tuning Optimization & Open-Source Community Lineage**:
+  * **Dual-Axis Pareto Search**: The upgraded autotuning engine eliminates single-axis frequency lock-in by tracking both hashrate throughput and joules-per-terahash ($\text{J/TH}$) efficiency on every search cycle. When frequency headroom narrows near thermal or power thresholds, the engine pivots dynamically to deep core-voltage trims.
+  * **Fast Headroom Acceleration**: Implemented adaptive frequency step scaling ($\Delta f = 2 \times f_{\text{step}}$) when large thermal ($\Delta T \ge 10^\circ\text{C}$) and electrical ($\Delta W \ge 15\text{W}$) margins exist, cutting convergence time to optimal setpoints by over 50%.
+  * **Ecosystem Attributions & Inspiration**: Our autotuning algorithms, thermal feedback loops, and frequency exploration methodology were heavily shaped by and build upon the groundbreaking work of the open-source mining firmware community:
+    * [`kha1n3vol3/BitaxePID`](https://github.com/kha1n3vol3/BitaxePID): Closed-loop proportional-integral-derivative thermal regulation and fan tracking.
+    * [`terminally-challenged/bitaxe-gamma-oc-script`](https://github.com/terminally-challenged/bitaxe-gamma-oc-script): Automated voltage/frequency boundary stepping and stability cliff recovery heuristics.
+    * [`andelorean/bitaxe_frequency_sweeper`](https://github.com/andelorean/bitaxe_frequency_sweeper): Discrete frequency sweep algorithms and power-target envelope hunting.
+    * [`WillItMod/AxeBench-Release`](https://github.com/WillItMod/AxeBench-Release): Standardized benchmarking methodologies and empirical J/TH efficiency validation.
+    * [`WhiteyCookie/Bitaxe-Temperature-Control`](https://github.com/WhiteyCookie/Bitaxe-Temperature-Control): Dual-sensor thermal guardrails and junction-to-ambient backstop thresholds.
 
 ## Why Mujina
 
@@ -300,6 +142,15 @@ toolchain. A build failure on `openssl-sys` usually means the build
 can't find openssl; see the
 [openssl crate's macOS notes](https://docs.rs/openssl/latest/openssl/#automatic)
 for the supported installation and environment options.
+
+### Windows
+
+Windows is fully supported.
+
+- **Pre-built binary (No compilation required)**: Download or locate `mujina-minerd.exe` in the repository root and run `.\start-all.ps1` in PowerShell to launch both the miner daemon and web dashboard. No Rust toolchain or Visual Studio setup is required.
+- **Building from source**: Install the [Rust toolchain](https://rustup.rs) via `rustup-init.exe` (`x86_64-pc-windows-msvc`) and **Build Tools for Visual Studio** (with the "Desktop development with C++" workload). Python 3 is required for the web dashboard.
+
+See the detailed [Windows Setup Guide](docs/windows-setup.md) for full COM port drivers, gotchas, pre-built launcher usage, and PowerShell scripts.
 
 ## Building
 
@@ -431,6 +282,10 @@ GitHub.
   component interaction
 - [REST API](docs/api.md): endpoints, conventions, and OpenAPI spec
 - [CPU Mining](docs/cpu-mining.md): the CPU backend in detail
+- [Windows Setup Guide](docs/windows-setup.md): Windows build instructions,
+  COM port drivers, gotchas, and PowerShell scripts
+- [Raspberry Pi Setup Guide](docs/raspberry-pi-setup.md): Raspberry Pi
+  deployment, systemd auto-start, and Waveshare e-paper setup
 - [Container Image](docs/container.md): build and run Mujina as a
   container
 
@@ -446,8 +301,6 @@ GitHub.
 
 - [Bitaxe Gamma Board Guide](mujina-miner/src/board/bitaxe_gamma.md):
   board hardware, firmware flashing, and Mujina integration
-- [Nano3s Hardware Register Reference](docs/nano3s-registers.md):
-  GPIO/IOMUX/PWM/I2C register map, independently reverse-engineered
 
 ### Contributor reference
 

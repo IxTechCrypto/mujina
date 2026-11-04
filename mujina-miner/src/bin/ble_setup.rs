@@ -274,13 +274,14 @@ fn main() {
     // effect more simply by never starting it in the first place once
     // already connected, rechecked every 60s via the sleep+exit below.
     let force_advertise = std::env::var("BLE_SETUP_FORCE_ADVERTISE").as_deref() == Ok("1");
+    let is_live = std::path::Path::new("/tmp/nano3s_live.txt").exists();
     if let Some(ip) = ifconfig_wlan0_ip() {
-        if force_advertise {
-            eprintln!("step: wlan0 connected (ip={ip}) but BLE_SETUP_FORCE_ADVERTISE=1, advertising anyway");
-        } else {
-            eprintln!("step: wlan0 already connected (ip={ip}), not advertising; idling before recheck");
+        if is_live && !force_advertise {
+            eprintln!("step: wlan0 connected (ip={ip}) and miner live, not advertising; idling before recheck");
             std::thread::sleep(std::time::Duration::from_secs(60));
             return;
+        } else {
+            eprintln!("step: wlan0 connected (ip={ip}) but miner not live (/tmp/nano3s_live.txt missing) or forced; continuing BLE advertising");
         }
     }
 
@@ -692,10 +693,126 @@ fn dispatch_command(cmd: &[u8], state: &Arc<Mutex<GattState>>) {
     }
 }
 
+struct WifiScanEntry {
+    ssid: String,
+    auth: i32,
+    rssi: i32,
+}
+
+fn parse_iwlist_scan(text: &str) -> Vec<String> {
+    let mut entries: Vec<WifiScanEntry> = Vec::new();
+    let mut cur_ssid: Option<String> = None;
+    let mut cur_rssi: i32 = -100;
+    let mut cur_has_wpa2 = false;
+    let mut cur_has_wpa = false;
+
+    let flush_cell = |entries: &mut Vec<WifiScanEntry>,
+                          ssid: &mut Option<String>,
+                          rssi: &mut i32,
+                          has_wpa2: &mut bool,
+                          has_wpa: &mut bool| {
+        if let Some(s) = ssid.take() {
+            if !s.is_empty() && s != "\\x00" {
+                let auth = if *has_wpa2 {
+                    7
+                } else if *has_wpa {
+                    5
+                } else {
+                    1
+                };
+                if let Some(existing) = entries.iter_mut().find(|e| e.ssid == s) {
+                    if *rssi > existing.rssi {
+                        existing.rssi = *rssi;
+                        existing.auth = auth;
+                    }
+                } else {
+                    entries.push(WifiScanEntry {
+                        ssid: s,
+                        auth,
+                        rssi: *rssi,
+                    });
+                }
+            }
+        }
+        *rssi = -100;
+        *has_wpa2 = false;
+        *has_wpa = false;
+    };
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Cell ") {
+            flush_cell(&mut entries, &mut cur_ssid, &mut cur_rssi, &mut cur_has_wpa2, &mut cur_has_wpa);
+        }
+
+        if let Some(idx) = trimmed.find("ESSID:\"") {
+            let after = &trimmed[idx + 7..];
+            if let Some(end) = after.rfind('"') {
+                cur_ssid = Some(after[..end].to_string());
+            }
+        }
+
+        if trimmed.contains("Signal level") {
+            if let Some(pos) = trimmed.find("Signal level") {
+                let sub = &trimmed[pos + 12..];
+                let s = sub.trim_start_matches(|c| c == '=' || c == ':' || c == ' ');
+                if let Some(token) = s.split_whitespace().next() {
+                    let cleaned = token.trim_end_matches("dBm").trim_end_matches("dbm");
+                    if let Ok(val) = cleaned.parse::<i32>() {
+                        cur_rssi = val;
+                    } else if let Some((num, den)) = cleaned.split_once('/') {
+                        if let (Ok(n), Ok(d)) = (num.parse::<f32>(), den.parse::<f32>()) {
+                            if d > 0.0 {
+                                cur_rssi = (-100.0 + (n / d) * 70.0).round() as i32;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if cur_rssi == -100 && trimmed.contains("Quality") {
+            if let Some(pos) = trimmed.find("Quality") {
+                let sub = &trimmed[pos + 7..];
+                let s = sub.trim_start_matches(|c| c == '=' || c == ':' || c == ' ');
+                if let Some(token) = s.split_whitespace().next() {
+                    if let Some((num, den)) = token.split_once('/') {
+                        if let (Ok(n), Ok(d)) = (num.parse::<f32>(), den.parse::<f32>()) {
+                            if d > 0.0 {
+                                cur_rssi = (-100.0 + (n / d) * 70.0).round() as i32;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if trimmed.contains("WPA2") || trimmed.contains("802.11i") {
+            cur_has_wpa2 = true;
+        } else if trimmed.contains("WPA") {
+            cur_has_wpa = true;
+        }
+    }
+
+    flush_cell(&mut entries, &mut cur_ssid, &mut cur_rssi, &mut cur_has_wpa2, &mut cur_has_wpa);
+
+    entries.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+
+    entries
+        .into_iter()
+        .map(|e| format!("{},{},{}", hex::encode(e.ssid), e.auth, e.rssi))
+        .collect()
+}
+
 fn run_wifi_scan(state: &Arc<Mutex<GattState>>) {
+    // Ensure control interface directory exists for wpa_supplicant / wpa_cli
+    let _ = std::fs::create_dir_all("/var/run/wpa_supplicant");
+    let _ = std::process::Command::new("mkdir").args(["-p", "/var/run/wpa_supplicant"]).status();
+
+    // Ensure wlan0 is UP before scanning (matching Canaan stock mm_miner: `ifconfig %s 0.0.0.0 up`)
+    let _ = std::process::Command::new("ifconfig").args(["wlan0", "0.0.0.0", "up"]).status();
+    let _ = std::process::Command::new("ifconfig").args(["wlan0", "up"]).status();
+
     // wpa_supplicant is already managing wlan0 (STA mode); ask it to
-    // trigger a scan and read cached results back, rather than fighting
-    // it for the interface with a separate iwlist/iw call.
+    // trigger a scan and read cached results back.
     let _ = std::process::Command::new("wpa_cli").args(["-i", "wlan0", "scan"]).status();
     std::thread::sleep(std::time::Duration::from_secs(3));
     let out = std::process::Command::new("wpa_cli").args(["-i", "wlan0", "scan_results"]).output();
@@ -721,11 +838,31 @@ fn run_wifi_scan(state: &Arc<Mutex<GattState>>) {
             } else {
                 1
             };
-            entries.push(format!("{},{},{}", hex::encode(ssid), auth, rssi));
+            entries.push((ssid.to_string(), auth, rssi));
         }
     }
-    let count = entries.len();
-    state.lock().unwrap_or_else(|e| e.into_inner()).ffe1_value = entries.join(",").into_bytes();
+
+    let result_entries: Vec<String> = if !entries.is_empty() {
+        // Sort by RSSI descending so strongest networks appear first
+        entries.sort_by(|a, b| b.2.cmp(&a.2));
+        entries
+            .into_iter()
+            .map(|(ssid, auth, rssi)| format!("{},{},{}", hex::encode(ssid), auth, rssi))
+            .collect()
+    } else {
+        // Fallback: If wpa_cli returned 0 entries (e.g. wpa_supplicant not ready or empty cache),
+        // parse iwlist wlan0 scan directly.
+        eprintln!("step: wpa_cli scan returned 0 entries, attempting iwlist wlan0 scan fallback");
+        if let Ok(iw_out) = std::process::Command::new("iwlist").args(["wlan0", "scan"]).output() {
+            let text = String::from_utf8_lossy(&iw_out.stdout);
+            parse_iwlist_scan(&text)
+        } else {
+            Vec::new()
+        }
+    };
+
+    let count = result_entries.len();
+    state.lock().unwrap_or_else(|e| e.into_inner()).ffe1_value = result_entries.join(",").into_bytes();
     eprintln!("step: scan complete, {count} networks");
 }
 
@@ -743,7 +880,18 @@ fn apply_wifi_credentials(ssid: &str, password: &str, auth: i32, state: &Arc<Mut
     match std::fs::write("/data/userconfig/wpa_supplicant.conf", &conf) {
         Ok(()) => {
             eprintln!("step: wrote /data/userconfig/wpa_supplicant.conf, restarting wpa_supplicant");
-            let _ = std::process::Command::new("wpa_cli").args(["-i", "wlan0", "reconfigure"]).status();
+            let rc = std::process::Command::new("wpa_cli").args(["-i", "wlan0", "reconfigure"]).status();
+            let need_start = match rc {
+                Ok(status) => !status.success(),
+                Err(_) => true,
+            };
+            if need_start {
+                eprintln!("step: wpa_cli reconfigure failed, starting wpa_supplicant daemon");
+                let _ = std::process::Command::new("killall").args(["-9", "wpa_supplicant"]).status();
+                let _ = std::process::Command::new("wpa_supplicant")
+                    .args(["-B", "-D", "nl80211", "-i", "wlan0", "-c", "/data/userconfig/wpa_supplicant.conf"])
+                    .status();
+            }
             set_status(state, ssid, auth, 1, None);
             write_wifi_status("connecting", ssid);
             poll_connection_result(state, ssid, auth);
@@ -776,6 +924,7 @@ fn poll_connection_result(state: &Arc<Mutex<GattState>>, ssid: &str, auth: i32) 
     // against however short that window actually is, without changing
     // anything about how fast wpa_supplicant itself can reassociate.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut dhcp_requested = false;
     while std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(300));
         let wpa_state = std::process::Command::new("wpa_cli")
@@ -793,6 +942,13 @@ fn poll_connection_result(state: &Arc<Mutex<GattState>>, ssid: &str, auth: i32) 
                 write_wifi_status("connected", &ip);
                 set_display_page("nano3s");
                 return;
+            } else if !dhcp_requested {
+                eprintln!("step: wifi associated (wpa_state=COMPLETED), requesting DHCP lease via udhcpc");
+                let _ = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg("killall -9 udhcpc 2>/dev/null; udhcpc -i wlan0 -b -p /var/run/udhcpc.wlan0.pid &")
+                    .status();
+                dhcp_requested = true;
             }
         }
     }
@@ -945,5 +1101,42 @@ fn event_loop(fd: i32, device_name: &str) {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_iwlist_scan() {
+        let sample = r#"
+wlan0     Scan completed :
+          Cell 01 - Address: 00:11:22:33:44:55
+                    Channel:1
+                    Frequency:2.412 GHz (Channel 1)
+                    Quality=70/70  Signal level=-40 dBm  
+                    Encryption key:on
+                    ESSID:"TestNet_5G"
+                    IE: IEEE 802.11i/WPA2 Version 1
+          Cell 02 - Address: 00:11:22:33:44:56
+                    Channel:6
+                    Frequency:2.437 GHz (Channel 6)
+                    Quality=50/70  Signal level=-65 dBm  
+                    Encryption key:on
+                    ESSID:"TestNet_WPA"
+                    IE: WPA Version 1
+          Cell 03 - Address: 00:11:22:33:44:57
+                    Channel:11
+                    Frequency:2.462 GHz (Channel 11)
+                    Quality=40/70  Signal level=-75 dBm  
+                    Encryption key:off
+                    ESSID:"OpenNet"
+"#;
+        let res = parse_iwlist_scan(sample);
+        assert_eq!(res.len(), 3);
+        assert_eq!(res[0], format!("{},7,-40", hex::encode("TestNet_5G")));
+        assert_eq!(res[1], format!("{},5,-65", hex::encode("TestNet_WPA")));
+        assert_eq!(res[2], format!("{},1,-75", hex::encode("OpenNet")));
     }
 }
