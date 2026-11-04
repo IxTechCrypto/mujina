@@ -11,3 +11,6 @@ mujina-autotune.json
 mujina-settings.json
 *.visual-check.*
 
+brag-output/
+.archify/
+*.finalize*.json

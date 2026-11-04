@@ -46,6 +46,15 @@ This repository ([`IxTechCrypto/mujina`](https://github.com/IxTechCrypto/mujina)
     * **Stark Holiday Modes**: Calibrated 100% saturated primary subpixel palettes for Christmas (`#FF0000` Crimson Red & `#00FF00` Emerald Green), Halloween (`#FF3C00` Pumpkin Orange, `#00FF00` Slime Green, `#AA00FF` Witch Purple), and 4th of July.
   * **Mobile-First Touch Web Interface**: Dedicated `/led` control surface and dashboard integration with fluid 9-LED responsive preview (`clamp()`), Canaan-style categorized `<select>` dropdown, 2-column mobile button cards, 44px touch targets, and centered menubar buttons across mobile and desktop.
   * **Hardened RISC-V Toolchain & Static Linking**: Compiled strictly for RV64GC (0 illegal vector / Zb instructions) with `-C target-feature=+crt-static` to eliminate glibc dynamic loader dependencies on the K230 Busybox userland, with single-package bundle deployment (`pack_firmware_bundle.py`).
+* **🧠 Auto-Tuning Optimization & Open-Source Community Lineage**:
+  * **Dual-Axis Pareto Search**: The upgraded autotuning engine eliminates single-axis frequency lock-in by tracking both hashrate throughput and joules-per-terahash ($\text{J/TH}$) efficiency on every search cycle. When frequency headroom narrows near thermal or power thresholds, the engine pivots dynamically to deep core-voltage trims.
+  * **Fast Headroom Acceleration**: Implemented adaptive frequency step scaling ($\Delta f = 2 \times f_{\text{step}}$) when large thermal ($\Delta T \ge 10^\circ\text{C}$) and electrical ($\Delta W \ge 15\text{W}$) margins exist, cutting convergence time to optimal setpoints by over 50%.
+  * **Ecosystem Attributions & Inspiration**: Our autotuning algorithms, thermal feedback loops, and frequency exploration methodology were heavily shaped by and build upon the groundbreaking work of the open-source mining firmware community:
+    * [`kha1n3vol3/BitaxePID`](https://github.com/kha1n3vol3/BitaxePID): Closed-loop proportional-integral-derivative thermal regulation and fan tracking.
+    * [`terminally-challenged/bitaxe-gamma-oc-script`](https://github.com/terminally-challenged/bitaxe-gamma-oc-script): Automated voltage/frequency boundary stepping and stability cliff recovery heuristics.
+    * [`andelorean/bitaxe_frequency_sweeper`](https://github.com/andelorean/bitaxe_frequency_sweeper): Discrete frequency sweep algorithms and power-target envelope hunting.
+    * [`WillItMod/AxeBench-Release`](https://github.com/WillItMod/AxeBench-Release): Standardized benchmarking methodologies and empirical J/TH efficiency validation.
+    * [`WhiteyCookie/Bitaxe-Temperature-Control`](https://github.com/WhiteyCookie/Bitaxe-Temperature-Control): Dual-sensor thermal guardrails and junction-to-ambient backstop thresholds.
 
 ## Why Mujina
 

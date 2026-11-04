@@ -31,9 +31,11 @@
 //!   **Bitaxe-Temperature-Control** by WhiteyCookie — thermal-governor
 //!   tuning and hashrate benchmarking.
 //!   <https://github.com/Hurllz/bitaxe-temp-monitor>,
+//!   <https://github.com/WhiteyCookie/Bitaxe-Temperature-Control>,
 //!   <https://github.com/WhiteyCookie/Bitaxe-Hashrate-Benchmark>
-//! - **AxeBench** — the Quiet / Efficient / Balanced / Max-Hash profile
-//!   framing.
+//! - **AxeBench-Release** by WillItMod — the Quiet / Efficient / Balanced / Max-Hash profile
+//!   framing and empirical benchmark harness.
+//!   <https://github.com/WillItMod/AxeBench-Release>
 //! - **D-Central's** Bitaxe overclocking and auto-tuning guides — safe
 //!   frequency/voltage ranges, 24/7 temperature targets, and the
 //!   ~15 W / 25 W power limits used for the profile caps.
@@ -162,7 +164,7 @@ impl TuneProfile {
                 temp_c: 62.0,
                 power_w: 15.0,
                 seek_hash: true,
-                seek_efficiency: false,
+                seek_efficiency: true,
             },
             TuneProfile::MaxHash => Caps {
                 temp_c: 68.0,
@@ -744,10 +746,14 @@ impl AutoTuner {
         let strictly_improved = match self.best {
             None => true,
             Some((_, best_hash, best_eff)) => {
-                if caps.seek_efficiency {
-                    efficiency < best_eff * (1.0 - IMPROVEMENT_MARGIN)
+                let eff_win = efficiency < best_eff * (1.0 - IMPROVEMENT_MARGIN);
+                let hash_win = hashrate > best_hash * (1.0 + IMPROVEMENT_MARGIN);
+                if caps.seek_efficiency && caps.seek_hash {
+                    eff_win || hash_win
+                } else if caps.seek_efficiency {
+                    eff_win
                 } else {
-                    hashrate > best_hash * (1.0 + IMPROVEMENT_MARGIN)
+                    hash_win
                 }
             }
         };
@@ -931,6 +937,25 @@ impl AutoTuner {
     fn seek_further_or_lock(&mut self, m: &Metrics, caps: &Caps) -> Option<TuneAction> {
         self.phase = TunePhase::Seeking;
 
+        if caps.seek_hash {
+            let power_margin = caps.power_w - m.power_w;
+            let temp_margin = caps.temp_c - m.asic_temp_c;
+            let step = if power_margin >= 15.0 && temp_margin >= 10.0 {
+                2.0 * FREQ_STEP_MHZ
+            } else {
+                FREQ_STEP_MHZ
+            };
+            let mut next = m.frequency_mhz + step;
+            if next >= self.probe_ceiling_mhz || next > MAX_FREQ_MHZ {
+                next = m.frequency_mhz + FREQ_STEP_MHZ;
+            }
+            let has_headroom = temp_margin > 3.0 && power_margin > 1.0;
+            if next <= MAX_FREQ_MHZ && next < self.probe_ceiling_mhz && has_headroom {
+                self.log_event(format!("headroom: raising to {next:.0} MHz"), m);
+                return Some(TuneAction::SetFrequency(next));
+            }
+        }
+
         // Trim from the commanded voltage, not the drooping measured one, so a
         // step moves the setpoint by exactly VOLT_STEP_MV rather than
         // droop+step (which would overshoot the stability cliff).
@@ -942,13 +967,6 @@ impl AutoTuner {
                 m,
             );
             return Some(TuneAction::SetVoltage(trimmed));
-        }
-
-        let next = m.frequency_mhz + FREQ_STEP_MHZ;
-        let has_headroom = m.asic_temp_c < caps.temp_c - 3.0 && m.power_w < caps.power_w - 1.0;
-        if caps.seek_hash && next <= MAX_FREQ_MHZ && next < self.probe_ceiling_mhz && has_headroom {
-            self.log_event(format!("headroom: raising to {next:.0} MHz"), m);
-            return Some(TuneAction::SetFrequency(next));
         }
 
         if self.phase != TunePhase::Locked {
@@ -1807,6 +1825,20 @@ mod tests {
         let action = step_to_action(&mut t, &m(50.0, 11.0, 1.2, 525.0, 1150));
         assert_eq!(action, None);
         assert_eq!(t.phase, TunePhase::Locked);
+    }
+
+    #[test]
+    fn balanced_climbs_then_undervolts_for_efficiency() {
+        let mut t = AutoTuner::default();
+        t.enable_profile(TuneProfile::Balanced); // temp cap 62, power cap 15
+        // At 525 MHz, 1170 mV with headroom: climbs clock first.
+        let a1 = step_to_action(&mut t, &m(50.0, 11.0, 1.2, 525.0, 1170));
+        assert_eq!(a1, Some(TuneAction::SetFrequency(550.0)));
+        // At 550 MHz with higher hashrate (1.3 TH/s) but pinned at clock ceiling:
+        // having improved at the ceiling, trims voltage for efficiency.
+        t.probe_ceiling_mhz = 550.0;
+        let a2 = step_to_action(&mut t, &m(50.0, 12.0, 1.3, 550.0, 1170));
+        assert_eq!(a2, Some(TuneAction::SetVoltage(1160)));
     }
 
     // --- target mode ---------------------------------------------------

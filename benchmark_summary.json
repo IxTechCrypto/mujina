@@ -1,0 +1,79 @@
+{
+  "benchmark_start_iso": "2026-11-03T15:33:04.263587",
+  "profiles": {
+    "balanced": {
+      "start_iso": "2026-11-03T15:33:04.462136",
+      "target_duration_secs": 7200,
+      "completed": true,
+      "old_baseline": {
+        "samples_count": 239,
+        "avg_hashrate_ths": 4.336,
+        "avg_power_w": 92.69,
+        "avg_efficiency_j_th": 21.38,
+        "avg_asic_temp_c": 80.0,
+        "last_freq_mhz": 210.0,
+        "last_volt_mv": 3782
+      },
+      "new_pareto": {
+        "samples_count": 234,
+        "avg_hashrate_ths": 4.581,
+        "avg_power_w": 90.72,
+        "avg_efficiency_j_th": 19.8,
+        "avg_asic_temp_c": 75.3,
+        "last_freq_mhz": 260.0,
+        "last_volt_mv": 3730
+      },
+      "end_iso": "2026-11-03T17:33:27.141578"
+    },
+    "efficient": {
+      "start_iso": "2026-11-03T17:33:27.370590",
+      "target_duration_secs": 7200,
+      "completed": true,
+      "old_baseline": {
+        "samples_count": 235,
+        "avg_hashrate_ths": 3.791,
+        "avg_power_w": 68.33,
+        "avg_efficiency_j_th": 18.02,
+        "avg_asic_temp_c": 62.6,
+        "last_freq_mhz": 210.0,
+        "last_volt_mv": 3522
+      },
+      "new_pareto": {
+        "samples_count": 220,
+        "avg_hashrate_ths": 3.984,
+        "avg_power_w": 72.63,
+        "avg_efficiency_j_th": 18.23,
+        "avg_asic_temp_c": 60.0,
+        "last_freq_mhz": 260.0,
+        "last_volt_mv": 3626
+      },
+      "end_iso": "2026-11-03T19:33:41.725239"
+    },
+    "max_hash": {
+      "start_iso": "2026-11-03T19:33:41.792756",
+      "target_duration_secs": 7200,
+      "completed": true,
+      "old_baseline": {
+        "samples_count": 237,
+        "avg_hashrate_ths": 4.89,
+        "avg_power_w": 94.77,
+        "avg_efficiency_j_th": 19.38,
+        "avg_asic_temp_c": 75.7,
+        "last_freq_mhz": 290.0,
+        "last_volt_mv": 3704
+      },
+      "new_pareto": {
+        "samples_count": 230,
+        "avg_hashrate_ths": 4.913,
+        "avg_power_w": 94.67,
+        "avg_efficiency_j_th": 19.27,
+        "avg_asic_temp_c": 72.3,
+        "last_freq_mhz": 320.0,
+        "last_volt_mv": 3730
+      },
+      "end_iso": "2026-11-03T21:34:06.079810"
+    }
+  },
+  "status": "completed",
+  "benchmark_end_iso": "2026-11-03T21:34:06.087971"
+}
