@@ -601,7 +601,7 @@ class H(http.server.BaseHTTPRequestHandler):
                     "model": b.get("model") or "Bitaxe / NerdQAxe",
                     "chips": len(b.get("chips") or []),
                     "caps": {
-                        "fan": "harness",
+                        "fan": "board",
                         "fan_curve": False,
                         "manual_tuning": f"/api/v0/boards/{b_name}/tuning",
                         "tuner": f"/api/v0/boards/{b_name}/autotune",
@@ -748,8 +748,16 @@ class H(http.server.BaseHTTPRequestHandler):
                     payload[k] = req[k]
             ok, detail = patch_tuning(board, payload)
         elif action == "fan" or clean_path.startswith("/settings"):
-            payload = {"auto": bool(req.get("auto"))}
-            for k in ("target_c", "min_percent", "percent"):
+            is_auto = req.get("auto")
+            if is_auto is None and "mode" in req:
+                is_auto = (req["mode"] == "auto")
+            payload = {"auto": bool(is_auto)}
+            pct = req.get("percent")
+            if pct is None:
+                pct = req.get("manual_duty_percent")
+            if pct is not None:
+                payload["percent"] = pct
+            for k in ("target_c", "min_percent"):
                 if req.get(k) is not None:
                     payload[k] = req[k]
             ok, detail = patch_fan(board, payload)
