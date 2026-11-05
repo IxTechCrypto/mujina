@@ -14,11 +14,16 @@ def run_cmd(cmd, cwd=None):
         raise RuntimeError(f"Command failed: {cmd}")
     return res.stdout
 
-print("[1] Updating staged mujina-minerd binary...")
+print("[1] Updating staged mujina-minerd and ble_setup binaries...")
 src_bin = "/home/grant/nano3s-build/nano-mujina/target/riscv64gc-unknown-linux-gnu/release/mujina-minerd.stripped"
 dst_bin = "/home/grant/udisk_build/data_extracted/590221451/ubi_data_part/mujina-minerd"
 shutil.copy2(src_bin, dst_bin)
 os.chmod(dst_bin, 0o755)
+
+src_ble = "/home/grant/nano3s-build/nano-mujina/target/riscv64gc-unknown-linux-gnu/release/ble_setup.stripped"
+dst_ble = "/home/grant/udisk_build/data_extracted/590221451/ubi_data_part/ble_setup"
+shutil.copy2(src_ble, dst_ble)
+os.chmod(dst_ble, 0o755)
 
 print("[2] Creating clean staging tree for genimage...")
 stage_dir = "/home/grant/udisk_build/stage_v5"
