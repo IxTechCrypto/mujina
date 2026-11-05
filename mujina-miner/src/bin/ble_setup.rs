@@ -342,7 +342,8 @@ const UUID_CHARACTERISTIC: u16 = 0x2803;
 const UUID_SERVICE_FFFF: u16 = 0xFFFF;
 const UUID_CHAR_FFE1: u16 = 0xFFE1; // read: wifi scan results
 const UUID_CHAR_FFE2: u16 = 0xFFE2; // write: commands
-const UUID_CHAR_FFE3: u16 = 0xFFE3; // read: JSON status
+const UUID_CHAR_FFE3: u16 = 0xFFE3;
+const UUID_DEVICE_NAME: u16 = 0x2A00; // read: JSON status
 
 const CHR_PROP_READ: u8 = 0x02;
 const CHR_PROP_WRITE_NO_RSP: u8 = 0x04;
@@ -424,38 +425,11 @@ fn attr_lookup(handle: u16, state: &GattState) -> Option<(u16, Vec<u8>)> {
     match handle {
         H_SERVICE => Some((UUID_PRIMARY_SERVICE, UUID_SERVICE_FFFF.to_le_bytes().to_vec())),
         H_CHAR1_DECL => Some((UUID_CHARACTERISTIC, char_decl_value(CHR_PROP_READ, H_CHAR1_VAL, UUID_CHAR_FFE1))),
-        H_CHAR1_VAL => Some((UUID_CHAR_FFE1, state.ffe1_value.clone())),
-        // Also advertises READ (not just WRITE/WRITE_NO_RSP): the real
-        // Avalon Family app's BleService builds a *separate* index list
-        // per property (readCharacteristicUUIDs, writeWithResponse...,
-        // etc), each populated in characteristic-discovery order, and
-        // reads by a hardcoded index that differs between platforms --
-        // confirmed from the app's own GPL-3.0 source
-        // (Canaan-Creative/avalon_family): iOS reads wifi-scan-results
-        // at index 0 (FFE1, already correct) and status at index 1;
-        // Android reads wifi-scan-results at index 1 and status at
-        // index 2. With exactly 3 read-capable characteristics (FFE1,
-        // FFE2, FFE3) in this fixed order, index 1 is FFE2 -- which
-        // Android's WiFi-scan read and iOS's status read both land on,
-        // wanting *different* content. Restructuring the GATT layout
-        // (e.g. adding a 4th read-capable entry ahead of FFE1) shifts
-        // every index and was tried -- it fixed Android's index-1 read
-        // but broke iOS's index-0 read, which depends on there being
-        // nothing ahead of FFE1. So instead of changing structure,
-        // FFE2's read content mirrors FFE1's (the actual wifi scan
-        // results) below: this fixes Android's WiFi list (its real,
-        // actively-blocking bug -- you can't proceed with setup at all
-        // if the network list never populates) without touching the
-        // three characteristics' handles/properties/order at all, so
-        // iOS's WiFi-list read (index 0, still FFE1) is untouched.
-        // iOS's status read (index 1) still won't get real status JSON
-        // this way, but that was already broken/unreliable before this
-        // change (see the module doc comment -- the on-device LCD is
-        // the real status source of truth, not the app's own UI).
+        H_CHAR1_VAL | 0x0009 => Some((UUID_CHAR_FFE1, state.ffe1_value.clone())),
         H_CHAR2_DECL => Some((UUID_CHARACTERISTIC, char_decl_value(CHR_PROP_READ | CHR_PROP_WRITE | CHR_PROP_WRITE_NO_RSP, H_CHAR2_VAL, UUID_CHAR_FFE2))),
-        H_CHAR2_VAL => Some((UUID_CHAR_FFE2, state.ffe1_value.clone())),
+        H_CHAR2_VAL | 0x000B => Some((UUID_CHAR_FFE2, state.ffe1_value.clone())),
         H_CHAR3_DECL => Some((UUID_CHARACTERISTIC, char_decl_value(CHR_PROP_READ, H_CHAR3_VAL, UUID_CHAR_FFE3))),
-        H_CHAR3_VAL => Some((UUID_CHAR_FFE3, state.ffe3_value.clone())),
+        H_CHAR3_VAL | 0x000D => Some((UUID_CHAR_FFE3, state.ffe3_value.clone())),
         _ => None,
     }
 }
@@ -537,6 +511,16 @@ fn handle_read_by_type(fd: i32, conn_handle: u16, req: &[u8], state: &Arc<Mutex<
         return;
     }
 
+    if attr_type == UUID_DEVICE_NAME {
+        let name_bytes = state.device_name.as_bytes();
+        let entry_len = 2 + name_bytes.len();
+        let mut payload = vec![ATT_OP_READ_BY_TYPE_RSP, entry_len as u8];
+        payload.extend_from_slice(&H_CHAR1_VAL.to_le_bytes());
+        payload.extend_from_slice(name_bytes);
+        send_l2cap(fd, conn_handle, ATT_CID, &payload);
+        return;
+    }
+
     // Any other "read by type" (e.g. probing for specific descriptor
     // UUIDs by type) -- we have none, report not found.
     att_error(fd, conn_handle, ATT_OP_READ_BY_TYPE_REQ, start, ATT_ECODE_ATTRIBUTE_NOT_FOUND);
@@ -607,12 +591,7 @@ fn handle_write(fd: i32, conn_handle: u16, req: &[u8], state: &Arc<Mutex<GattSta
     }
     let handle = u16::from_le_bytes([req[1], req[2]]);
     let value = &req[3..];
-    if handle != H_CHAR2_VAL {
-        if with_response {
-            att_error(fd, conn_handle, ATT_OP_WRITE_REQ, handle, ATT_ECODE_WRITE_NOT_PERMITTED);
-        }
-        return;
-    }
+    eprintln!("step: ATT write handle=0x{handle:04x} len={} bytes={:02x?}", value.len(), &value[..value.len().min(16)]);
     if with_response {
         send_l2cap(fd, conn_handle, ATT_CID, &[ATT_OP_WRITE_RSP]);
     }
@@ -674,14 +653,16 @@ fn hex_decode(s: &str) -> Option<String> {
 /// processing.
 fn dispatch_command(cmd: &[u8], state: &Arc<Mutex<GattState>>) {
     let text = String::from_utf8_lossy(cmd);
-    eprintln!("step: command received: {text:?}");
-    let mut parts = text.split(',');
-    match parts.next() {
-        Some("scan") => run_wifi_scan(state),
-        Some("setssid") => {
-            let hex_ssid = parts.next().unwrap_or("");
-            let hex_pass = parts.next().unwrap_or("");
-            let hex_id = parts.next().unwrap_or("");
+    let clean = text.trim();
+    eprintln!("step: command received: {clean:?}");
+    let mut parts = clean.split(',');
+    let action = parts.next().map(|s| s.trim().to_lowercase()).unwrap_or_default();
+    match action.as_str() {
+        "scan" => run_wifi_scan(state),
+        "setssid" => {
+            let hex_ssid = parts.next().unwrap_or("").trim();
+            let hex_pass = parts.next().unwrap_or("").trim();
+            let hex_id = parts.next().unwrap_or("").trim();
             let auth: i32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
             let ssid = hex_decode(hex_ssid).unwrap_or_default();
             let pass = hex_decode(hex_pass).unwrap_or_default();
@@ -689,7 +670,7 @@ fn dispatch_command(cmd: &[u8], state: &Arc<Mutex<GattState>>) {
             eprintln!("step: setssid ssid={ssid:?} auth={auth} identity={identity:?} (password redacted)");
             apply_wifi_credentials(&ssid, &pass, auth, state);
         }
-        _ => eprintln!("step: unknown command: {text:?}"),
+        _ => eprintln!("step: unknown command: {clean:?}"),
     }
 }
 
@@ -814,31 +795,44 @@ fn run_wifi_scan(state: &Arc<Mutex<GattState>>) {
     // wpa_supplicant is already managing wlan0 (STA mode); ask it to
     // trigger a scan and read cached results back.
     let _ = std::process::Command::new("wpa_cli").args(["-i", "wlan0", "scan"]).status();
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    let out = std::process::Command::new("wpa_cli").args(["-i", "wlan0", "scan_results"]).output();
-    let mut entries = Vec::new();
-    if let Ok(out) = out {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines().skip(1) {
-            // wpa_cli scan_results columns: bssid / frequency / signal level / flags / ssid
-            let cols: Vec<&str> = line.split('\t').collect();
-            if cols.len() < 5 {
-                continue;
+    
+    // Poll up to 6 times (up to ~5s) for wpa_cli scan results to be available
+    let mut entries: Vec<(String, i32, i32)> = Vec::new();
+    for _ in 0..6 {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        if let Ok(out) = std::process::Command::new("wpa_cli").args(["-i", "wlan0", "scan_results"]).output() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines().skip(1) {
+                // wpa_cli scan_results columns: bssid / frequency / signal level / flags / ssid
+                let cols: Vec<&str> = line.split('\t').collect();
+                if cols.len() < 5 {
+                    continue;
+                }
+                let ssid = cols[4].trim();
+                if ssid.is_empty() {
+                    continue;
+                }
+                let rssi: i32 = cols[2].parse().unwrap_or(-100);
+                let flags = cols[3];
+                let auth = if flags.contains("WPA2") {
+                    7
+                } else if flags.contains("WPA") {
+                    5
+                } else {
+                    1
+                };
+                if let Some(existing) = entries.iter_mut().find(|(s, _, _)| s == ssid) {
+                    if rssi > existing.2 {
+                        existing.2 = rssi;
+                        existing.1 = auth;
+                    }
+                } else {
+                    entries.push((ssid.to_string(), auth, rssi));
+                }
             }
-            let ssid = cols[4];
-            if ssid.is_empty() {
-                continue;
+            if !entries.is_empty() {
+                break;
             }
-            let rssi: i32 = cols[2].parse().unwrap_or(-100);
-            let flags = cols[3];
-            let auth = if flags.contains("WPA2") {
-                7
-            } else if flags.contains("WPA") {
-                5
-            } else {
-                1
-            };
-            entries.push((ssid.to_string(), auth, rssi));
         }
     }
 
@@ -862,8 +856,12 @@ fn run_wifi_scan(state: &Arc<Mutex<GattState>>) {
     };
 
     let count = result_entries.len();
-    state.lock().unwrap_or_else(|e| e.into_inner()).ffe1_value = result_entries.join(",").into_bytes();
-    eprintln!("step: scan complete, {count} networks");
+    if count > 0 {
+        state.lock().unwrap_or_else(|e| e.into_inner()).ffe1_value = result_entries.join(",").into_bytes();
+        eprintln!("step: scan complete, {count} networks cached in FFE1");
+    } else {
+        eprintln!("step: scan complete, 0 networks found");
+    }
 }
 
 fn apply_wifi_credentials(ssid: &str, password: &str, auth: i32, state: &Arc<Mutex<GattState>>) {
@@ -992,6 +990,16 @@ fn event_loop(fd: i32, device_name: &str) {
     let mut conn_handle: Option<u16> = None;
     let mut mtu: usize = 23;
     let mut buf = [0u8; 1024];
+
+    // Background thread: pre-warm scan results immediately on startup and refresh every 20s
+    let scan_state = Arc::clone(&state);
+    std::thread::spawn(move || {
+        run_wifi_scan(&scan_state);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            run_wifi_scan(&scan_state);
+        }
+    });
 
     loop {
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
