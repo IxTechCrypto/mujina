@@ -274,14 +274,13 @@ fn main() {
     // effect more simply by never starting it in the first place once
     // already connected, rechecked every 60s via the sleep+exit below.
     let force_advertise = std::env::var("BLE_SETUP_FORCE_ADVERTISE").as_deref() == Ok("1");
-    let is_live = std::path::Path::new("/tmp/nano3s_live.txt").exists();
     if let Some(ip) = ifconfig_wlan0_ip() {
-        if is_live && !force_advertise {
-            eprintln!("step: wlan0 connected (ip={ip}) and miner live, not advertising; idling before recheck");
+        if !force_advertise {
+            eprintln!("step: wlan0 connected (ip={ip}), not advertising; idling before recheck");
             std::thread::sleep(std::time::Duration::from_secs(60));
             return;
         } else {
-            eprintln!("step: wlan0 connected (ip={ip}) but miner not live (/tmp/nano3s_live.txt missing) or forced; continuing BLE advertising");
+            eprintln!("step: wlan0 connected (ip={ip}) but BLE_SETUP_FORCE_ADVERTISE=1; continuing BLE advertising");
         }
     }
 
@@ -788,9 +787,10 @@ fn run_wifi_scan(state: &Arc<Mutex<GattState>>) {
     let _ = std::fs::create_dir_all("/var/run/wpa_supplicant");
     let _ = std::process::Command::new("mkdir").args(["-p", "/var/run/wpa_supplicant"]).status();
 
-    // Ensure wlan0 is UP before scanning (matching Canaan stock mm_miner: `ifconfig %s 0.0.0.0 up`)
-    let _ = std::process::Command::new("ifconfig").args(["wlan0", "0.0.0.0", "up"]).status();
-    let _ = std::process::Command::new("ifconfig").args(["wlan0", "up"]).status();
+    // Ensure wlan0 is UP before scanning without wiping any existing IPv4 address!
+    if ifconfig_wlan0_ip().is_none() {
+        let _ = std::process::Command::new("ifconfig").args(["wlan0", "up"]).status();
+    }
 
     // wpa_supplicant is already managing wlan0 (STA mode); ask it to
     // trigger a scan and read cached results back.
@@ -992,12 +992,21 @@ fn event_loop(fd: i32, device_name: &str) {
     let mut buf = [0u8; 1024];
 
     // Background thread: pre-warm scan results immediately on startup and refresh every 20s
+    // while wlan0 is unconfigured; once wlan0 has an IP, exit ble_setup so advertising stops.
     let scan_state = Arc::clone(&state);
+    let force_adv = std::env::var("BLE_SETUP_FORCE_ADVERTISE").as_deref() == Ok("1");
     std::thread::spawn(move || {
         run_wifi_scan(&scan_state);
         loop {
             std::thread::sleep(std::time::Duration::from_secs(20));
-            run_wifi_scan(&scan_state);
+            if let Some(ip) = ifconfig_wlan0_ip() {
+                if !force_adv {
+                    eprintln!("step: wlan0 acquired IP ({ip}), exiting BLE setup advertiser");
+                    std::process::exit(0);
+                }
+            } else {
+                run_wifi_scan(&scan_state);
+            }
         }
     });
 
