@@ -17,7 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # from this script.
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$WORKSPACE_ROOT/mujina-miner"
-cargo build --release --target riscv64gc-unknown-linux-gnu --features nano3s --bin mujina-minerd
+cargo build --release --target riscv64gc-unknown-linux-gnu --features nano3s --bin mujina-minerd --bin ble_setup
 # Built binary path (workspace-rooted target dir).
 BIN="$WORKSPACE_ROOT/target/riscv64gc-unknown-linux-gnu/release/mujina-minerd"
 echo "[*] Verifying nano3s symbols are linked in..."
@@ -26,3 +26,8 @@ ls -lh "$BIN"
 riscv64-linux-gnu-strip --strip-all -o "$BIN.stripped" "$BIN"
 ls -lh "$BIN.stripped"
 echo "[+] Built $BIN.stripped"
+
+BLE_BIN="$WORKSPACE_ROOT/target/riscv64gc-unknown-linux-gnu/release/ble_setup"
+riscv64-linux-gnu-strip --strip-all -o "$BLE_BIN.stripped" "$BLE_BIN"
+ls -lh "$BLE_BIN.stripped"
+echo "[+] Built $BLE_BIN.stripped"

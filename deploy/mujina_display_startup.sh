@@ -56,6 +56,23 @@ sleep 5
     done
 ) &
 
+# BLE WiFi-setup provisioning server (2026-08-24). Speaks raw HCI/ATT
+# directly (no BlueZ/D-Bus on this device) via HCI_CHANNEL_USER, which
+# needs hci0 in a clean unmanaged state -- bring it down first in case
+# a previous crashed instance left it in an inconsistent state, or
+# something else (e.g. hciconfig run by hand) brought it up. The binary
+# itself exits quickly (after a 60s idle sleep) once wlan0 already has
+# an address, so this loop is a cheap periodic no-op once WiFi is
+# configured, not an always-on radio. Binary lives in /data, same
+# reasoning as mujina-minerd (/mntapp is only 7.4MB).
+(
+    while true; do
+        hciconfig hci0 down 2>/dev/null
+        /data/ble_setup > /sharefs/ble_setup.log 2>&1
+        sleep 3
+    done
+) &
+
 # Power/fan idle-control harness (2026-07-29) -- no IPC of its own, just
 # power_en (GPIO34) + fan (pwm4) sysfs control driven by pause/resume
 # requests via /tmp/harness_control. See mujina_test_harness.c.
@@ -120,4 +137,3 @@ sleep 5
         fi
     done
 ) &
-
