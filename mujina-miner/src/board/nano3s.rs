@@ -351,6 +351,13 @@ const TEMP_TARGET_EMERGENCY_STEP_MHZ: i32 = 30;
 /// Matches the frequency floor `patch_board_tuning` already validates.
 const TEMP_TARGET_MIN_MHZ: u32 = 100;
 
+/// Minimum dwell time between consecutive thermal auto-throttle frequency steps.
+/// Thermal mass of the heatsink and heatpipes has a ~10-15s response latency.
+/// Stepping on every telemetry update (~1.2s) without pacing causes high slew-rate
+/// frequency cascades (e.g. 13 consecutive steps in 20s) that desynchronize the
+/// Canaan A3197S analog PLL clock trees and freeze the daisy chain.
+const TEMP_TARGET_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Hashrate-mode autotune: given a target TH/s (`autotune_hashrate_target_ths`
 /// local var below, unset = feature off), searches for the lowest-power
 /// frequency/voltage combination that reliably sustains it, taking over
@@ -2671,6 +2678,7 @@ fn run_worker(
     // bottomed out and power still exceeds the PD-detected ceiling.
     let mut psu_ceiling_freq: [u32; 4] = temp_throttle_base_freq;
     let mut next_psu_freq_check = std::time::Instant::now() + PSU_FREQ_CHECK_INTERVAL;
+    let mut next_temp_freq_check = std::time::Instant::now() + TEMP_TARGET_CHECK_INTERVAL;
     // Hashrate-mode autotune -- see AUTOTUNE_LEVEL_STEP's doc comment.
     // `Some` means it owns frequency+voltage; power-target/temp-target
     // are force-disabled whenever this is set (see the
@@ -3293,44 +3301,50 @@ fn run_worker(
             // does NOT update temp_throttle_base_freq -- only a
             // dashboard/API-commanded frequency (the `tune:` arm above)
             // moves that ceiling.
+            // Paced by TEMP_TARGET_CHECK_INTERVAL (15s) to prevent analog
+            // PLL desync caused by rapid back-to-back frequency shifts.
             let mut temp_candidate: Option<[u32; 4]> = None;
-            if let Some(target_c) = temp_target_c {
-                let temp_max = st.temp_max as f64;
-                if temp_max > 0.0 {
-                    let step_mhz = if temp_max >= TEMP_TARGET_EMERGENCY_C {
-                        // Hard safety trip -- always allowed, ignores the
-                        // dead-band.
-                        Some(-TEMP_TARGET_EMERGENCY_STEP_MHZ)
-                    } else if temp_max > target_c + TEMP_TARGET_DEADBAND_C {
-                        Some(-TEMP_TARGET_STEP_MHZ)
-                    } else if temp_max < target_c - TEMP_TARGET_DEADBAND_C {
-                        Some(TEMP_TARGET_STEP_MHZ)
-                    } else {
-                        None
-                    };
+            let temp_now = std::time::Instant::now();
+            if temp_now >= next_temp_freq_check {
+                if let Some(target_c) = temp_target_c {
+                    let temp_max = st.temp_max as f64;
+                    if temp_max > 0.0 {
+                        let step_mhz = if temp_max >= TEMP_TARGET_EMERGENCY_C {
+                            // Hard safety trip -- always allowed, ignores the
+                            // dead-band.
+                            Some(-TEMP_TARGET_EMERGENCY_STEP_MHZ)
+                        } else if temp_max > target_c + TEMP_TARGET_DEADBAND_C {
+                            Some(-TEMP_TARGET_STEP_MHZ)
+                        } else if temp_max < target_c - TEMP_TARGET_DEADBAND_C {
+                            Some(TEMP_TARGET_STEP_MHZ)
+                        } else {
+                            None
+                        };
 
-                    if let Some(step_mhz) = step_mhz {
-                        let mut new_freq = last_applied_pll_freq;
-                        for i in 0..4 {
-                            let candidate = new_freq[i] as i32 + step_mhz;
-                            // Respect psu_ceiling_freq too, not just
-                            // temp_throttle_base_freq -- live-verified
-                            // 2026-09-16 that without this, this recovery
-                            // step fights the PSU trip below every tick
-                            // (each one unaware of the other's state),
-                            // thrashing frequency up and down instead of
-                            // settling. Recovering above the PSU ceiling
-                            // is only possible once psu_ceiling_freq
-                            // itself has recovered that far (see that
-                            // block's own stepping).
-                            let ceiling = temp_throttle_base_freq[i].min(psu_ceiling_freq[i]) as i32;
-                            new_freq[i] = candidate.clamp(TEMP_TARGET_MIN_MHZ as i32, ceiling) as u32;
-                        }
-                        if new_freq != last_applied_pll_freq {
-                            eprintln!(
-                                "[nano3s] temp-target: temp_max={temp_max:.1}C target={target_c:.1}C freq={last_applied_pll_freq:?} -> {new_freq:?}"
-                            );
-                            temp_candidate = Some(new_freq);
+                        if let Some(step_mhz) = step_mhz {
+                            let mut new_freq = last_applied_pll_freq;
+                            for i in 0..4 {
+                                let candidate = new_freq[i] as i32 + step_mhz;
+                                // Respect psu_ceiling_freq too, not just
+                                // temp_throttle_base_freq -- live-verified
+                                // 2026-09-16 that without this, this recovery
+                                // step fights the PSU trip below every tick
+                                // (each one unaware of the other's state),
+                                // thrashing frequency up and down instead of
+                                // settling. Recovering above the PSU ceiling
+                                // is only possible once psu_ceiling_freq
+                                // itself has recovered that far (see that
+                                // block's own stepping).
+                                let ceiling = temp_throttle_base_freq[i].min(psu_ceiling_freq[i]) as i32;
+                                new_freq[i] = candidate.clamp(TEMP_TARGET_MIN_MHZ as i32, ceiling) as u32;
+                            }
+                            if new_freq != last_applied_pll_freq {
+                                eprintln!(
+                                    "[nano3s] temp-target (paced): temp_max={temp_max:.1}C target={target_c:.1}C freq={last_applied_pll_freq:?} -> {new_freq:?}"
+                                );
+                                temp_candidate = Some(new_freq);
+                                next_temp_freq_check = temp_now + TEMP_TARGET_CHECK_INTERVAL;
+                            }
                         }
                     }
                 }

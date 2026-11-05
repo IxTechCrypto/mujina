@@ -488,6 +488,10 @@ pub(crate) fn fan_step(st: &mut FanState, temp: Option<f32>, cap: f32, target: f
             }
             if st.hold_full {
                 st.duty = 100.0;
+            } else if t >= cap - 2.0 {
+                // Pre-emptive boost: within 2 C of thermal cap, ramp fan duty aggressively
+                // to arrest temperature rise before tripping the emergency PLL down-throttle.
+                st.duty = (st.duty + FAN_KP * 2.5 * (t - target)).clamp(FAN_DUTY_MIN, 100.0);
             } else {
                 st.duty = (st.duty + FAN_KP * (t - target)).clamp(FAN_DUTY_MIN, 100.0);
             }

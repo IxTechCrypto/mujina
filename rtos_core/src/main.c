@@ -2632,10 +2632,17 @@ static void *stage6_hard_watchdog(void *unused)
 
 			if (fp) {
 				fprintf(fp, "stage6_hard_watchdog: genuine stall detected (no "
-					"progress for >=%ds) -- forcing exit(3), device needs a "
-					"reboot to recover (nothing relaunches init.sh)\n",
+					"progress for >=%ds) -- flagging /sharefs/reboot_request and forcing exit(3)\n",
 					STAGE6_STALL_SEC);
 				fclose(fp);
+			}
+		}
+		{
+			FILE *rf = fopen("/sharefs/reboot_request", "w");
+			if (rf) {
+				fprintf(rf, "stage6_hard_watchdog: genuine stall detected (no progress for >=%ds)\n",
+					STAGE6_STALL_SEC);
+				fclose(rf);
 			}
 		}
 		gpio_asic_rst_deassert();

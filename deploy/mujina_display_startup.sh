@@ -90,3 +90,34 @@ sleep 5
         fi
     done
 ) &
+
+# Hardware stall & IPC recovery watchdog:
+# If RTOS detected a genuine stall and flagged /sharefs/reboot_request,
+# or if mujina-minerd has been stuck blocked connecting to rtos_core for >=60s,
+# execute a full hardware reboot so the K230 reboots cleanly, reloads rtos_core,
+# and resumes mining within 25 seconds instead of hanging indefinitely.
+(
+    ipc_blocked_counter=0
+    while true; do
+        sleep 5
+        if [ -f /sharefs/reboot_request ]; then
+            echo "[watchdog] /sharefs/reboot_request detected -- forcing reboot" >> /data/mujina-minerd.log
+            rm -f /sharefs/reboot_request
+            sync
+            /sbin/reboot -f
+        fi
+
+        # Check if mujina-minerd is stuck blocked on connecting to rtos_core
+        if tail -n 10 /data/mujina-minerd.log 2>/dev/null | grep -q "connecting to rtos_core (blocking)"; then
+            ipc_blocked_counter=$((ipc_blocked_counter + 5))
+            if [ $ipc_blocked_counter -ge 60 ]; then
+                echo "[watchdog] mujina-minerd stuck blocked connecting to rtos_core for >=60s -- forcing reboot" >> /data/mujina-minerd.log
+                sync
+                /sbin/reboot -f
+            fi
+        else
+            ipc_blocked_counter=0
+        fi
+    done
+) &
+

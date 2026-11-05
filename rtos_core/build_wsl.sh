@@ -16,7 +16,8 @@
 # WSL's riscv64-linux-gnu-gcc (glibc) here -- a glibc binary launched via
 # /sharefs/init.sh silently fails to start at all under RT-Smart's msh.
 set -e
-export PATH=/mnt/c/Users/aathe/Desktop/nano3s/toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin:/usr/bin:/bin
-cd /mnt/c/Users/aathe/Desktop/nano3s/rtos_core
+export PATH=/home/grant/nano3s-build/toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin:/usr/bin:/bin
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 rm -rf build
 make CC=riscv64-unknown-linux-musl-gcc
