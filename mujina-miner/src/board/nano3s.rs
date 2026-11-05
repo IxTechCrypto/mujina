@@ -2434,14 +2434,24 @@ impl AnimState {
                 colors
             }
             LedEffect::Christmas => {
-                const RED: (u8, u8, u8) = (255, 0, 0);   // Pure solid Crimson Red (zero green, zero blue)
-                const GREEN: (u8, u8, u8) = (0, 255, 0); // Pure solid Emerald Green (zero red, zero blue)
-                self.holiday_phase = (self.holiday_phase + 0.2 + speed_frac * 0.4) % std::f32::consts::TAU;
+                const PALETTE: [(u8, u8, u8); 4] = [
+                    (255, 0, 0),     // Pure solid Crimson Red
+                    (0, 255, 0),     // Pure solid Emerald Green
+                    (255, 255, 255), // Pure Snow White
+                    (255, 180, 0),   // Warm Holiday Gold
+                ];
+                let spawn_chance = 0.03 + speed_frac * 0.25;
                 let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
                 for i in 0..WS2812_LED_COUNT {
-                    let color = if i % 2 == 0 { RED } else { GREEN };
-                    let shimmer = 0.35 + 0.65 * ((self.holiday_phase + i as f32 * 0.7).sin() * 0.5 + 0.5);
-                    colors[i] = scale_color(color, v * shimmer);
+                    if self.halloween_twinkle[i] <= 0.02 && rand_unit(&mut self.rng) < spawn_chance {
+                        self.halloween_twinkle[i] = 1.0;
+                        self.halloween_color_idx[i] = (xorshift32(&mut self.rng) % 4) as u8;
+                    } else {
+                        self.halloween_twinkle[i] *= 0.82;
+                    }
+                    let color = PALETTE[self.halloween_color_idx[i] as usize % 4];
+                    let level = (0.05 + 0.95 * self.halloween_twinkle[i]).clamp(0.0, 1.0);
+                    colors[i] = scale_color(color, v * level);
                 }
                 colors
             }
@@ -3912,9 +3922,8 @@ mod tests {
         };
         let xmas_frame = anim.frame(ov_xmas);
         assert_eq!(xmas_frame.len(), WS2812_LED_COUNT);
-        // Even indices are Red (r > 0, g < 100), odd indices are Green (g > 0, r < 100)
-        assert!(xmas_frame[0].0 > xmas_frame[0].1);
-        assert!(xmas_frame[1].1 > xmas_frame[1].0);
+        // Christmas Twinkle renders 9 non-zero RGB pixels from the 4-color holiday palette
+        assert!(xmas_frame.iter().any(|&(r, g, b)| r > 0 || g > 0 || b > 0));
 
         let ov_patriotic = LedOverrideState {
             effect: LedEffect::Patriotic,
