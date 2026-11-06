@@ -677,7 +677,12 @@ impl AutoTuner {
 
     /// Averaging window progress: (samples accumulated, samples needed).
     pub fn averaging_progress(&self) -> (u32, u32) {
-        (self.acc.n.min(self.envelope.settle_cycles), self.envelope.settle_cycles)
+        let ticks = if self.enabled && self.envelope.average_judgement {
+            self.cycles_since_change.min(self.envelope.settle_cycles)
+        } else {
+            self.acc.n.min(self.envelope.settle_cycles)
+        };
+        (ticks, self.envelope.settle_cycles)
     }
 
     /// Update the chip count for the board this tuner is driving, looked up
@@ -817,6 +822,11 @@ impl AutoTuner {
             self.cycle += 1;
         }
         if self.enabled && self.envelope.average_judgement {
+            if self.envelope.settle_cycles >= 12
+                && self.cycles_since_change == self.envelope.settle_cycles / 4
+            {
+                self.acc = Accum::default();
+            }
             self.acc.add(m);
         }
         let action = self.evaluate_inner(m);
@@ -1133,13 +1143,20 @@ impl AutoTuner {
         }
         let strictly_improved = !at_cap_candidate && match self.best {
             None => true,
-            Some((_, best_hash, best_eff)) => {
+            Some((best_sp, best_hash, best_eff)) => {
                 let best_power = best_eff * best_hash;
                 let power_win = env.trim_steps_per_judgement > 1
                     && m.power_w <= best_power * (1.0 - POWER_SAVING_MARGIN)
                     && hashrate >= best_hash * (1.0 - HASHRATE_EQUAL_TOLERANCE);
                 let eff_win = power_win || efficiency < best_eff * (1.0 - IMPROVEMENT_MARGIN);
-                let hash_win = hashrate > best_hash * (1.0 + IMPROVEMENT_MARGIN);
+                let is_climb = m.frequency_mhz > best_sp.frequency_mhz + FREQ_TOLERANCE_MHZ;
+                let fine_climb_win = env.average_judgement
+                    && is_climb
+                    && (hashrate > best_hash * 1.005
+                        || (m.fail_rate_pct.is_some_and(|r| r <= 5.0)
+                            && m.power_w > best_power + 0.5
+                            && hashrate >= best_hash * (1.0 - HASHRATE_EQUAL_TOLERANCE)));
+                let hash_win = hashrate > best_hash * (1.0 + IMPROVEMENT_MARGIN) || fine_climb_win;
 
                 if caps.seek_hash && caps.seek_efficiency {
                     hash_win || eff_win
@@ -1245,7 +1262,8 @@ impl AutoTuner {
             return Some(TuneAction::SetVoltage(best.core_voltage_mv));
         }
         if self.continuous {
-            let has_continuous_headroom = m.asic_temp_c < caps.temp_c - 6.0
+            let cont_temp_margin = if env.average_judgement { 3.0 } else { 6.0 };
+            let has_continuous_headroom = m.asic_temp_c < caps.temp_c - cont_temp_margin
                 && m.power_w < caps.power_w - 4.0 - env.best_point_margin_w;
             if has_continuous_headroom && m.frequency_mhz < env.max_freq_mhz {
                 self.probe_ceiling_mhz = env.max_freq_mhz + env.freq_step_mhz;
@@ -1357,7 +1375,8 @@ impl AutoTuner {
         if caps.seek_hash {
             let power_margin = caps.power_w - m.power_w;
             let temp_margin = caps.temp_c - m.asic_temp_c;
-            let step = if power_margin >= 15.0 && temp_margin >= 10.0 {
+            let min_fast_temp_margin = if env.average_judgement { 3.5 } else { 10.0 };
+            let step = if power_margin >= 15.0 && temp_margin >= min_fast_temp_margin {
                 2.0 * env.freq_step_mhz
             } else {
                 env.freq_step_mhz
@@ -1388,7 +1407,8 @@ impl AutoTuner {
         }
 
         if self.continuous {
-            let has_continuous_headroom = m.asic_temp_c < caps.temp_c - 6.0
+            let cont_temp_margin = if env.average_judgement { 3.0 } else { 6.0 };
+            let has_continuous_headroom = m.asic_temp_c < caps.temp_c - cont_temp_margin
                 && m.power_w < caps.power_w - 4.0 - env.best_point_margin_w;
             if has_continuous_headroom && m.frequency_mhz < env.max_freq_mhz {
                 self.probe_ceiling_mhz = env.max_freq_mhz + env.freq_step_mhz;
@@ -2553,5 +2573,43 @@ mod tests {
         let a2 = step_to_action(&mut t, &m(56.0, 14.5, 1.3, 550.0, 1200));
         // Headroom for climbing is exhausted -> trims voltage to 1190 mV for efficiency!
         assert_eq!(a2, Some(TuneAction::SetVoltage(1190)));
+    }
+
+    #[test]
+    fn nano3s_maxhash_climbs_past_350_mhz_to_420_mhz_with_realistic_sub_3pct_steps() {
+        let env = TuneEnvelope {
+            settle_cycles: 20,
+            safety_settle_cycles: 1,
+            power_settle_cycles: 4,
+            max_hash: CapLimits { temp_c: 90.0, power_w: 135.0 },
+            average_judgement: true,
+            best_point_margin_w: 3.0,
+            trim_steps_per_judgement: 3,
+            ..nano_env()
+        };
+        let mut t = AutoTuner::default();
+        t.set_envelope(env);
+        t.enable_profile(TuneProfile::MaxHash);
+
+        let mut freq = 350.0_f32;
+        let volt = 3782_u16;
+        for _window in 0..12 {
+            for tick in 0..20 {
+                let power = 108.0 + (freq - 350.0) * 0.31;
+                // Simulate SmartSpeed CORE_RST dip on first 5 ticks, then +1.6% per 10 MHz step (< 3% old margin)
+                let settled_hash = 5.40 * (1.0 + (freq - 350.0) * 0.0016);
+                let hash = if tick < 5 { settled_hash * 0.94 } else { settled_hash };
+                let metric = Metrics {
+                    fail_rate_pct: Some(2.1),
+                    ..m(85.5, power, hash, freq, volt)
+                };
+                if let Some(TuneAction::SetFrequency(next_f)) = t.evaluate(&metric) {
+                    freq = next_f;
+                }
+            }
+        }
+        assert!(freq >= 420.0, "expected MaxHash to climb to >= 420 MHz, got {freq} MHz");
+        let (best_sp, _) = t.best_point().expect("best recorded");
+        assert!(best_sp.frequency_mhz >= 420.0, "expected best >= 420 MHz, got {}", best_sp.frequency_mhz);
     }
 }

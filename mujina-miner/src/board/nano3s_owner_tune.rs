@@ -532,12 +532,24 @@ pub(crate) fn fan_step(st: &mut FanState, temp: Option<f32>, cap: f32, target: f
                 // Temperature is below target but actively rising toward it: hold/pre-ramp
                 // rather than cutting airflow right into a rising thermal wave.
                 st.duty = (st.duty + FAN_KD * dt).clamp(FAN_DUTY_MIN, 100.0);
+            } else if dt > 0.05 {
+                // Temperature is rising (slowly near target or rebounding after cool-down):
+                // never cut fan duty into a positive dT/dt wave; pre-ramp if rebounding fast.
+                if dt > 1.5 {
+                    st.duty = (st.duty + 0.5 * FAN_KD * dt).clamp(FAN_DUTY_MIN, 100.0);
+                }
             } else {
-                // Cooling below target: cap step-down rate when within 8 C of target
+                // Cooling or flat below target: cap step-down rate when within 8 C of target
                 // so the fan settles at steady-state equilibrium instead of crashing to 20 %.
+                // Maintain a 28 % floor when within 2.5 C of a high target (>= 80 C).
                 let raw_step = FAN_KP * (t - target);
                 let step = if t > target - 8.0 { raw_step.max(-6.0) } else { raw_step };
-                st.duty = (st.duty + step).clamp(FAN_DUTY_MIN, 100.0);
+                let floor = if target >= 80.0 && t >= target - 2.5 {
+                    28.0_f32.min(st.duty)
+                } else {
+                    FAN_DUTY_MIN
+                };
+                st.duty = (st.duty + step).clamp(floor, 100.0);
             }
         }
     }
@@ -1383,5 +1395,18 @@ mod tests {
         // not keep the old profile's 68.0 C
         o.pick_profile(TuneProfile::Balanced, None);
         assert_eq!(o.fan_target_c(), 85.0);
+    }
+
+    #[test]
+    fn fan_step_holds_on_rising_temp_and_maintains_28_floor_near_high_target() {
+        let mut st = st_at(34.0);
+        // Cooling slightly at 84.5 C (within 2.5 C of 86.0 C target): steps down to 31 %, then clamps at 28 % floor.
+        assert_eq!(fan_step(&mut st, Some(84.5), 90.0, 86.0, false), Some(31));
+        assert_eq!(fan_step(&mut st, Some(84.5), 90.0, 86.0, false), Some(28));
+        assert_eq!(fan_step(&mut st, Some(84.5), 90.0, 86.0, false), None);
+        assert_eq!(st.duty_percent(), 28);
+        // Slowly rising temperature (84.5 -> 84.7 C, dt = +0.2): holds duty instead of stepping down.
+        assert_eq!(fan_step(&mut st, Some(84.7), 90.0, 86.0, false), None);
+        assert_eq!(st.duty_percent(), 28);
     }
 }
