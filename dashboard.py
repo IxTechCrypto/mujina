@@ -627,8 +627,15 @@ class H(http.server.BaseHTTPRequestHandler):
                 "power": {
                     "shared_rail": False
                 },
+                "pool": {
+                    "apply": "restart"
+                },
                 "boards": board_caps
             }).encode())
+        elif self.path.startswith("/api/v0/pool"):
+            s = fetch_settings() or {}
+            pool = s.get("pool") or {"url": "", "user": "", "password_set": False}
+            self._send(200, json.dumps(pool).encode())
         elif "/autotune" in self.path:
             board = None
             if "/boards/" in self.path:
@@ -652,8 +659,8 @@ class H(http.server.BaseHTTPRequestHandler):
                 self._send(404, json.dumps({"error": f"autotune not found for board {board}"}).encode())
         elif self.path.startswith("/minersettings"):
             self._send(200, json.dumps(fetch_settings() or {}).encode())
-        elif self.path.startswith("/nano3s-detail"):
-            self._send(404, json.dumps({"error": "nano3s-detail not available on host proxy"}).encode())
+        elif self.path.startswith("/nano3s-detail") or self.path.startswith("/api/v0/"):
+            self._send(404, json.dumps({"error": "endpoint not available on host proxy"}).encode())
         elif self.path.startswith("/logs"):
             parsed = urllib.parse.urlparse(self.path)
             query = urllib.parse.parse_qs(parsed.query)
@@ -692,6 +699,8 @@ class H(http.server.BaseHTTPRequestHandler):
                 or clean_path.startswith("/autotune")
                 or clean_path.startswith("/minersettings")
                 or clean_path.startswith("/restart")
+                or clean_path.startswith("/api/v0/restart")
+                or clean_path.startswith("/api/v0/pool")
                 or clean_path.startswith("/api/v0/boards/")):
             self._send(404, b'{"ok":false}')
             return
@@ -702,10 +711,27 @@ class H(http.server.BaseHTTPRequestHandler):
             self._send(400, json.dumps({"ok": False, "reason": str(e)}).encode())
             return
 
-        if clean_path.startswith("/restart"):
+        if clean_path.startswith("/restart") or clean_path.startswith("/api/v0/restart"):
             ok, detail = restart_miner()
             self._send(200 if ok else 502,
                        json.dumps({"ok": ok, "detail": detail}).encode())
+            return
+
+        if clean_path.startswith("/api/v0/pool"):
+            cur = ((fetch_settings() or {}).get("pool")) or {}
+            pool_patch = {
+                "url": req.get("url", cur.get("url", "")),
+                "user": req.get("user", cur.get("user", "")),
+            }
+            if req.get("password"):
+                pool_patch["password"] = req["password"]
+            ok, detail = patch_settings({"pool": pool_patch})
+            if ok:
+                new_pool = (detail or {}).get("pool") or pool_patch
+                self._send(200, json.dumps(new_pool).encode())
+            else:
+                code = 400 if ("url" in str(detail).lower() or "user" in str(detail).lower() or "400" in str(detail)) else 502
+                self._send(code, json.dumps({"ok": False, "detail": detail}).encode())
             return
 
         # Miner-wide, so it names no board and is handled before the
@@ -761,6 +787,16 @@ class H(http.server.BaseHTTPRequestHandler):
                 if req.get(k) is not None:
                     payload[k] = req[k]
             ok, detail = patch_fan(board, payload)
+        elif action == "pause":
+            try:
+                p_req = urllib.request.Request(
+                    API, data=json.dumps({"paused": bool(req.get("paused"))}).encode(),
+                    method="PATCH", headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(p_req, timeout=8) as r:
+                    ok, detail = True, r.status
+            except Exception as e:
+                ok, detail = False, str(e)
         else:
             self._send(404, b'{"ok":false,"reason":"unknown action"}')
             return
