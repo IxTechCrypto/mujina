@@ -251,6 +251,7 @@ pub struct Caps {
     /// Trim voltage for efficiency while stable.
     pub seek_efficiency: bool,
     pub continuous: bool,
+    pub max_fail_rate_pct: Option<f32>,
 }
 
 impl TuneProfile {
@@ -262,12 +263,17 @@ impl TuneProfile {
             TuneProfile::Balanced => (true, true),
             TuneProfile::MaxHash => (true, false),
         };
+        let max_fail_rate_pct = match self {
+            TuneProfile::MaxHash => env.max_fail_rate_pct.map(|m| m.max(25.0)),
+            _ => env.max_fail_rate_pct,
+        };
         Caps {
             temp_c: limits.temp_c,
             power_w: limits.power_w,
             seek_hash,
             seek_efficiency,
             continuous: false,
+            max_fail_rate_pct,
         }
     }
 }
@@ -321,6 +327,7 @@ impl TuneMode {
                 seek_hash: false,
                 seek_efficiency: false,
                 continuous: false,
+                max_fail_rate_pct: env.max_fail_rate_pct,
             },
             TuneMode::Target(TuneTarget::Hashrate(_)) => Caps {
                 temp_c: env.target_temp_c,
@@ -330,6 +337,7 @@ impl TuneMode {
                 seek_hash: false,
                 seek_efficiency: false,
                 continuous: false,
+                max_fail_rate_pct: env.max_fail_rate_pct,
             },
         }
     }
@@ -1023,7 +1031,7 @@ impl AutoTuner {
         // step back to the last good voltage and lock there. `probe_floor_mv`
         // keeps the efficiency walk from trimming to it again.
         if let Some(prev_mv) = self.pending_trim_from_mv.take()
-            && let (Some(max), Some(rate)) = (env.max_fail_rate_pct, m.fail_rate_pct)
+            && let (Some(max), Some(rate)) = (caps.max_fail_rate_pct, m.fail_rate_pct)
             && rate > max
         {
             let failed_mv = self.commanded_voltage(m);
@@ -1043,7 +1051,7 @@ impl AutoTuner {
         // hashrate or J/TH: never record it as best or climb from it. Raise
         // voltage a step (power permitting), else drop the clock a step. The
         // efficiency walk also stays above it from now on.
-        if let (Some(max), Some(rate)) = (env.max_fail_rate_pct, m.fail_rate_pct)
+        if let (Some(max), Some(rate)) = (caps.max_fail_rate_pct, m.fail_rate_pct)
             && rate > max
         {
             let commanded_v = self.commanded_voltage(m);
@@ -1153,7 +1161,7 @@ impl AutoTuner {
                 let fine_climb_win = env.average_judgement
                     && is_climb
                     && (hashrate > best_hash * 1.005
-                        || (m.fail_rate_pct.is_some_and(|r| r <= 5.0)
+                        || (m.fail_rate_pct.is_some_and(|r| r <= caps.max_fail_rate_pct.unwrap_or(5.0))
                             && m.power_w > best_power + 0.5
                             && hashrate >= best_hash * (1.0 - HASHRATE_EQUAL_TOLERANCE)));
                 let hash_win = hashrate > best_hash * (1.0 + IMPROVEMENT_MARGIN) || fine_climb_win;
@@ -2611,5 +2619,23 @@ mod tests {
         assert!(freq >= 420.0, "expected MaxHash to climb to >= 420 MHz, got {freq} MHz");
         let (best_sp, _) = t.best_point().expect("best recorded");
         assert!(best_sp.frequency_mhz >= 420.0, "expected best >= 420 MHz, got {}", best_sp.frequency_mhz);
+    }
+
+    #[test]
+    fn max_hash_allows_up_to_25pct_fail_rate_while_other_profiles_enforce_envelope_cap() {
+        // Balanced enforces 10% from nano_env: 18% fails and triggers voltage raise
+        let mut t_bal = nano_tuner(TuneProfile::Balanced);
+        assert_eq!(
+            step_to_action(&mut t_bal, &nano_m(85.0, 3444, Some(18.0))),
+            Some(TuneAction::SetVoltage(3470))
+        );
+
+        // MaxHash expands the cap to 25%: 18% is tolerated and does not trip failure backoff
+        let mut t_max = nano_tuner(TuneProfile::MaxHash);
+        let a = step_to_action(&mut t_max, &nano_m(85.0, 3444, Some(18.0)));
+        assert_ne!(a, Some(TuneAction::SetVoltage(3470)));
+        // 27% breaches the 25% cap and triggers safety action
+        let a_fail = step_to_action(&mut t_max, &nano_m(85.0, 3444, Some(27.0)));
+        assert_eq!(a_fail, Some(TuneAction::SetVoltage(3470)));
     }
 }
