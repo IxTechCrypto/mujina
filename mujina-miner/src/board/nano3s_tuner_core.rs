@@ -1157,7 +1157,10 @@ impl AutoTuner {
                     && m.power_w <= best_power * (1.0 - POWER_SAVING_MARGIN)
                     && hashrate >= best_hash * (1.0 - HASHRATE_EQUAL_TOLERANCE);
                 let eff_win = power_win || efficiency < best_eff * (1.0 - IMPROVEMENT_MARGIN);
-                let is_climb = m.frequency_mhz > best_sp.frequency_mhz + FREQ_TOLERANCE_MHZ;
+                let is_climb = m.frequency_mhz > best_sp.frequency_mhz + FREQ_TOLERANCE_MHZ
+                    || (caps.seek_hash
+                        && !caps.seek_efficiency
+                        && commanded_v > best_sp.core_voltage_mv + VOLT_TOLERANCE_MV);
                 let fine_climb_win = env.average_judgement
                     && is_climb
                     && (hashrate > best_hash * 1.005

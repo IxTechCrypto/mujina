@@ -41,7 +41,7 @@ pub(crate) const OWNER_POWER_MARGIN_W: f32 = 3.0;
 pub(crate) const DOMAIN_SPACING_MHZ: u32 = 20;
 /// Per-domain ceiling enforced by `patch_board_tuning`'s validator: base 440
 /// + 3*20 = 500.
-pub(crate) const MAX_DOMAIN_MHZ: u32 = 500;
+pub(crate) const MAX_DOMAIN_MHZ: u32 = 520;
 /// Voltage grid anchor: the DC/DC quantizes as 3600 +/- n*26 mV
 /// (POWER_TARGET_STEP_MV's comment in nano3s.rs).
 const VOLT_GRID_ANCHOR_MV: i32 = 3600;
@@ -73,10 +73,10 @@ pub(crate) const BACKSTOP_FLOOR_MHZ: u32 = 100;
 ///   points (14.5 % at 3496/LOW, 2.8-3.2 % at the good points).
 pub(crate) const NANO3S_ENVELOPE: TuneEnvelope = TuneEnvelope {
     min_freq_mhz: 210.0,
-    max_freq_mhz: 440.0,
+    max_freq_mhz: 460.0,
     freq_step_mhz: 10.0,
     min_voltage_mv: 3392,
-    max_voltage_mv: 3800,
+    max_voltage_mv: 3860,
     voltage_step_mv: 26,
     forbidden_voltages_mv: &[3600],
     settle_cycles: OWNER_SETTLE_CYCLES,
@@ -937,8 +937,8 @@ mod tests {
         assert_eq!(snap_voltage_mv(1000), 3392);
         assert_eq!(snap_voltage_mv(3380), 3392);
         assert_eq!(snap_voltage_mv(3790), 3782);
-        assert_eq!(snap_voltage_mv(3805), 3782); // 3808 snapped, clamped to the top grid value
-        assert_eq!(snap_voltage_mv(9000), 3782);
+        assert_eq!(snap_voltage_mv(3805), 3808);
+        assert_eq!(snap_voltage_mv(9000), 3860);
     }
 
     #[test]
@@ -946,8 +946,9 @@ mod tests {
         assert_eq!(domain_freqs(210.0), [210, 230, 250, 270]);
         assert_eq!(domain_freqs(338.0), [338, 358, 378, 398]);
         assert_eq!(domain_freqs(440.0), [440, 460, 480, 500]);
+        assert_eq!(domain_freqs(460.0), [460, 480, 500, 520]);
         assert_eq!(domain_freqs(100.0), [210, 230, 250, 270]);
-        assert_eq!(domain_freqs(900.0), [440, 460, 480, 500]);
+        assert_eq!(domain_freqs(900.0), [460, 480, 500, 520]);
     }
 
     #[test]
@@ -1048,8 +1049,8 @@ mod tests {
 
     #[test]
     fn voltage_clamps_stay_on_the_grid() {
-        assert_eq!(snap_voltage_mv(3800), 3782);
-        assert_eq!(snap_voltage_mv(9999), 3782);
+        assert_eq!(snap_voltage_mv(3800), 3808);
+        assert_eq!(snap_voltage_mv(9999), 3860);
         assert_eq!(snap_voltage_mv(3392), 3392);
         assert_eq!(snap_voltage_mv(1000), 3392);
         assert_eq!(snap_voltage_mv(3600), 3574);
@@ -1132,7 +1133,7 @@ mod tests {
         assert_eq!((e.balanced.temp_c, e.balanced.power_w), (90.0, 95.0));
         assert_eq!((e.max_hash.temp_c, e.max_hash.power_w), (90.0, 133.0));
         // Hard limits and tuner behavior come from the constants.
-        assert_eq!(e.max_voltage_mv, 3800);
+        assert_eq!(e.max_voltage_mv, 3860);
         assert_eq!(e.forbidden_voltages_mv, &[3600]);
         assert!(e.average_judgement);
         assert_eq!(e.best_point_margin_w, 3.0);

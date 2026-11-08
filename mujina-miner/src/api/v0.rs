@@ -222,7 +222,7 @@ async fn patch_board_tuning(
     }
     // Frequency range check; the four PLL ramp domains must be non-decreasing.
     if let Some(f) = req.pll_freq_mhz {
-        let in_range = f.iter().all(|&mhz| (100..=500).contains(&mhz));
+        let in_range = f.iter().all(|&mhz| (100..=520).contains(&mhz));
         let non_decreasing = f[0] <= f[1] && f[1] <= f[2] && f[2] <= f[3];
         if !in_range || !non_decreasing {
             return Err(StatusCode::BAD_REQUEST);
@@ -230,7 +230,7 @@ async fn patch_board_tuning(
     }
     // Voltage range check.
     if let Some(v) = req.voltage_mv
-        && !(3300..=3800).contains(&v)
+        && !(3300..=3860).contains(&v)
     {
         return Err(StatusCode::BAD_REQUEST);
     }

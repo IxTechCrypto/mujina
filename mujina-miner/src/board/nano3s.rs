@@ -291,7 +291,7 @@ const POWER_TARGET_DEADBAND_W: f64 = 5.0;
 /// never go outside this range regardless of how far off-target power
 /// reads.
 const POWER_TARGET_MIN_MV: i32 = 3496;
-const POWER_TARGET_MAX_MV: i32 = 3800;
+const POWER_TARGET_MAX_MV: i32 = 3860;
 /// Voltage value to avoid landing on exactly (causes core-domain
 /// migration collapse). A step that would land here takes one further
 /// step in the same direction instead.
@@ -497,7 +497,7 @@ fn level_to_freq_voltage_limit(level: f64) -> ([u32; 4], u32, f64) {
     // rounding drift. Clamped to 440 so domain3 (base+60) never exceeds
     // the 500MHz/domain absolute ceiling.
     let base = (lo_freq[0] as f64 + frac * (hi_freq[0] as f64 - lo_freq[0] as f64)).round() as i32;
-    let base = base.clamp(TEMP_TARGET_MIN_MHZ as i32, 440);
+    let base = base.clamp(TEMP_TARGET_MIN_MHZ as i32, 460);
     let freq = [base as u32, (base + 20) as u32, (base + 40) as u32, (base + 60) as u32];
 
     let volt_f = lo_volt as f64 + frac * (hi_volt as f64 - lo_volt as f64);
