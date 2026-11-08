@@ -1,4 +1,4 @@
-//! Per-chip clock tuner for the Nano 3S chain, layered on the owner tuner.
+//! Per-chip clock tuner for the Nano 3S chain, layered on the AutoTune.
 //!
 //! The 12 A3197S chips are a series voltage stack: a chip clocked lower draws
 //! less and takes a larger share of the rail, so moving one chip moves every
@@ -9,7 +9,7 @@
 //! otherwise the strongest low-fail chip is stepped up.
 //!
 //! Pure state machine (no hardware calls): the caller feeds one
-//! [`ChipMetrics`] per tick while the owner tuner is locked, makes the
+//! [`ChipMetrics`] per tick while the AutoTune is locked, makes the
 //! firmware match [`ChipTuner::offsets`] (retrying failed sends), persists
 //! only [`ChipTuner::committed_offsets`] (never an unjudged trial), and calls
 //! [`ChipTuner::interrupt`] whenever the base point changes or ticking stops.
@@ -657,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn step_down_trial_is_not_aborted_by_high_board_fail_and_completes_within_owner_window() {
+    fn step_down_trial_is_not_aborted_by_high_board_fail_and_completes_within_auto_tune_window() {
         let mut t = tuner(ChipTunerConfig::default());
         let mut m = flat(8.0);
         m.chip_fail_pct[5] = 80.0; // board_fail = 14.0% > max_board_fail_pct (10.0%)
@@ -681,7 +681,7 @@ mod tests {
         for _ in 0..(t.cfg.discard_ticks + t.cfg.settle_ticks) {
             t.tick(&improved);
         }
-        // Total ticks elapsed = 6 + 2 + 6 = 14 ticks (< 19 ticks in owner's 20-tick window)
+        // Total ticks elapsed = 6 + 2 + 6 = 14 ticks (< 19 ticks in AutoTune's 20-tick window)
         assert_eq!(t.committed_offsets()[5], -10, "step-down must be committed: {}", t.last_event());
     }
 

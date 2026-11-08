@@ -1,9 +1,9 @@
-//! Nano 3S adapter for the owner autotuner ("owner tuner").
+//! Nano 3S adapter for AutoTune.
 //!
 //! Everything here is pure (no IPC, no files) so it tests on the host without
 //! the `nano3s` feature. `nano3s.rs::run_worker` owns the hardware side: it
-//! builds [`Metrics`] with [`metrics_from_readings`], ticks [`OwnerTune`], and
-//! executes the returned [`OwnerCmd`]s over IPC.
+//! builds [`Metrics`] with [`metrics_from_readings`], ticks [`AutoTune`], and
+//! executes the returned [`AutoTuneCmd`]s over IPC.
 #![allow(dead_code)]
 
 use std::sync::Mutex;
@@ -16,26 +16,26 @@ use super::nano3s_tuner_core::{
     AutoTuner, CapLimits, Metrics, SearchMemory, TuneAction, TuneEnvelope, TunePhase, TuneProfile, TuneSetpoint,
 };
 
-/// How often the owner tuner is evaluated. The status block of `run_worker`
+/// How often the autotuner is evaluated. The status block of `run_worker`
 /// runs on every IPC status refresh (~15 s per the existing comments); the
 /// adapter gates on wall clock so a faster refresh cannot shorten a settle.
-pub(crate) const OWNER_TICK: Duration = Duration::from_secs(15);
+pub(crate) const AUTO_TUNE_TICK: Duration = Duration::from_secs(15);
 
 /// Settle = 20 ticks x 15 s = 300 s, two SmartSpeed windows (~131.1 s each).
 /// The tuner judges the MEAN of every tick since the last change (SmartSpeed
 /// hashrate is 3-5 % noisy window to window), so a step is judged on
 /// hashrate/fail-rate that reflect it.
-pub(crate) const OWNER_SETTLE_CYCLES: u32 = 20;
+pub(crate) const AUTO_TUNE_SETTLE_CYCLES: u32 = 20;
 /// One tick (15 s) between thermal back-off steps (spec: ~12-15 s).
-pub(crate) const OWNER_SAFETY_SETTLE_CYCLES: u32 = 1;
+pub(crate) const AUTO_TUNE_SAFETY_SETTLE_CYCLES: u32 = 1;
 /// 4 ticks (60 s) between power-cap back-off steps. At one tick, warming
 /// chips (leakage) kept power over Efficient's 95 W cap while the clock was
 /// cut 348 -> 258 MHz in 4 min, landing 11 W under the cap (2026-10-24).
-pub(crate) const OWNER_POWER_SETTLE_CYCLES: u32 = 4;
+pub(crate) const AUTO_TUNE_POWER_SETTLE_CYCLES: u32 = 4;
 
 /// Margin (W) the tuner's own power cap sits below `effective_safety_w`, so
 /// the tuner backs the clock off before aadhi's 137 W / PD safety trip fires.
-pub(crate) const OWNER_POWER_MARGIN_W: f32 = 3.0;
+pub(crate) const AUTO_TUNE_POWER_MARGIN_W: f32 = 3.0;
 
 /// The four PLL domains sit 20 MHz apart (210/230/250/270 ... 420/440/460/480).
 pub(crate) const DOMAIN_SPACING_MHZ: u32 = 20;
@@ -68,7 +68,7 @@ pub(crate) const BACKSTOP_FLOOR_MHZ: u32 = 100;
 /// - power caps are WHOLE-BOARD watts (INA226 input power): Quiet 60,
 ///   Efficient 90, Balanced 110 bracket the baselines (50.6 W LOW, 95.8 W
 ///   MED/338-398). MaxHash 137 = POWER_TARGET_SAFETY_W; every cap is further
-///   clamped at runtime by `owner_power_ceiling(effective_safety_w)`.
+///   clamped at runtime by `auto_tune_power_ceiling(effective_safety_w)`.
 /// - max_fail_rate_pct 10: the baselines show fail < ~10 % marks usable
 ///   points (14.5 % at 3496/LOW, 2.8-3.2 % at the good points).
 pub(crate) const NANO3S_ENVELOPE: TuneEnvelope = TuneEnvelope {
@@ -79,9 +79,9 @@ pub(crate) const NANO3S_ENVELOPE: TuneEnvelope = TuneEnvelope {
     max_voltage_mv: 3860,
     voltage_step_mv: 26,
     forbidden_voltages_mv: &[3600],
-    settle_cycles: OWNER_SETTLE_CYCLES,
-    safety_settle_cycles: OWNER_SAFETY_SETTLE_CYCLES,
-    power_settle_cycles: OWNER_POWER_SETTLE_CYCLES,
+    settle_cycles: AUTO_TUNE_SETTLE_CYCLES,
+    safety_settle_cycles: AUTO_TUNE_SAFETY_SETTLE_CYCLES,
+    power_settle_cycles: AUTO_TUNE_POWER_SETTLE_CYCLES,
     quiet: CapLimits { temp_c: 70.0, power_w: 60.0 },
     efficient: CapLimits { temp_c: 80.0, power_w: 90.0 },
     balanced: CapLimits { temp_c: 88.0, power_w: 90.0 },
@@ -163,7 +163,7 @@ pub(crate) fn parse_cali(text: &str) -> Option<[CaliMode; 3]> {
     (a.power_w < b.power_w && b.power_w < c.power_w).then_some([a, b, c])
 }
 
-/// Builds the owner-tuner envelope from the device calibration: voltage floor
+/// Builds the autotuner envelope from the device calibration: voltage floor
 /// = mode0, Quiet = mode0 (P, T), Efficient = (mode1 P, mode0 T), Balanced =
 /// (mode1 P, mode2 T), MaxHash = mode2 (P, T). mode1 is Canaan's Medium:
 /// Balanced gets stock Medium's power budget and a cap high enough for its
@@ -194,21 +194,21 @@ pub(crate) fn load_envelope(path: &str) -> (TuneEnvelope, bool) {
 
 // --- API types -------------------------------------------------------------
 
-/// Body of `PATCH /api/v0/boards/{name}/owner-tune`.
+/// Body of `PATCH /api/v0/boards/{name}/auto-tune`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
-pub struct OwnerTuneRequest {
-    /// `quiet`, `efficient`, `balanced` or `max_hash`; `null` turns the owner
-    /// tuner off. Absent (with `chip_temp_target_c` present) leaves the
+pub struct AutoTuneRequest {
+    /// `quiet`, `efficient`, `balanced` or `max_hash`; `null` turns AutoTune
+    /// off. Absent (with `chip_temp_target_c` present) leaves the
     /// profile unchanged; `{}` still means off.
     #[serde(default, deserialize_with = "present_or_null")]
     #[schema(value_type = Option<TuneProfile>)]
     pub profile: Option<Option<TuneProfile>>,
-    /// Hottest-chip temperature (60..88 C) the fan loop holds while the owner
-    /// tuner is on. Default: the profile's temp cap minus 5 C. Persisted.
+    /// Hottest-chip temperature (60..88 C) the fan loop holds while AutoTune
+    /// is on. Default: the profile's temp cap minus 5 C. Persisted.
     #[serde(default)]
     pub chip_temp_target_c: Option<f32>,
-    /// Per-chip clock tuner on/off while the owner tuner is on (it runs only
-    /// once the owner tuner has locked). Absent leaves it unchanged. Persisted.
+    /// Per-chip clock tuner on/off while the autotuner is on (it runs only
+    /// once the autotuner has locked). Absent leaves it unchanged. Persisted.
     #[serde(default)]
     pub per_chip: Option<bool>,
     /// Continuous dynamic tuning: continuously probes upward when thermal/cooling headroom opens up.
@@ -223,7 +223,7 @@ fn present_or_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Opti
 /// Fan-target range accepted by the API.
 pub(crate) const FAN_TARGET_RANGE_C: std::ops::RangeInclusive<f32> = 60.0..=88.0;
 
-impl OwnerTuneRequest {
+impl AutoTuneRequest {
     /// `Err` (-> 400) when `chip_temp_target_c` is outside 60..88.
     pub(crate) fn validate(&self) -> Result<(), ()> {
         match self.chip_temp_target_c {
@@ -252,9 +252,9 @@ pub struct AveragingProgress {
     pub needed: u32,
 }
 
-/// Body of `GET /api/v0/boards/{name}/owner-tune`.
+/// Body of `GET /api/v0/boards/{name}/auto-tune`.
 #[derive(Clone, Debug, Default, Serialize, ToSchema)]
-pub struct OwnerTuneStatus {
+pub struct AutoTuneStatus {
     pub enabled: bool,
     pub profile: Option<TuneProfile>,
     pub phase: Option<TunePhase>,
@@ -270,23 +270,23 @@ pub struct OwnerTuneStatus {
     /// Continuous dynamic tuning enabled.
     pub continuous: bool,
     /// Last 20 tuner log entries, newest last.
-    pub events: Vec<OwnerEvent>,
+    pub events: Vec<AutoTuneEvent>,
     /// Best measured point, if any.
-    pub best: Option<OwnerBest>,
+    pub best: Option<AutoTuneBest>,
     /// Per-chip tuner state; `None` while it is off.
     pub per_chip: Option<ChipTuneStatus>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ChipTuneStatus {
-    /// `baseline`, `trial` or `converged`; `waiting` until the owner tuner locks.
+    /// `baseline`, `trial` or `converged`; `waiting` until the autotuner locks.
     pub phase: String,
     pub last_event: String,
     pub offsets_mhz: Vec<i16>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
-pub struct OwnerEvent {
+pub struct AutoTuneEvent {
     /// Approximate age (15 s per tuner tick).
     pub t_secs_ago: u64,
     pub message: String,
@@ -297,20 +297,20 @@ pub struct OwnerEvent {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, ToSchema)]
-pub struct OwnerBest {
+pub struct AutoTuneBest {
     pub freq_mhz: f32,
     pub voltage_mv: u16,
     pub j_th: f32,
 }
 
-static OWNER_TUNE_STATUS: Mutex<Option<OwnerTuneStatus>> = Mutex::new(None);
+static AUTO_TUNE_STATUS: Mutex<Option<AutoTuneStatus>> = Mutex::new(None);
 
-pub(crate) fn publish_status(s: OwnerTuneStatus) {
-    *OWNER_TUNE_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+pub(crate) fn publish_status(s: AutoTuneStatus) {
+    *AUTO_TUNE_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
 }
 
-pub(crate) fn read_status() -> OwnerTuneStatus {
-    OWNER_TUNE_STATUS
+pub(crate) fn read_status() -> AutoTuneStatus {
+    AUTO_TUNE_STATUS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
@@ -326,10 +326,10 @@ pub(crate) fn directive_for(profile: Option<TuneProfile>) -> String {
         Some(TuneProfile::Balanced) => "balanced",
         Some(TuneProfile::MaxHash) => "max_hash",
     };
-    format!("owner_tune:{name}")
+    format!("auto_tune:{name}")
 }
 
-/// Parses the part after `owner_tune:`.
+/// Parses the part after `auto_tune:`.
 pub(crate) fn parse_directive(v: &str) -> Result<Option<TuneProfile>, ()> {
     match v.trim() {
         "off" => Ok(None),
@@ -341,9 +341,9 @@ pub(crate) fn parse_directive(v: &str) -> Result<Option<TuneProfile>, ()> {
     }
 }
 
-/// Parsed `owner_tune:` control line: `<profile|off|keep>[;fan=<C>]`.
+/// Parsed `auto_tune:` control line: `<profile|off|keep>[;fan=<C>]`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct OwnerDirective {
+pub(crate) struct AutoTuneDirective {
     /// `Some(None)` = off, `None` = keep (`keep`).
     pub profile: Option<Option<TuneProfile>>,
     pub fan_target_c: Option<f32>,
@@ -355,7 +355,7 @@ pub(crate) struct OwnerDirective {
 
 pub(crate) fn directive_for_request(profile: Option<Option<TuneProfile>>, fan_target_c: Option<f32>) -> String {
     let head = match profile {
-        None => "owner_tune:keep".to_string(),
+        None => "auto_tune:keep".to_string(),
         Some(p) => directive_for(p),
     };
     match fan_target_c {
@@ -364,7 +364,7 @@ pub(crate) fn directive_for_request(profile: Option<Option<TuneProfile>>, fan_ta
     }
 }
 
-pub(crate) fn parse_owner_directive(v: &str) -> Result<OwnerDirective, ()> {
+pub(crate) fn parse_auto_tune_directive(v: &str) -> Result<AutoTuneDirective, ()> {
     let mut parts = v.split(';');
     let head = parts.next().unwrap_or("").trim();
     let profile = if head == "keep" { None } else { Some(parse_directive(head)?) };
@@ -395,7 +395,7 @@ pub(crate) fn parse_owner_directive(v: &str) -> Result<OwnerDirective, ()> {
         }
         fan_target_c = Some(c);
     }
-    Ok(OwnerDirective { profile, fan_target_c, chip_tune, continuous })
+    Ok(AutoTuneDirective { profile, fan_target_c, chip_tune, continuous })
 }
 
 // --- chip-temp fan loop ------------------------------------------------------
@@ -603,9 +603,9 @@ pub(crate) fn domain_freqs(base_mhz: f32) -> [u32; 4] {
 /// Continuous ceiling = min(80 % of the detected PD contract, safety trip -
 /// 3 W). On the 140 W EPR supply that is 112 W. An undetected contract is
 /// `INFINITY`, which leaves the safety-trip bound.
-pub(crate) fn owner_power_ceiling(pd_contract_w: f64, effective_safety_w: f64) -> f32 {
+pub(crate) fn auto_tune_power_ceiling(pd_contract_w: f64, effective_safety_w: f64) -> f32 {
     let by_pd = (pd_contract_w * PD_CONTINUOUS_FRACTION) as f32;
-    by_pd.min((effective_safety_w as f32) - OWNER_POWER_MARGIN_W).max(0.0)
+    by_pd.min((effective_safety_w as f32) - AUTO_TUNE_POWER_MARGIN_W).max(0.0)
 }
 
 /// Fraction of the PD contract the tuner may draw continuously.
@@ -651,7 +651,7 @@ pub(crate) fn metrics_from_readings(
 
 /// A hardware command the worker must perform for a tuner action.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum OwnerCmd {
+pub(crate) enum AutoTuneCmd {
     /// `nano3s_ipc_set_mode(freqs)`.
     SetMode([u32; 4]),
     /// `nano3s_ipc_set_voltage_raw(mv)`.
@@ -663,18 +663,18 @@ pub(crate) enum OwnerCmd {
 }
 
 /// Maps a tuner action to hardware commands. Fan actions map to nothing here:
-/// `OwnerTune::evaluate` hands them to the fan loop.
-pub(crate) fn action_to_cmds(action: TuneAction) -> Vec<OwnerCmd> {
+/// `AutoTune::evaluate` hands them to the fan loop.
+pub(crate) fn action_to_cmds(action: TuneAction) -> Vec<AutoTuneCmd> {
     match action {
-        TuneAction::SetFrequency(base) => vec![OwnerCmd::SetMode(domain_freqs(base))],
-        TuneAction::SetVoltage(mv) => vec![OwnerCmd::SetVoltage(snap_voltage_mv(mv as i64) as i32)],
-        // Fan actions are routed through the fan loop (`OwnerTune`), which
-        // owns the fan while the owner tuner is on.
+        TuneAction::SetFrequency(base) => vec![AutoTuneCmd::SetMode(domain_freqs(base))],
+        TuneAction::SetVoltage(mv) => vec![AutoTuneCmd::SetVoltage(snap_voltage_mv(mv as i64) as i32)],
+        // Fan actions are routed through the fan loop (`AutoTune`), which
+        // owns the fan while the autotuner is on.
         TuneAction::SetFanFull | TuneAction::RestoreFanAuto | TuneAction::SetFanMinPercent(_) => vec![],
     }
 }
 
-/// Exclusivity: enabling the owner tuner clears aadhi's three loops.
+/// Exclusivity: enabling the autotuner clears aadhi's three loops.
 /// Returns true if any was actually set.
 pub(crate) fn clear_other_loops(
     power_target_w: &mut Option<f64>,
@@ -688,14 +688,14 @@ pub(crate) fn clear_other_loops(
     any
 }
 
-/// At startup, the owner tuner wins over any persisted/env loop.
-pub(crate) fn startup_loop_allowed(owner_profile: Option<TuneProfile>, autotune_hashrate: Option<f64>) -> bool {
-    owner_profile.is_none() && autotune_hashrate.is_none()
+/// At startup, the autotuner wins over any persisted/env loop.
+pub(crate) fn startup_loop_allowed(auto_tune_profile: Option<TuneProfile>, autotune_hashrate: Option<f64>) -> bool {
+    auto_tune_profile.is_none() && autotune_hashrate.is_none()
 }
 
 // --- stateful wrapper ------------------------------------------------------
 
-pub(crate) struct OwnerTune {
+pub(crate) struct AutoTune {
     tuner: AutoTuner,
     profile: Option<TuneProfile>,
     next_tick: Option<std::time::Instant>,
@@ -707,7 +707,7 @@ pub(crate) struct OwnerTune {
     chip_status: Option<ChipTuneStatus>,
 }
 
-impl OwnerTune {
+impl AutoTune {
     pub(crate) fn new() -> Self {
         Self::with_envelope(NANO3S_ENVELOPE)
     }
@@ -770,7 +770,7 @@ impl OwnerTune {
 
     /// One fan-loop step; at most one harness write per tick. `temp_max_c`
     /// is the raw hottest-chip reading (`None`/<=0 = missing -> 100 %).
-    pub(crate) fn fan_tick(&mut self, temp_max_c: Option<f32>) -> Option<OwnerCmd> {
+    pub(crate) fn fan_tick(&mut self, temp_max_c: Option<f32>) -> Option<AutoTuneCmd> {
         if self.profile.is_none() {
             return None;
         }
@@ -780,7 +780,7 @@ impl OwnerTune {
         }
         let force = std::mem::take(&mut self.fan_force_pending);
         let target = self.fan_target_c();
-        fan_step(&mut self.fan, temp_max_c, cap, target, force).map(OwnerCmd::FanManual)
+        fan_step(&mut self.fan, temp_max_c, cap, target, force).map(AutoTuneCmd::FanManual)
     }
 
     /// The running profile's search memory (see [`SearchMemory`]).
@@ -831,8 +831,8 @@ impl OwnerTune {
 
     /// Disables the tuner. Returns the harness command that hands the fan
     /// back to auto if this tuner ever took it over.
-    pub(crate) fn disable(&mut self) -> Option<OwnerCmd> {
-        let restore = (self.fan.sent.is_some() || self.tuner.fan_forced()).then_some(OwnerCmd::Fan("fan:auto,"));
+    pub(crate) fn disable(&mut self) -> Option<AutoTuneCmd> {
+        let restore = (self.fan.sent.is_some() || self.tuner.fan_forced()).then_some(AutoTuneCmd::Fan("fan:auto,"));
         self.fan = FanState::default();
         self.fan_force_pending = false;
         self.fan_restore_pending = false;
@@ -850,7 +850,7 @@ impl OwnerTune {
         match self.next_tick {
             Some(t) if now < t => false,
             _ => {
-                self.next_tick = Some(now + OWNER_TICK);
+                self.next_tick = Some(now + AUTO_TUNE_TICK);
                 true
             }
         }
@@ -865,7 +865,7 @@ impl OwnerTune {
         self.tuner.set_power_ceiling(Some(w));
     }
 
-    pub(crate) fn evaluate(&mut self, m: &Metrics) -> Vec<OwnerCmd> {
+    pub(crate) fn evaluate(&mut self, m: &Metrics) -> Vec<AutoTuneCmd> {
         let action = self.tuner.evaluate(m);
         match action {
             Some(TuneAction::SetFanFull) => self.fan_force_pending = true,
@@ -875,13 +875,13 @@ impl OwnerTune {
         action.map(action_to_cmds).unwrap_or_default()
     }
 
-    fn events(&self) -> Vec<OwnerEvent> {
+    fn events(&self) -> Vec<AutoTuneEvent> {
         let now = self.tuner.cycle();
         let all: Vec<_> = self.tuner.events().collect();
         all[all.len().saturating_sub(20)..]
             .iter()
-            .map(|e| OwnerEvent {
-                t_secs_ago: now.saturating_sub(e.cycle) * OWNER_TICK.as_secs(),
+            .map(|e| AutoTuneEvent {
+                t_secs_ago: now.saturating_sub(e.cycle) * AUTO_TUNE_TICK.as_secs(),
                 message: e.message.clone(),
                 freq_mhz: e.frequency_mhz,
                 voltage_mv: e.core_voltage_mv,
@@ -892,7 +892,7 @@ impl OwnerTune {
     }
 
     pub(crate) fn publish(&self, setpoint: Option<TuneSetpoint>) {
-        publish_status(OwnerTuneStatus {
+        publish_status(AutoTuneStatus {
             enabled: self.profile.is_some(),
             profile: self.profile,
             phase: Some(self.tuner.phase()),
@@ -907,7 +907,7 @@ impl OwnerTune {
             continuous_ceiling_w: self.profile.and(self.continuous_ceiling_w),
             continuous: self.tuner.continuous(),
             events: self.events(),
-            best: self.tuner.best_point().map(|(sp, j)| OwnerBest {
+            best: self.tuner.best_point().map(|(sp, j)| AutoTuneBest {
                 freq_mhz: sp.frequency_mhz,
                 voltage_mv: sp.core_voltage_mv,
                 j_th: j,
@@ -973,9 +973,9 @@ mod tests {
     fn actions_map_to_commands() {
         assert_eq!(
             action_to_cmds(TuneAction::SetFrequency(300.0)),
-            vec![OwnerCmd::SetMode([300, 320, 340, 360])]
+            vec![AutoTuneCmd::SetMode([300, 320, 340, 360])]
         );
-        assert_eq!(action_to_cmds(TuneAction::SetVoltage(3600)), vec![OwnerCmd::SetVoltage(3574)]);
+        assert_eq!(action_to_cmds(TuneAction::SetVoltage(3600)), vec![AutoTuneCmd::SetVoltage(3574)]);
         assert!(action_to_cmds(TuneAction::SetFanFull).is_empty());
         assert!(action_to_cmds(TuneAction::RestoreFanAuto).is_empty());
         assert!(action_to_cmds(TuneAction::SetFanMinPercent(40)).is_empty());
@@ -990,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_exclusivity_prefers_owner_and_autotune() {
+    fn startup_exclusivity_prefers_auto_tune_and_autotune_hashrate() {
         assert!(startup_loop_allowed(None, None));
         assert!(!startup_loop_allowed(Some(TuneProfile::Efficient), None));
         assert!(!startup_loop_allowed(None, Some(4.0)));
@@ -1006,43 +1006,43 @@ mod tests {
             Some(TuneProfile::MaxHash),
         ] {
             let d = directive_for(p);
-            assert_eq!(parse_directive(d.strip_prefix("owner_tune:").unwrap()), Ok(p));
+            assert_eq!(parse_directive(d.strip_prefix("auto_tune:").unwrap()), Ok(p));
         }
         assert!(parse_directive("turbo").is_err());
     }
 
     #[test]
     fn request_accepts_null_and_names() {
-        let r: OwnerTuneRequest = serde_json::from_str(r#"{"profile":null}"#).unwrap();
+        let r: AutoTuneRequest = serde_json::from_str(r#"{"profile":null}"#).unwrap();
         assert_eq!(r.profile, Some(None));
         assert_eq!(r.profile_change(), Some(None));
-        let r: OwnerTuneRequest = serde_json::from_str(r#"{"profile":"max_hash"}"#).unwrap();
+        let r: AutoTuneRequest = serde_json::from_str(r#"{"profile":"max_hash"}"#).unwrap();
         assert_eq!(r.profile, Some(Some(TuneProfile::MaxHash)));
         // `{}` is still "off"; a bare fan target leaves the profile alone.
-        let r: OwnerTuneRequest = serde_json::from_str("{}").unwrap();
+        let r: AutoTuneRequest = serde_json::from_str("{}").unwrap();
         assert_eq!(r.profile_change(), Some(None));
-        let r: OwnerTuneRequest = serde_json::from_str(r#"{"chip_temp_target_c":75}"#).unwrap();
+        let r: AutoTuneRequest = serde_json::from_str(r#"{"chip_temp_target_c":75}"#).unwrap();
         assert_eq!(r.profile_change(), None);
         assert!(r.validate().is_ok());
         for bad in ["59.9", "88.1", "0", "200"] {
-            let r: OwnerTuneRequest =
+            let r: AutoTuneRequest =
                 serde_json::from_str(&format!(r#"{{"chip_temp_target_c":{bad}}}"#)).unwrap();
             assert!(r.validate().is_err(), "{bad}");
         }
-        assert!(serde_json::from_str::<OwnerTuneRequest>(r#"{"profile":"nope"}"#).is_err());
+        assert!(serde_json::from_str::<AutoTuneRequest>(r#"{"profile":"nope"}"#).is_err());
     }
 
     #[test]
     fn power_ceiling_and_backstop() {
         // 140 W EPR supply: 80 % = 112 W beats safety trip 137 - 3.
-        assert_eq!(owner_power_ceiling(140.0, 137.0), 112.0);
+        assert_eq!(auto_tune_power_ceiling(140.0, 137.0), 112.0);
         // 100 W SPR contract: 80 W, safety trip (100 - margin) is higher.
-        assert_eq!(owner_power_ceiling(100.0, 97.0), 80.0);
+        assert_eq!(auto_tune_power_ceiling(100.0, 97.0), 80.0);
         // Override/contract looser than the trip: the trip - 3 W wins.
-        assert_eq!(owner_power_ceiling(200.0, 137.0), 134.0);
+        assert_eq!(auto_tune_power_ceiling(200.0, 137.0), 134.0);
         // No PD reading (INFINITY): trip - 3 W.
-        assert_eq!(owner_power_ceiling(f64::INFINITY, 137.0), 134.0);
-        assert_eq!(owner_power_ceiling(1.0, 1.0), 0.0);
+        assert_eq!(auto_tune_power_ceiling(f64::INFINITY, 137.0), 134.0);
+        assert_eq!(auto_tune_power_ceiling(1.0, 1.0), 0.0);
         assert_eq!(backstop_freqs([338, 358, 378, 398]), [308, 328, 348, 368]);
         assert_eq!(backstop_freqs([110, 120, 130, 140]), [100, 100, 100, 110]);
     }
@@ -1060,8 +1060,8 @@ mod tests {
     #[test]
     fn envelope_is_nano_shaped() {
         let e = NANO3S_ENVELOPE;
-        assert_eq!(e.settle_cycles as u64 * OWNER_TICK.as_secs(), 300);
-        assert_eq!(e.power_settle_cycles as u64 * OWNER_TICK.as_secs(), 60);
+        assert_eq!(e.settle_cycles as u64 * AUTO_TUNE_TICK.as_secs(), 300);
+        assert_eq!(e.power_settle_cycles as u64 * AUTO_TUNE_TICK.as_secs(), 60);
         assert!(e.average_judgement);
         assert_eq!(e.best_point_margin_w, 3.0);
         assert_eq!(e.voltage_step_mv, 26);
@@ -1071,13 +1071,13 @@ mod tests {
 
     #[test]
     fn wrapper_ticks_on_wall_clock_and_power_ceiling_wins() {
-        let mut o = OwnerTune::new();
+        let mut o = AutoTune::new();
         let t0 = std::time::Instant::now();
         assert!(!o.tick_due(t0)); // disabled
         o.enable(TuneProfile::MaxHash);
         assert!(o.tick_due(t0));
         assert!(!o.tick_due(t0 + Duration::from_secs(5)));
-        assert!(o.tick_due(t0 + OWNER_TICK));
+        assert!(o.tick_due(t0 + AUTO_TUNE_TICK));
         // A PSU ceiling of 80 W makes 90 W a breach: the clock must come down.
         o.set_power_ceiling(80.0);
         let m = Metrics {
@@ -1091,13 +1091,13 @@ mod tests {
             fail_rate_pct: Some(2.0),
         };
         let mut cmds = vec![];
-        for _ in 0..OWNER_SETTLE_CYCLES {
+        for _ in 0..AUTO_TUNE_SETTLE_CYCLES {
             cmds = o.evaluate(&m);
             if !cmds.is_empty() {
                 break;
             }
         }
-        assert!(matches!(cmds.first(), Some(OwnerCmd::SetMode(f)) if f[0] < 338));
+        assert!(matches!(cmds.first(), Some(AutoTuneCmd::SetMode(f)) if f[0] < 338));
         assert_eq!(o.disable(), None);
         assert!(!o.is_enabled());
     }
@@ -1171,27 +1171,27 @@ mod tests {
     }
 
     #[test]
-    fn owner_directive_parses_the_chip_switch() {
-        let d = parse_owner_directive("keep;chip=on").unwrap();
+    fn auto_tune_directive_parses_the_chip_switch() {
+        let d = parse_auto_tune_directive("keep;chip=on").unwrap();
         assert_eq!((d.profile, d.chip_tune, d.fan_target_c), (None, Some(true), None));
-        let d = parse_owner_directive("balanced;fan=80;chip=off").unwrap();
+        let d = parse_auto_tune_directive("balanced;fan=80;chip=off").unwrap();
         assert_eq!(d.chip_tune, Some(false));
         assert_eq!(d.fan_target_c, Some(80.0));
-        assert!(parse_owner_directive("keep;chip=maybe").is_err());
+        assert!(parse_auto_tune_directive("keep;chip=maybe").is_err());
         // A per-chip switch alone keeps the profile.
-        let r = OwnerTuneRequest { per_chip: Some(true), ..Default::default() };
+        let r = AutoTuneRequest { per_chip: Some(true), ..Default::default() };
         assert_eq!(r.profile_change(), None);
     }
 
     #[test]
-    fn owner_directive_parses_the_continuous_switch() {
-        let d = parse_owner_directive("keep;continuous=on").unwrap();
+    fn auto_tune_directive_parses_the_continuous_switch() {
+        let d = parse_auto_tune_directive("keep;continuous=on").unwrap();
         assert_eq!((d.profile, d.continuous, d.fan_target_c), (None, Some(true), None));
-        let d = parse_owner_directive("balanced;continuous=off").unwrap();
+        let d = parse_auto_tune_directive("balanced;continuous=off").unwrap();
         assert_eq!(d.continuous, Some(false));
-        assert!(parse_owner_directive("keep;continuous=maybe").is_err());
+        assert!(parse_auto_tune_directive("keep;continuous=maybe").is_err());
         // A continuous switch alone keeps the profile.
-        let r = OwnerTuneRequest { continuous: Some(true), ..Default::default() };
+        let r = AutoTuneRequest { continuous: Some(true), ..Default::default() };
         assert_eq!(r.profile_change(), None);
     }
 
@@ -1271,8 +1271,8 @@ mod tests {
     }
 
     #[test]
-    fn owner_fan_loop_target_default_override_and_disable_restores_auto() {
-        let mut o = OwnerTune::new();
+    fn auto_tune_fan_loop_target_default_override_and_disable_restores_auto() {
+        let mut o = AutoTune::new();
         assert_eq!(o.fan_tick(Some(70.0)), None); // disabled: never touches the fan
         o.enable(TuneProfile::Efficient); // NANO3S_ENVELOPE efficient temp cap 80
         assert_eq!(o.fan_target_c(), 68.0); // Efficient default
@@ -1287,25 +1287,25 @@ mod tests {
             (TuneProfile::Balanced, 83.0), // cap 88 - 5 (MaxHash's cap, Medium power)
             (TuneProfile::MaxHash, 83.0),  // cap 88 - 5
         ] {
-            let mut o = OwnerTune::new();
+            let mut o = AutoTune::new();
             o.enable(p);
             let expect = default_fan_target_c(Some(p), o.tuner.temp_cap_c());
             assert_eq!(o.fan_target_c(), expect);
             assert_eq!(expect, want, "{p:?}");
         }
-        assert_eq!(o.fan_tick(Some(75.0)), Some(OwnerCmd::FanManual(100)));
+        assert_eq!(o.fan_tick(Some(75.0)), Some(AutoTuneCmd::FanManual(100)));
         assert_eq!(o.fan_tick(Some(75.0)), None);
-        assert_eq!(o.disable(), Some(OwnerCmd::Fan("fan:auto,")));
+        assert_eq!(o.disable(), Some(AutoTuneCmd::Fan("fan:auto,")));
         assert_eq!(o.fan_tick(Some(90.0)), None);
         // Never took the fan -> nothing to hand back.
-        let mut o = OwnerTune::new();
+        let mut o = AutoTune::new();
         o.enable(TuneProfile::Efficient);
         assert_eq!(o.disable(), None);
     }
 
     #[test]
     fn tuner_temp_breach_routes_through_the_fan_loop() {
-        let mut o = OwnerTune::new();
+        let mut o = AutoTune::new();
         o.enable(TuneProfile::Efficient); // temp cap 80
         o.fan_tick(Some(70.0));
         o.fan.duty = 40.0;
@@ -1313,7 +1313,7 @@ mod tests {
         // 81 C breaches: the core asks for SetFanFull; no harness cmd from
         // evaluate itself, the fan loop writes 100.
         assert!(o.evaluate(&fan_metrics(81.0)).is_empty());
-        assert_eq!(o.fan_tick(Some(81.0)), Some(OwnerCmd::FanManual(100)));
+        assert_eq!(o.fan_tick(Some(81.0)), Some(AutoTuneCmd::FanManual(100)));
         // 76 C: under the cap but inside the release band -> stays 100.
         assert_eq!(o.fan_tick(Some(76.0)), None);
         assert_eq!(o.fan.duty_percent(), 100);
@@ -1323,27 +1323,27 @@ mod tests {
     }
 
     #[test]
-    fn owner_directive_round_trips_with_fan_target() {
-        let d = parse_owner_directive("efficient;fan=72.5").unwrap();
-        assert_eq!(d, OwnerDirective { profile: Some(Some(TuneProfile::Efficient)), fan_target_c: Some(72.5), chip_tune: None, continuous: None });
-        let d = parse_owner_directive("keep;fan=75").unwrap();
-        assert_eq!(d, OwnerDirective { profile: None, fan_target_c: Some(75.0), chip_tune: None, continuous: None });
-        assert_eq!(parse_owner_directive("off").unwrap().profile, Some(None));
-        assert!(parse_owner_directive("off;fan=95").is_err());
-        assert!(parse_owner_directive("off;bogus=1").is_err());
+    fn auto_tune_directive_round_trips_with_fan_target() {
+        let d = parse_auto_tune_directive("efficient;fan=72.5").unwrap();
+        assert_eq!(d, AutoTuneDirective { profile: Some(Some(TuneProfile::Efficient)), fan_target_c: Some(72.5), chip_tune: None, continuous: None });
+        let d = parse_auto_tune_directive("keep;fan=75").unwrap();
+        assert_eq!(d, AutoTuneDirective { profile: None, fan_target_c: Some(75.0), chip_tune: None, continuous: None });
+        assert_eq!(parse_auto_tune_directive("off").unwrap().profile, Some(None));
+        assert!(parse_auto_tune_directive("off;fan=95").is_err());
+        assert!(parse_auto_tune_directive("off;bogus=1").is_err());
         for (p, f) in [(None, Some(70.0)), (Some(None), None), (Some(Some(TuneProfile::Quiet)), Some(65.0))] {
             let line = directive_for_request(p, f);
-            let d = parse_owner_directive(line.strip_prefix("owner_tune:").unwrap()).unwrap();
+            let d = parse_auto_tune_directive(line.strip_prefix("auto_tune:").unwrap()).unwrap();
             assert_eq!((d.profile, d.fan_target_c), (p, f));
         }
     }
 
     #[test]
     fn status_exposes_events_best_and_ceiling() {
-        let mut o = OwnerTune::new();
+        let mut o = AutoTune::new();
         o.enable(TuneProfile::Efficient);
         o.set_power_ceiling(112.0);
-        for _ in 0..OWNER_SETTLE_CYCLES {
+        for _ in 0..AUTO_TUNE_SETTLE_CYCLES {
             o.evaluate(&fan_metrics(60.0));
         }
         o.publish(None);
@@ -1362,7 +1362,7 @@ mod tests {
     #[test]
     fn profile_pick_resets_fan_override_and_memory() {
         let env = envelope_from_cali(&parse_cali(SAMPLE_CALI).unwrap());
-        let mut o = OwnerTune::with_envelope(env);
+        let mut o = AutoTune::with_envelope(env);
         o.set_fan_target(Some(80.0));
         o.enable(TuneProfile::Balanced);
         o.restore_memory(SearchMemory {
@@ -1387,7 +1387,7 @@ mod tests {
     #[test]
     fn pick_profile_cross_profile_switch_adopts_new_profile_default_fan_target() {
         let env = envelope_from_cali(&parse_cali(SAMPLE_CALI).unwrap());
-        let mut o = OwnerTune::with_envelope(env);
+        let mut o = AutoTune::with_envelope(env);
         // Start on Efficient (default target 68.0 C)
         o.pick_profile(TuneProfile::Efficient, None);
         assert_eq!(o.fan_target_c(), 68.0);

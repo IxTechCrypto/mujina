@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::commands::SchedulerCommand;
-use crate::board::nano3s_owner_tune::{OwnerTuneRequest, OwnerTuneStatus};
+use crate::board::nano3s_auto_tune::{AutoTuneRequest, AutoTuneStatus};
 use super::server::SharedState;
 use crate::api_client::types::{
     AutotuneHashrateRequest, AutotuneHashrateResponse, BoardFanRequest, BoardLedRequest,
@@ -50,7 +50,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(patch_board_temp_target))
         .routes(routes!(get_board_psu, patch_board_psu))
         .routes(routes!(get_board_autotune_hashrate, patch_board_autotune_hashrate))
-        .routes(routes!(get_board_owner_tune, patch_board_owner_tune))
+        .routes(routes!(get_board_auto_tune, patch_board_auto_tune))
         .routes(routes!(get_board_tuner, patch_board_tuner))
         .routes(routes!(get_system))
         .routes(routes!(patch_board_fan))
@@ -632,24 +632,24 @@ async fn patch_board_autotune_hashrate(
     }
 }
 
-/// Read the owner-tuner state.
+/// Read AutoTune state.
 #[utoipa::path(
     get,
-    path = "/boards/{name}/owner-tune",
+    path = "/boards/{name}/auto-tune",
     tag = "boards",
     params(
         ("name" = String, Path, description = "Board name"),
     ),
     responses(
-        (status = OK, description = "Current owner-tuner state", body = OwnerTuneStatus),
+        (status = OK, description = "Current AutoTune state", body = AutoTuneStatus),
         (status = NOT_FOUND, description = "Board not found"),
-        (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support the owner tuner"),
+        (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support AutoTune"),
     ),
 )]
-async fn get_board_owner_tune(
+async fn get_board_auto_tune(
     State(state): State<SharedState>,
     Path(name): Path<String>,
-) -> Result<Json<OwnerTuneStatus>, StatusCode> {
+) -> Result<Json<AutoTuneStatus>, StatusCode> {
     let known = state
         .board_registry
         .lock()
@@ -662,7 +662,7 @@ async fn get_board_owner_tune(
     }
     #[cfg(feature = "nano3s")]
     {
-        Ok(Json(crate::board::nano3s_owner_tune::read_status()))
+        Ok(Json(crate::board::nano3s_auto_tune::read_status()))
     }
     #[cfg(not(feature = "nano3s"))]
     {
@@ -671,28 +671,28 @@ async fn get_board_owner_tune(
 }
 
 /// Enable (`quiet`/`efficient`/`balanced`/`max_hash`) or disable (`null`) the
-/// owner tuner. Enabling turns off power-target, temp-target and
+/// AutoTune. Enabling turns off power-target, temp-target and
 /// autotune-hashrate; enabling any of those, or a manual tune, turns it off.
 /// Shares the single-slot control file: space writes at least 5 s apart.
 #[utoipa::path(
     patch,
-    path = "/boards/{name}/owner-tune",
+    path = "/boards/{name}/auto-tune",
     tag = "boards",
     params(
         ("name" = String, Path, description = "Board name"),
     ),
-    request_body = OwnerTuneRequest,
+    request_body = AutoTuneRequest,
     responses(
-        (status = OK, description = "Owner-tune directive queued"),
+        (status = OK, description = "AutoTune directive queued"),
         (status = BAD_REQUEST, description = "chip_temp_target_c outside 60..88"),
         (status = NOT_FOUND, description = "Board not found"),
-        (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support the owner tuner"),
+        (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support AutoTune"),
     ),
 )]
-async fn patch_board_owner_tune(
+async fn patch_board_auto_tune(
     State(state): State<SharedState>,
     Path(name): Path<String>,
-    Json(req): Json<OwnerTuneRequest>,
+    Json(req): Json<AutoTuneRequest>,
 ) -> Result<StatusCode, StatusCode> {
     let known = state
         .board_registry
@@ -709,7 +709,7 @@ async fn patch_board_owner_tune(
     }
     #[cfg(feature = "nano3s")]
     {
-        crate::board::nano3s::write_owner_tune_command(
+        crate::board::nano3s::write_auto_tune_command(
             req.profile_change(),
             req.chip_temp_target_c,
             req.per_chip,
@@ -725,7 +725,7 @@ async fn patch_board_owner_tune(
     }
 }
 
-/// Unified-dashboard alias of `GET /boards/{name}/owner-tune`.
+/// Unified-dashboard alias of `GET /boards/{name}/auto-tune`.
 #[utoipa::path(
     get,
     path = "/boards/{name}/tuner",
@@ -734,19 +734,19 @@ async fn patch_board_owner_tune(
         ("name" = String, Path, description = "Board name"),
     ),
     responses(
-        (status = OK, description = "Current owner-tuner state", body = OwnerTuneStatus),
+        (status = OK, description = "Current AutoTune state", body = AutoTuneStatus),
         (status = NOT_FOUND, description = "Board not found"),
-        (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support the owner tuner"),
+        (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support AutoTune"),
     ),
 )]
 async fn get_board_tuner(
     state: State<SharedState>,
     name: Path<String>,
-) -> Result<Json<OwnerTuneStatus>, StatusCode> {
-    get_board_owner_tune(state, name).await
+) -> Result<Json<AutoTuneStatus>, StatusCode> {
+    get_board_auto_tune(state, name).await
 }
 
-/// Unified-dashboard alias of `PATCH /boards/{name}/owner-tune`.
+/// Unified-dashboard alias of `PATCH /boards/{name}/auto-tune`.
 #[utoipa::path(
     patch,
     path = "/boards/{name}/tuner",
@@ -754,20 +754,20 @@ async fn get_board_tuner(
     params(
         ("name" = String, Path, description = "Board name"),
     ),
-    request_body = OwnerTuneRequest,
+    request_body = AutoTuneRequest,
     responses(
         (status = OK, description = "Tuner directive queued"),
         (status = BAD_REQUEST, description = "chip_temp_target_c outside 60..88"),
         (status = NOT_FOUND, description = "Board not found"),
-        (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support the owner tuner"),
+        (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support AutoTune"),
     ),
 )]
 async fn patch_board_tuner(
     state: State<SharedState>,
     name: Path<String>,
-    req: Json<OwnerTuneRequest>,
+    req: Json<AutoTuneRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    patch_board_owner_tune(state, name, req).await
+    patch_board_auto_tune(state, name, req).await
 }
 
 /// Capability document for the unified dashboard (docs/unified-dashboard-spec.md).

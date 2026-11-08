@@ -43,9 +43,9 @@ use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256d;
 use tokio::sync::{mpsc, watch};
 
-use super::nano3s_owner_tune::{self as owner, OwnerCmd, OwnerTune};
+use super::nano3s_auto_tune::{self as auto_tune, AutoTune, AutoTuneCmd};
 use super::nano3s_chip_tuner::{ChipGoal, ChipMetrics, ChipPhase, ChipTuner, ChipTunerConfig};
-use super::nano3s_owner_tune::ChipTuneStatus;
+use super::nano3s_auto_tune::ChipTuneStatus;
 use super::nano3s_tuner_core::{SearchMemory, TuneProfile, TuneSetpoint};
 use super::{BackplaneConnector, BoardInfo, VirtualBoardDescriptor};
 use crate::api_client::types::{
@@ -1197,7 +1197,7 @@ pub(crate) fn read_psu_status() -> (Option<f64>, Option<bool>, Option<f64>, Opti
         override_w.clamp(40.0, 140.0)
     } else {
         detected_ceiling_w
-            .map(|w| (w * owner::PD_CONTINUOUS_FRACTION).min(POWER_TARGET_SAFETY_W - PD_CEILING_MARGIN_W))
+            .map(|w| (w * auto_tune::PD_CONTINUOUS_FRACTION).min(POWER_TARGET_SAFETY_W - PD_CEILING_MARGIN_W))
             .unwrap_or(POWER_TARGET_SAFETY_W - PD_CEILING_MARGIN_W)
     };
     (bus_v, attached, detected_ceiling_w, override_max_w, effective_ceiling_w)
@@ -1317,17 +1317,17 @@ struct PersistedTuning {
     /// resumes searching from where it left off instead of restarting
     /// from the middle.
     autotune_level: Option<f64>,
-    /// Owner-tuner profile (`owner_tune:` directive). `Some` means the owner
-    /// tuner owns frequency+voltage+fan escalation and the three aadhi loops
+    /// AutoTune profile (`auto_tune:` directive). `Some` means AutoTune
+    /// owns frequency+voltage+fan escalation and the three aadhi loops
     /// above are forced off, at startup and live. `None` = off (default).
-    owner_tune_profile: Option<TuneProfile>,
-    /// Chip-temp target (C) the owner-tuner fan loop holds; `None` = profile
+    auto_tune_profile: Option<TuneProfile>,
+    /// Chip-temp target (C) the AutoTune fan loop holds; `None` = profile
     /// temp cap - 5 C.
-    owner_fan_target_c: Option<f32>,
+    auto_fan_target_c: Option<f32>,
     /// Per-chip clock offsets, MHz; `None` = uniform clocks.
     chip_offset_mhz: Option<[i16; CHIP_COUNT]>,
-    /// Owner-tuner search memory and the profile it belongs to.
-    owner_memory: Option<(TuneProfile, SearchMemory)>,
+    /// AutoTune search memory and the profile it belongs to.
+    auto_memory: Option<(TuneProfile, SearchMemory)>,
     /// Per-chip clock tuner switch.
     chip_tune: bool,
     /// Continuous dynamic tuning switch.
@@ -1385,11 +1385,11 @@ fn chip_goal(p: Option<TuneProfile>) -> ChipGoal {
 }
 
 /// `profile,freq,mv,ths,jth,floor_mv,ceiling_mhz`.
-fn parse_owner_memory(s: &str) -> Option<(TuneProfile, SearchMemory)> {
+fn parse_auto_memory(s: &str) -> Option<(TuneProfile, SearchMemory)> {
     let f: Vec<&str> = s.split(',').map(str::trim).collect();
     let [p, freq, mv, ths, jth, floor, ceil] = f.as_slice() else { return None };
     Some((
-        owner::parse_directive(p).ok().flatten()?,
+        auto_tune::parse_directive(p).ok().flatten()?,
         SearchMemory {
             best: TuneSetpoint { frequency_mhz: freq.parse().ok()?, core_voltage_mv: mv.parse().ok()? },
             best_hashrate_ths: ths.parse().ok()?,
@@ -1400,10 +1400,10 @@ fn parse_owner_memory(s: &str) -> Option<(TuneProfile, SearchMemory)> {
     ))
 }
 
-fn format_owner_memory((p, m): &(TuneProfile, SearchMemory)) -> String {
+fn format_auto_memory((p, m): &(TuneProfile, SearchMemory)) -> String {
     format!(
         "{},{},{},{},{},{},{}",
-        owner::directive_for(Some(*p)).trim_start_matches("owner_tune:"),
+        auto_tune::directive_for(Some(*p)).trim_start_matches("auto_tune:"),
         m.best.frequency_mhz,
         m.best.core_voltage_mv,
         m.best_hashrate_ths,
@@ -1413,9 +1413,9 @@ fn format_owner_memory((p, m): &(TuneProfile, SearchMemory)) -> String {
     )
 }
 
-fn persist_owner_memory(mem: Option<(TuneProfile, SearchMemory)>) {
+fn persist_auto_memory(mem: Option<(TuneProfile, SearchMemory)>) {
     let mut cfg = load_tuning();
-    cfg.owner_memory = mem;
+    cfg.auto_memory = mem;
     write_tuning_conf(&cfg);
 }
 
@@ -1448,13 +1448,13 @@ fn load_tuning() -> PersistedTuning {
                 cfg.autotune_hashrate_target_ths = value.parse::<f64>().ok()
             }
             "autotune_level" => cfg.autotune_level = value.parse::<f64>().ok(),
-            "owner_tune_profile" => cfg.owner_tune_profile = owner::parse_directive(value).ok().flatten(),
-            "owner_fan_target_c" => {
-                cfg.owner_fan_target_c =
-                    value.parse::<f32>().ok().filter(|c| owner::FAN_TARGET_RANGE_C.contains(c))
+            "auto_tune_profile" | "owner_tune_profile" => cfg.auto_tune_profile = auto_tune::parse_directive(value).ok().flatten(),
+            "auto_fan_target_c" | "owner_fan_target_c" => {
+                cfg.auto_fan_target_c =
+                    value.parse::<f32>().ok().filter(|c| auto_tune::FAN_TARGET_RANGE_C.contains(c))
             }
             "chip_offset_mhz" => cfg.chip_offset_mhz = parse_chip_offsets(value),
-            "owner_memory" => cfg.owner_memory = parse_owner_memory(value),
+            "auto_memory" | "owner_memory" => cfg.auto_memory = parse_auto_memory(value),
             "chip_tune" => cfg.chip_tune = value == "on",
             "continuous" => cfg.continuous = value == "on",
             _ => {}
@@ -1486,17 +1486,17 @@ fn write_tuning_conf(cfg: &PersistedTuning) {
     if let Some(l) = cfg.autotune_level {
         out.push_str(&format!("autotune_level={l}\n"));
     }
-    if let Some(p) = cfg.owner_tune_profile {
+    if let Some(p) = cfg.auto_tune_profile {
         out.push_str(&format!(
-            "owner_tune_profile={}\n",
-            owner::directive_for(Some(p)).trim_start_matches("owner_tune:")
+            "auto_tune_profile={}\n",
+            auto_tune::directive_for(Some(p)).trim_start_matches("auto_tune:")
         ));
     }
-    if let Some(c) = cfg.owner_fan_target_c {
-        out.push_str(&format!("owner_fan_target_c={c}\n"));
+    if let Some(c) = cfg.auto_fan_target_c {
+        out.push_str(&format!("auto_fan_target_c={c}\n"));
     }
-    if let Some(m) = &cfg.owner_memory {
-        out.push_str(&format!("owner_memory={}\n", format_owner_memory(m)));
+    if let Some(m) = &cfg.auto_memory {
+        out.push_str(&format!("auto_memory={}\n", format_auto_memory(m)));
     }
     if cfg.chip_tune {
         out.push_str("chip_tune=on\n");
@@ -1568,43 +1568,43 @@ fn persist_autotune_hashrate_target(target_ths: Option<f64>) {
     write_tuning_conf(&cfg);
 }
 
-fn persist_owner_fan_target(c: Option<f32>) {
+fn persist_auto_fan_target(c: Option<f32>) {
     let mut cfg = load_tuning();
-    cfg.owner_fan_target_c = c;
+    cfg.auto_fan_target_c = c;
     write_tuning_conf(&cfg);
 }
 
-fn persist_owner_tune_profile(profile: Option<TuneProfile>) {
+fn persist_auto_tune_profile(profile: Option<TuneProfile>) {
     let mut cfg = load_tuning();
-    cfg.owner_tune_profile = profile;
+    cfg.auto_tune_profile = profile;
     write_tuning_conf(&cfg);
 }
 
-/// Turns the owner tuner off because a manual/aadhi control took over.
+/// Turns the AutoTune off because a manual/aadhi control took over.
 /// Hands the fan back to auto if the tuner had forced it to 100 %.
-fn disable_owner_for_manual(owner: &mut OwnerTune, why: &str) {
-    if !owner.is_enabled() {
+fn disable_auto_tune_for_manual(auto_tuner: &mut AutoTune, why: &str) {
+    if !auto_tuner.is_enabled() {
         return;
     }
-    if let Some(OwnerCmd::Fan(t)) = owner.disable() {
+    if let Some(AutoTuneCmd::Fan(t)) = auto_tuner.disable() {
         write_harness_control(t);
     }
-    persist_owner_tune_profile(None);
-    owner.publish(None);
-    eprintln!("[nano3s] owner-tune: disabled by {why}");
+    persist_auto_tune_profile(None);
+    auto_tuner.publish(None);
+    eprintln!("[nano3s] auto-tune: disabled by {why}");
 }
 
-/// Queues an `owner_tune:<profile|off|keep>[;fan=<C>]` directive for the run
+/// Queues an `auto_tune:<profile|off|keep>[;fan=<C>]` directive for the run
 /// loop (`profile`: `Some(None)` = off, `None` = keep). The worker persists
 /// the choice when it consumes the directive. Shares the single-slot control
 /// file with every other writer: space calls >= 5 s.
-pub(crate) fn write_owner_tune_command(
+pub(crate) fn write_auto_tune_command(
     profile: Option<Option<TuneProfile>>,
     fan_target_c: Option<f32>,
     per_chip: Option<bool>,
     continuous: Option<bool>,
 ) -> std::io::Result<()> {
-    let mut line = owner::directive_for_request(profile, fan_target_c);
+    let mut line = auto_tune::directive_for_request(profile, fan_target_c);
     let chip_flag = match per_chip {
         Some(true) => Some(true),
         Some(false) => Some(false),
@@ -2632,8 +2632,8 @@ fn run_worker(
     // disabled autotune as a side effect (same failure class as the
     // persisted-field version of this bug, fixed the same day, via a
     // path that fix didn't close).
-    let mut power_target_w: Option<f64> = if !owner::startup_loop_allowed(
-        persisted_tuning.owner_tune_profile,
+    let mut power_target_w: Option<f64> = if !auto_tune::startup_loop_allowed(
+        persisted_tuning.auto_tune_profile,
         persisted_tuning.autotune_hashrate_target_ths,
     ) {
         None
@@ -2658,8 +2658,8 @@ fn run_worker(
     // above -- no env var fallback exists for this one today, but this
     // keeps the invariant explicit rather than relying on that being
     // true forever.
-    let mut temp_target_c: Option<f64> = if !owner::startup_loop_allowed(
-        persisted_tuning.owner_tune_profile,
+    let mut temp_target_c: Option<f64> = if !auto_tune::startup_loop_allowed(
+        persisted_tuning.auto_tune_profile,
         persisted_tuning.autotune_hashrate_target_ths,
     ) {
         None
@@ -2701,41 +2701,41 @@ fn run_worker(
     let mut next_autotune_check = std::time::Instant::now() + AUTOTUNE_CHECK_INTERVAL;
     let mut autotune_over_ticks: u32 = 0;
     let mut next_autotune_forced_check = std::time::Instant::now();
-    // Owner tuner (IxTech AutoTuner) -- OFF unless a profile is persisted or
-    // set via `owner_tune:`. While on, power_target_w / temp_target_c /
+    // AutoTune (IxTech AutoTuner) -- OFF unless a profile is persisted or
+    // set via `auto_tune:`. While on, power_target_w / temp_target_c /
     // autotune_hashrate_target_ths are all None (startup guards above, and
-    // the `owner_tune:` arm). aadhi's PSU safety trip and the 97C backstop
+    // the `auto_tune:` arm). aadhi's PSU safety trip and the 97C backstop
     // below keep running and win over it.
-    let (owner_env, owner_env_from_file) = owner::load_envelope(owner::CALI_PATH);
-    if owner_env_from_file {
+    let (auto_tune_env, auto_tune_env_from_file) = auto_tune::load_envelope(auto_tune::CALI_PATH);
+    if auto_tune_env_from_file {
         eprintln!(
-            "[nano3s] owner-tune: caps from {}: min {} mV, quiet {}W/{}C, efficient {}W/{}C, balanced {}W/{}C, max_hash {}W/{}C",
-            owner::CALI_PATH,
-            owner_env.min_voltage_mv,
-            owner_env.quiet.power_w, owner_env.quiet.temp_c,
-            owner_env.efficient.power_w, owner_env.efficient.temp_c,
-            owner_env.balanced.power_w, owner_env.balanced.temp_c,
-            owner_env.max_hash.power_w, owner_env.max_hash.temp_c,
+            "[nano3s] auto-tune: caps from {}: min {} mV, quiet {}W/{}C, efficient {}W/{}C, balanced {}W/{}C, max_hash {}W/{}C",
+            auto_tune::CALI_PATH,
+            auto_tune_env.min_voltage_mv,
+            auto_tune_env.quiet.power_w, auto_tune_env.quiet.temp_c,
+            auto_tune_env.efficient.power_w, auto_tune_env.efficient.temp_c,
+            auto_tune_env.balanced.power_w, auto_tune_env.balanced.temp_c,
+            auto_tune_env.max_hash.power_w, auto_tune_env.max_hash.temp_c,
         );
     } else {
-        eprintln!("[nano3s] owner-tune: {} missing/invalid, using built-in cap constants", owner::CALI_PATH);
+        eprintln!("[nano3s] auto-tune: {} missing/invalid, using built-in cap constants", auto_tune::CALI_PATH);
     }
-    let mut owner = OwnerTune::with_envelope(owner_env);
-    owner.set_fan_target(persisted_tuning.owner_fan_target_c);
-    owner.set_continuous(persisted_tuning.continuous);
-    if let Some(p) = persisted_tuning.owner_tune_profile {
-        owner.enable(p);
-        owner.seed_fan_duty(read_fan_status().and_then(|f| f.percent));
-        eprintln!("[nano3s] owner-tune: resumed profile {p:?} from {TUNING_CONF_PATH}");
-        if let Some((mp, mem)) = persisted_tuning.owner_memory
+    let mut auto_tuner = AutoTune::with_envelope(auto_tune_env);
+    auto_tuner.set_fan_target(persisted_tuning.auto_fan_target_c);
+    auto_tuner.set_continuous(persisted_tuning.continuous);
+    if let Some(p) = persisted_tuning.auto_tune_profile {
+        auto_tuner.enable(p);
+        auto_tuner.seed_fan_duty(read_fan_status().and_then(|f| f.percent));
+        eprintln!("[nano3s] auto-tune: resumed profile {p:?} from {TUNING_CONF_PATH}");
+        if let Some((mp, mem)) = persisted_tuning.auto_memory
             && mp == p
         {
-            owner.restore_memory(mem);
-            eprintln!("[nano3s] owner-tune: restored search memory {mem:?}");
+            auto_tuner.restore_memory(mem);
+            eprintln!("[nano3s] auto-tune: restored search memory {mem:?}");
         }
     }
-    let mut last_owner_memory = owner.profile().zip(owner.memory());
-    // Per-chip tuner: runs on the owner tick while the owner tuner is locked
+    let mut last_auto_memory = auto_tuner.profile().zip(auto_tuner.memory());
+    // Per-chip tuner: runs on the AutoTune tick while the AutoTune is locked
     // and its base point hasn't moved since the last tick.
     let new_chip_tuner = |p: Option<TuneProfile>, o: [i16; CHIP_COUNT]| {
         let mut cfg = ChipTunerConfig::default();
@@ -2746,10 +2746,10 @@ fn run_worker(
     };
     let mut chip_tuner = persisted_tuning
         .chip_tune
-        .then(|| new_chip_tuner(owner.profile(), chip_offset_mhz));
+        .then(|| new_chip_tuner(auto_tuner.profile(), chip_offset_mhz));
     let mut chip_base: Option<(u32, Option<i32>)> = None;
     let mut persisted_chip_offsets = chip_offset_mhz;
-    owner.publish(None);
+    auto_tuner.publish(None);
 
     loop {
         // Poll for an external pause/resume via MUJINA_CONTROL_FILE,
@@ -2798,7 +2798,7 @@ fn run_worker(
                         if chip_tuner.take().is_some() {
                             persist_chip_tune(false);
                             persisted_tuning.chip_tune = false;
-                            owner.set_chip_status(None);
+                            auto_tuner.set_chip_status(None);
                             eprintln!("[nano3s] per-chip tuner off (manual offsets)");
                         }
                     }
@@ -2806,8 +2806,9 @@ fn run_worker(
                 Some(_) => {}
                 None => eprintln!("[nano3s] malformed chip_offset directive: {s}"),
             },
-            Some(s) if s.starts_with("owner_tune:") => {
-                let parsed = owner::parse_owner_directive(&s["owner_tune:".len()..]);
+            Some(s) if s.starts_with("auto_tune:") || s.starts_with("owner_tune:") => {
+                let body = s.strip_prefix("auto_tune:").or_else(|| s.strip_prefix("owner_tune:")).unwrap_or("");
+                let parsed = auto_tune::parse_auto_tune_directive(body);
                 let fan_given = parsed.as_ref().is_ok_and(|d| d.fan_target_c.is_some());
                 if let Ok(Some(on)) = parsed.as_ref().map(|d| d.chip_tune) {
                     persist_chip_tune(on);
@@ -2817,34 +2818,34 @@ fn run_worker(
                         start = stop_chip_tuner(ct, &mut chip_offset_mhz);
                         persisted_chip_offsets = start;
                     }
-                    chip_tuner = on.then(|| new_chip_tuner(owner.profile(), start));
+                    chip_tuner = on.then(|| new_chip_tuner(auto_tuner.profile(), start));
                     if !on {
-                        owner.set_chip_status(None);
+                        auto_tuner.set_chip_status(None);
                     }
                     eprintln!("[nano3s] per-chip tuner {}", if on { "on" } else { "off" });
                 }
                 if let Ok(Some(c)) = parsed.as_ref().map(|d| d.continuous) {
                     persist_continuous(c);
                     persisted_tuning.continuous = c;
-                    owner.set_continuous(c);
-                    owner.publish(None);
+                    auto_tuner.set_continuous(c);
+                    auto_tuner.publish(None);
                     eprintln!("[nano3s] continuous tuning {}", if c { "on" } else { "off" });
                 }
                 if let Ok(d) = &parsed
                     && let Some(c) = d.fan_target_c
                 {
-                    owner.set_fan_target(Some(c));
-                    persist_owner_fan_target(Some(c));
-                    owner.publish(None);
-                    eprintln!("[nano3s] owner-tune: chip-temp fan target {c} C");
+                    auto_tuner.set_fan_target(Some(c));
+                    persist_auto_fan_target(Some(c));
+                    auto_tuner.publish(None);
+                    eprintln!("[nano3s] auto-tune: chip-temp fan target {c} C");
                 }
                 match parsed.map(|d| d.profile) {
                     Ok(None) => {} // `keep`: fan target only
                     Ok(Some(Some(profile))) => {
-                        // Exclusive: the owner tuner takes over frequency,
+                        // Exclusive: the AutoTune takes over frequency,
                         // voltage and fan escalation; aadhi's loops go off
                         // (live and persisted).
-                        owner::clear_other_loops(
+                        auto_tune::clear_other_loops(
                             &mut power_target_w,
                             &mut temp_target_c,
                             &mut autotune_hashrate_target_ths,
@@ -2852,13 +2853,13 @@ fn run_worker(
                         persist_tuning_clear_power_target();
                         persist_tuning_clear_temp_target();
                         persist_autotune_hashrate_target(None);
-                        persist_owner_tune_profile(Some(profile));
-                        persist_owner_memory(None);
-                        last_owner_memory = None;
+                        persist_auto_tune_profile(Some(profile));
+                        persist_auto_memory(None);
+                        last_auto_memory = None;
                         // A profile pick also means its default fan target
                         // (cap - 5), unless this request set one.
                         if !fan_given {
-                            persist_owner_fan_target(None);
+                            persist_auto_fan_target(None);
                         }
                         if let Some(ct) = chip_tuner.take() {
                             let start = stop_chip_tuner(ct, &mut chip_offset_mhz);
@@ -2869,13 +2870,13 @@ fn run_worker(
                         // clock we start from (stale-ceiling bug).
                         temp_throttle_base_freq = last_applied_pll_freq;
                         psu_ceiling_freq = last_applied_pll_freq;
-                        owner.pick_profile(profile, parsed.as_ref().ok().and_then(|d| d.fan_target_c));
-                        owner.seed_fan_duty(read_fan_status().and_then(|f| f.percent));
-                        owner.publish(None);
-                        eprintln!("[nano3s] owner-tune: enabled profile {profile:?} (power-target/temp-target/autotune-hashrate disabled)");
+                        auto_tuner.pick_profile(profile, parsed.as_ref().ok().and_then(|d| d.fan_target_c));
+                        auto_tuner.seed_fan_duty(read_fan_status().and_then(|f| f.percent));
+                        auto_tuner.publish(None);
+                        eprintln!("[nano3s] auto-tune: enabled profile {profile:?} (power-target/temp-target/autotune-hashrate disabled)");
                     }
                     Ok(Some(None)) => {
-                        if let Some(OwnerCmd::Fan(t)) = owner.disable() {
+                        if let Some(AutoTuneCmd::Fan(t)) = auto_tuner.disable() {
                             write_harness_control(t);
                         }
                         if let Some(ct) = chip_tuner.take() {
@@ -2883,12 +2884,12 @@ fn run_worker(
                             persisted_chip_offsets = start;
                         }
                         persist_chip_tune(false);
-                        owner.set_chip_status(None);
-                        persist_owner_tune_profile(None);
-                        owner.publish(None);
-                        eprintln!("[nano3s] owner-tune: disabled via dashboard/API");
+                        auto_tuner.set_chip_status(None);
+                        persist_auto_tune_profile(None);
+                        auto_tuner.publish(None);
+                        eprintln!("[nano3s] auto-tune: disabled via dashboard/API");
                     }
-                    Err(()) => eprintln!("[nano3s] malformed owner_tune directive: {s}"),
+                    Err(()) => eprintln!("[nano3s] malformed auto_tune directive: {s}"),
                 }
             }
             Some(s) if s.starts_with("tune:") => {
@@ -2900,7 +2901,7 @@ fn run_worker(
                     persist_autotune_hashrate_target(None);
                     eprintln!("[nano3s] autotune: disabled by manual tune command");
                 }
-                disable_owner_for_manual(&mut owner, "manual tune command");
+                disable_auto_tune_for_manual(&mut auto_tuner, "manual tune command");
                 // See write_tuning_command()'s doc comment for the exact
                 // "always 7 fields" wire format this expects.
                 let fields: Vec<&str> = s["tune:".len()..].split(',').collect();
@@ -2983,7 +2984,7 @@ fn run_worker(
                             // rather than waiting out the old interval.
                             next_power_check = std::time::Instant::now();
                             eprintln!("[nano3s] power-target: live target set to {w:.1}W via dashboard/API");
-                            disable_owner_for_manual(&mut owner, "manual power-target command");
+                            disable_auto_tune_for_manual(&mut auto_tuner, "manual power-target command");
                         }
                         Err(_) => eprintln!("[nano3s] malformed power_target directive: {s}"),
                     }
@@ -3024,7 +3025,7 @@ fn run_worker(
                             }
                             temp_target_c = Some(c);
                             eprintln!("[nano3s] temp-target: live target set to {c:.1}C via dashboard/API");
-                            disable_owner_for_manual(&mut owner, "manual temp-target command");
+                            disable_auto_tune_for_manual(&mut auto_tuner, "manual temp-target command");
                         }
                         Err(_) => eprintln!("[nano3s] malformed temp_target directive: {s}"),
                     }
@@ -3050,7 +3051,7 @@ fn run_worker(
                             // that the manual-command guard mistook for
                             // a real user command and used to disable
                             // autotune again.
-                            disable_owner_for_manual(&mut owner, "manual autotune-hashrate command");
+                            disable_auto_tune_for_manual(&mut auto_tuner, "manual autotune-hashrate command");
                             power_target_w = None;
                             temp_target_c = None;
                             persist_tuning_clear_power_target();
@@ -3212,7 +3213,7 @@ fn run_worker(
             } else {
                 let pd_contract = pd_ceiling_w_for_voltage(last_bus_v);
                 let safety = POWER_TARGET_SAFETY_W.min(pd_contract - PD_CEILING_MARGIN_W);
-                let ceiling = owner::owner_power_ceiling(pd_contract, safety);
+                let ceiling = auto_tune::auto_tune_power_ceiling(pd_contract, safety);
                 (ceiling, safety)
             };
             let pd_ceiling_w = psu_override_max_w
@@ -3250,9 +3251,9 @@ fn run_worker(
                     eprintln!(
                         "[nano3s] PSU safety trip: power={power_w:.1}W exceeds ceiling={effective_safety_w:.1}W (no power-target configured) cur={cur_mv}mV -> {new_mv}mV"
                     );
-                    if owner.is_enabled() {
+                    if auto_tuner.is_enabled() {
                         // Apply directly: a `tune:` directive would count as
-                        // a manual command and switch the owner tuner off.
+                        // a manual command and switch the AutoTune off.
                         // Only ever lower voltage here (the clamp above can
                         // otherwise lift it to POWER_TARGET_MIN_MV).
                         if new_mv < cur_mv {
@@ -3262,7 +3263,7 @@ fn run_worker(
                             } else {
                                 last_applied_voltage_mv = Some(new_mv);
                                 persist_tuning_set(None, Some(new_mv as u32), None, None);
-                                owner.note_external_voltage(new_mv as u16);
+                                auto_tuner.note_external_voltage(new_mv as u16);
                             }
                         }
                     } else if let Err(e) = write_tuning_command(None, Some(new_mv as u32), None, None) {
@@ -3534,23 +3535,23 @@ fn run_worker(
             // Publish telemetry to the REST API's board registry. Modeled
             // as one HashThread == one ThreadTelemetry entry (the whole
             // 12-chip chain is a single HashThread).
-            // Owner tuner tick. Runs AFTER the PSU safety trip, temp-target,
+            // AutoTune tick. Runs AFTER the PSU safety trip, temp-target,
             // PSU freq-ceiling and combined frequency apply above, so it
             // observes whatever they just did (last_applied_* are current)
             // instead of fighting it.
-            if owner.is_enabled() {
-                owner.set_power_ceiling(tuner_power_ceiling_w);
-                if owner.tick_due(std::time::Instant::now()) {
+            if auto_tuner.is_enabled() {
+                auto_tuner.set_power_ceiling(tuner_power_ceiling_w);
+                if auto_tuner.tick_due(std::time::Instant::now()) {
                     let volt_now = last_applied_voltage_mv.map(|v| v.max(0) as u32).unwrap_or(st.voltage_mv);
-                    let cmds: Vec<OwnerCmd> = if (st.temp_max as f64) >= owner::BACKSTOP_TEMP_C {
-                        let f = owner::backstop_freqs(last_applied_pll_freq);
+                    let cmds: Vec<AutoTuneCmd> = if (st.temp_max as f64) >= auto_tune::BACKSTOP_TEMP_C {
+                        let f = auto_tune::backstop_freqs(last_applied_pll_freq);
                         eprintln!(
-                            "[nano3s] owner-tune: {:.1}C backstop ({:.0}C) -- emergency clock drop {last_applied_pll_freq:?} -> {f:?}",
+                            "[nano3s] auto-tune: {:.1}C backstop ({:.0}C) -- emergency clock drop {last_applied_pll_freq:?} -> {f:?}",
                             st.temp_max,
-                            owner::BACKSTOP_TEMP_C
+                            auto_tune::BACKSTOP_TEMP_C
                         );
-                        vec![OwnerCmd::SetMode(f)]
-                    } else if let Some(m) = owner::metrics_from_readings(
+                        vec![AutoTuneCmd::SetMode(f)]
+                    } else if let Some(m) = auto_tune::metrics_from_readings(
                         st.temp_max,
                         power_w,
                         st.ghsspd,
@@ -3558,24 +3559,24 @@ fn run_worker(
                         volt_now,
                         st.spd_dh,
                     ) {
-                        owner.evaluate(&m)
+                        auto_tuner.evaluate(&m)
                     } else {
                         Vec::new()
                     };
-                    // Chip-temp fan loop: runs every owner tick even when the
+                    // Chip-temp fan loop: runs every AutoTune tick even when the
                     // tuner had no metrics (missing temp -> 100 %). It is the
                     // only source of fan writes, so at most one per tick.
                     let mut cmds = cmds;
                     let fan_temp = Some(st.temp_max).filter(|t| *t > 0.0);
-                    cmds.extend(owner.fan_tick(fan_temp));
+                    cmds.extend(auto_tuner.fan_tick(fan_temp));
                     for cmd in cmds {
                         match cmd {
-                            OwnerCmd::SetMode(f) => {
+                            AutoTuneCmd::SetMode(f) => {
                                 let rc = unsafe { nano3s_ipc_set_mode(f.as_ptr(), 0) };
                                 if rc != 0 {
-                                    eprintln!("[nano3s] owner-tune: nano3s_ipc_set_mode failed");
+                                    eprintln!("[nano3s] auto-tune: nano3s_ipc_set_mode failed");
                                 } else {
-                                    eprintln!("[nano3s] owner-tune: SET_MODE pll_freq={f:?}");
+                                    eprintln!("[nano3s] auto-tune: SET_MODE pll_freq={f:?}");
                                     last_applied_pll_freq = f;
                                     // Keep both ceilings at the new clock so
                                     // neither clamps it back to a stale one.
@@ -3584,33 +3585,33 @@ fn run_worker(
                                     persist_tuning_set(Some(f), None, None, None);
                                 }
                             }
-                            OwnerCmd::SetVoltage(mv) => {
+                            AutoTuneCmd::SetVoltage(mv) => {
                                 let rc = unsafe { nano3s_ipc_set_voltage_raw(mv) };
                                 if rc != 0 {
-                                    eprintln!("[nano3s] owner-tune: nano3s_ipc_set_voltage_raw failed");
+                                    eprintln!("[nano3s] auto-tune: nano3s_ipc_set_voltage_raw failed");
                                 } else {
-                                    eprintln!("[nano3s] owner-tune: SET_VOLTAGE_RAW target_mv={mv}");
+                                    eprintln!("[nano3s] auto-tune: SET_VOLTAGE_RAW target_mv={mv}");
                                     last_applied_voltage_mv = Some(mv);
                                     persist_tuning_set(None, Some(mv as u32), None, None);
                                 }
                             }
-                            OwnerCmd::Fan(t) => {
-                                eprintln!("[nano3s] owner-tune: harness {t}");
+                            AutoTuneCmd::Fan(t) => {
+                                eprintln!("[nano3s] auto-tune: harness {t}");
                                 write_harness_control(t);
                             }
-                            OwnerCmd::FanManual(d) => {
-                                eprintln!("[nano3s] owner-tune: fan:manual,{d} (temp_max {:.1}C)", st.temp_max);
+                            AutoTuneCmd::FanManual(d) => {
+                                eprintln!("[nano3s] auto-tune: fan:manual,{d} (temp_max {:.1}C)", st.temp_max);
                                 write_harness_control(&format!("fan:manual,{d}"));
                             }
                         }
                     }
-                    // Auto-engage: if owner is enabled (either locked or continuous dynamic tuning is active),
+                    // Auto-engage: if AutoTune is enabled (either locked or continuous dynamic tuning is active),
                     // operating thermals have settled, and chip tuning has not been explicitly disabled,
                     // automatically instantiate the per-chip tuner if absent.
-                    let chip_tune_allowed = owner.is_locked() || (owner.is_enabled() && persisted_tuning.continuous);
+                    let chip_tune_allowed = auto_tuner.is_locked() || (auto_tuner.is_enabled() && persisted_tuning.continuous);
                     if chip_tuner.is_none() && chip_tune_allowed && persisted_tuning.chip_tune {
-                        eprintln!("[nano3s] auto-engaging per-chip tuner (locked={} continuous={})", owner.is_locked(), persisted_tuning.continuous);
-                        chip_tuner = Some(new_chip_tuner(owner.profile(), chip_offset_mhz));
+                        eprintln!("[nano3s] auto-engaging per-chip tuner (locked={} continuous={})", auto_tuner.is_locked(), persisted_tuning.continuous);
+                        chip_tuner = Some(new_chip_tuner(auto_tuner.profile(), chip_offset_mhz));
                     }
 
                     if let Some(ct) = chip_tuner.as_mut() {
@@ -3624,7 +3625,7 @@ fn run_worker(
                         // would look like dead chips; skip the tick.
                         let complete = st.chip_count as usize >= CHIP_COUNT && st.ghsspd > 0;
                         if ready && complete {
-                            ct.set_power_cap_w(owner.power_cap_w());
+                            ct.set_power_cap_w(auto_tuner.power_cap_w());
                             let mut m = ChipMetrics {
                                 chip_ghs: [0.0; CHIP_COUNT],
                                 chip_fail_pct: [0.0; CHIP_COUNT],
@@ -3653,20 +3654,20 @@ fn run_worker(
                             (true, ChipPhase::Trial { .. }) => "trial",
                             (true, ChipPhase::Converged) => "converged",
                         };
-                        owner.set_chip_status(Some(ChipTuneStatus {
+                        auto_tuner.set_chip_status(Some(ChipTuneStatus {
                             phase: phase.to_owned(),
                             last_event: ct.last_event().to_owned(),
                             offsets_mhz: ct.offsets().to_vec(),
                         }));
                     }
-                    owner.publish(Some(TuneSetpoint {
+                    auto_tuner.publish(Some(TuneSetpoint {
                         frequency_mhz: last_applied_pll_freq[0] as f32,
                         core_voltage_mv: last_applied_voltage_mv.unwrap_or(st.voltage_mv as i32).max(0) as u16,
                     }));
-                    let mem = owner.profile().zip(owner.memory());
-                    if mem != last_owner_memory && (mem.is_some() || owner.profile().is_some()) {
-                        persist_owner_memory(mem);
-                        last_owner_memory = mem;
+                    let mem = auto_tuner.profile().zip(auto_tuner.memory());
+                    if mem != last_auto_memory && (mem.is_some() || auto_tuner.profile().is_some()) {
+                        persist_auto_memory(mem);
+                        last_auto_memory = mem;
                     }
                 }
             }

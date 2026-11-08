@@ -475,7 +475,7 @@
     .menusheet .sheet { width: min(640px, 96vw); position: relative; }
     .menusheet .sheetclose { position: sticky; top: 0; float: right; z-index: 2; margin: 0 0 8px 8px; }
     .menusheet .sheet .sec:first-of-type { margin-top: 4px; }
-    #ownCur { font-size: 13px; color: var(--ink); line-height: 1.5; margin-bottom: 12px; overflow-wrap: anywhere; }
+    #autoTuneCur { font-size: 13px; color: var(--ink); line-height: 1.5; margin-bottom: 12px; overflow-wrap: anywhere; }
     @media(max-width: 480px) {
       .menubar .menubtn { flex: 1 1 30%; padding: 9px 6px; text-align: center; justify-content: center; }
       .menusheet .sheet { width: 100vw; max-width: 100vw; height: 100vh; max-height: 100vh; border-radius: 0; }
@@ -1035,12 +1035,12 @@
       <h2>Tuning</h2>
       <div class="note" id="powerLine" style="display:none"></div>
       <div class="note" id="tuningNone" style="display:none">No tuning controls for this board.</div>
-      <div id="ownSection" style="display:none">
+      <div id="autoTuneSection" style="display:none">
       <div class="modalsec" style="margin-top:12px">Auto Tuner</div>
-      <div id="ownCur">tuner status loading&hellip;</div>
+      <div id="autoTuneCur">tuner status loading&hellip;</div>
       <div class="row">
-        <label for="ownProfile">Profile</label>
-        <select id="ownProfile" style="background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit">
+        <label for="autoTuneProfile">Profile</label>
+        <select id="autoTuneProfile" style="background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit">
           <option value="off">Off</option>
           <option value="quiet">Quiet</option>
           <option value="efficient">Efficient</option>
@@ -1049,21 +1049,21 @@
         </select>
       </div>
       <div class="row">
-        <label for="ownTemp">Chip temp target <small style="color:var(--dim)">°C, blank = unchanged</small></label>
-        <input type="number" id="ownTemp" min="30" max="95" step="1" placeholder="unchanged">
+        <label for="autoTuneTemp">Chip temp target <small style="color:var(--dim)">°C, blank = unchanged</small></label>
+        <input type="number" id="autoTuneTemp" min="30" max="95" step="1" placeholder="unchanged">
       </div>
       <div class="row" style="margin-top:10px;flex-wrap:wrap">
-        <label for="ownContinuous" style="cursor:pointer">Continuous Tuning</label>
-        <input type="checkbox" id="ownContinuous">
+        <label for="autoTuneContinuous" style="cursor:pointer">Continuous Tuning</label>
+        <input type="checkbox" id="autoTuneContinuous">
         <small style="color:var(--dim);display:block;margin-top:3px;flex-basis:100%;line-height:1.4">
           Disabled: warms up &amp; tunes board, optimizes individual chips, then locks in.<br>
           Enabled: continuously re-tunes as cooling, fan speeds, or ambient temps change.
         </small>
       </div>
       <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
-        <button class="btn pri wbtn" id="ownApply" type="button">Apply</button>
+        <button class="btn pri wbtn" id="autoTuneApply" type="button">Apply</button>
       </div>
-      <div class="msg" id="ownMsg"></div>
+      <div class="msg" id="autoTuneMsg"></div>
       <div class="note">Using any Live Tuning control below switches the auto tuner off.</div>
       </div>
 
@@ -1380,7 +1380,7 @@ function setMsg(id, text, ok) { const m = $(id); m.textContent = text; m.classNa
 let SYS = null;                 // last good /api/v0/system document
 let LAST = null, ACTIVE_NAME = null, CHIP_FILTER = 'all';
 let PAUSE_AVAILABLE = false, DETAIL_STATE = 0, PAUSED = false, CHIP_OFFSETS = [], DETAIL_CACHE = null;
-let LAST_OWNER_STATUS = null, USER_EDITING_CONTINUOUS = false;
+let LAST_AUTO_TUNE_STATUS = null, USER_EDITING_CONTINUOUS = false;
 let MOUSE_POS = { fleetChart: null, chart: null };
 let TICKS = 0;
 
@@ -1691,10 +1691,10 @@ function applyBoardCaps() {
     : !!(LAST && LAST.boards && LAST.boards.some(x => x.outlet_c != null));
   show('fcOutlet', anyOutlet);
   const tuner = !!(caps && safeUrl(caps.tuner)), manual = !!(caps && safeUrl(caps.manual_tuning));
-  show('ownSection', tuner);
+  show('autoTuneSection', tuner);
   show('tunerCard', tuner);
   const pcElem = $('at-per-chip');
-  const contChk = $('ownContinuous');
+  const contChk = $('autoTuneContinuous');
   if (!tuner) {
     if (pcElem) pcElem.textContent = '';
     if (contChk) { contChk.checked = false; contChk.disabled = true; }
@@ -1794,9 +1794,9 @@ function selectBoard(name) {
 function setActive(name) {
   if (name === ACTIVE_NAME) return;
   ACTIVE_NAME = name;
-  OWN_SYNCED = false;
+  AUTO_TUNE_SYNCED = false;
   if (LAST) render(LAST);
-  pollOwnerTune();
+  pollAutoTune();
 }
 
 function renderChips(chips, perChip) {
@@ -2401,7 +2401,7 @@ async function applyPsuProfile() {
     const label = mode === 'stock' ? 'Standard 112W Safe PD' : mode === 'aggressive' ? 'Aggressive 130W' : target + 'W Custom Ceiling';
     setMsg('psuMsg', 'Power profile saved ✓ (' + label + ')', true);
     setTimeout(loadPsuConfig, 1500);
-    if (typeof pollOwnerTune === 'function') setTimeout(pollOwnerTune, 1500);
+    if (typeof pollAutoTune === 'function') setTimeout(pollAutoTune, 1500);
   } catch (e) {
     setMsg('psuMsg', 'Failed: ' + e.message);
   }
@@ -2449,8 +2449,8 @@ async function poolApplyNow() {
   else await powerAction('/api/v0/restart', 'poolReboot', 'poolMsg', 'Restart the miner now to apply the new pool settings?', 'restarting miner…');
 }
 
-// ---- Owner tuner ----
-let OWNER_ACTIVE = false, OWN_SYNCED = false;
+// ---- AutoTune ----
+let AUTO_TUNE_ACTIVE = false, AUTO_TUNE_SYNCED = false;
 function fmtAgo(s) { return s < 90 ? Math.round(s) + 's' : Math.round(s / 60) + 'm'; }
 function pt(p) {
   if (!p) return null;
@@ -2458,22 +2458,22 @@ function pt(p) {
   const v = p.voltage_mv != null ? p.voltage_mv : p.core_voltage_mv;
   return { f, v, j: p.j_th != null ? p.j_th : p.efficiency_j_th };
 }
-function renderOwnerTune(o) {
-  LAST_OWNER_STATUS = o;
-  let ownTxt = 'tuner off';
+function renderAutoTune(o) {
+  LAST_AUTO_TUNE_STATUS = o;
+  let autoTuneTxt = 'tuner off';
   if (o.enabled) {
-    ownTxt = (o.profile || '?') + ' / ' + (o.phase || '?');
-    if (o.per_chip && o.per_chip.phase) ownTxt += ' · per-chip ' + o.per_chip.phase;
-    if (o.fan_duty_percent != null) ownTxt += ' · fan ' + o.fan_duty_percent + '%';
-    if (o.continuous_ceiling_w != null) ownTxt += ' · cap ' + (+o.continuous_ceiling_w).toFixed(0) + ' W';
+    autoTuneTxt = (o.profile || '?') + ' / ' + (o.phase || '?');
+    if (o.per_chip && o.per_chip.phase) autoTuneTxt += ' · per-chip ' + o.per_chip.phase;
+    if (o.fan_duty_percent != null) autoTuneTxt += ' · fan ' + o.fan_duty_percent + '%';
+    if (o.continuous_ceiling_w != null) autoTuneTxt += ' · cap ' + (+o.continuous_ceiling_w).toFixed(0) + ' W';
     const sp = pt(o.setpoint);
-    if (sp && sp.f != null) ownTxt += ' · set ' + Math.round(sp.f) + ' MHz' + (sp.v != null ? ' @ ' + sp.v + ' mV' : '');
+    if (sp && sp.f != null) autoTuneTxt += ' · set ' + Math.round(sp.f) + ' MHz' + (sp.v != null ? ' @ ' + sp.v + ' mV' : '');
   }
-  $('ownCur').textContent = 'Current: ' + ownTxt;
-  if (!OWN_SYNCED) {
-    $('ownProfile').value = o.enabled ? (o.profile || 'off') : 'off';
-    $('ownContinuous').checked = !!o.continuous;
-    OWN_SYNCED = true;
+  $('autoTuneCur').textContent = 'Current: ' + autoTuneTxt;
+  if (!AUTO_TUNE_SYNCED) {
+    $('autoTuneProfile').value = o.enabled ? (o.profile || 'off') : 'off';
+    $('autoTuneContinuous').checked = !!o.continuous;
+    AUTO_TUNE_SYNCED = true;
   }
   const best = $('atbest'), list = $('atlist'), st = $('at-phase-label'), pcElem = $('at-per-chip');
   if (pcElem) {
@@ -2515,55 +2515,55 @@ function renderOwnerTune(o) {
     list.appendChild(row);
   }
 }
-async function pollOwnerTune() {
+async function pollAutoTune() {
   const caps = activeCaps();
-  if (!caps || !safeUrl(caps.tuner)) { OWNER_ACTIVE = false; return; }
+  if (!caps || !safeUrl(caps.tuner)) { AUTO_TUNE_ACTIVE = false; return; }
   try {
     const r = await fetch(caps.tuner);
-    if (!r.ok) { OWNER_ACTIVE = false; return; }
-    OWNER_ACTIVE = true;
-    renderOwnerTune(await r.json());
-  } catch (e) { OWNER_ACTIVE = false; }
+    if (!r.ok) { AUTO_TUNE_ACTIVE = false; return; }
+    AUTO_TUNE_ACTIVE = true;
+    renderAutoTune(await r.json());
+  } catch (e) { AUTO_TUNE_ACTIVE = false; }
 }
-async function applyOwner() {
+async function applyAutoTune() {
   const caps = activeCaps();
-  if (!caps || !safeUrl(caps.tuner)) { setMsg('ownMsg', 'tuner not available for this board'); return; }
-  if (writeBusy('ownMsg')) return;
-  const sel = $('ownProfile'), v = sel.value, label = sel.options[sel.selectedIndex].textContent;
-  const curProfile = (LAST_OWNER_STATUS && LAST_OWNER_STATUS.enabled) ? (LAST_OWNER_STATUS.profile || 'off') : 'off';
-  const curContinuous = !!(LAST_OWNER_STATUS && LAST_OWNER_STATUS.continuous);
-  const newContinuous = $('ownContinuous').checked;
-  const tt = $('ownTemp').value;
+  if (!caps || !safeUrl(caps.tuner)) { setMsg('autoTuneMsg', 'tuner not available for this board'); return; }
+  if (writeBusy('autoTuneMsg')) return;
+  const sel = $('autoTuneProfile'), v = sel.value, label = sel.options[sel.selectedIndex].textContent;
+  const curProfile = (LAST_AUTO_TUNE_STATUS && LAST_AUTO_TUNE_STATUS.enabled) ? (LAST_AUTO_TUNE_STATUS.profile || 'off') : 'off';
+  const curContinuous = !!(LAST_AUTO_TUNE_STATUS && LAST_AUTO_TUNE_STATUS.continuous);
+  const newContinuous = $('autoTuneContinuous').checked;
+  const tt = $('autoTuneTemp').value;
 
   const profileChanged = (v !== curProfile);
   const tempChanged = (tt !== '');
   const continuousChanged = (newContinuous !== curContinuous);
 
   if (!profileChanged && !tempChanged && !continuousChanged) {
-    setMsg('ownMsg', 'No changes to apply');
+    setMsg('autoTuneMsg', 'No changes to apply');
     return;
   }
 
   // If ONLY continuous toggle changed and a profile is active, send ONLY continuous to avoid resetting the profile search or fan target
   if (!profileChanged && !tempChanged && continuousChanged) {
-    if (!LAST_OWNER_STATUS || !LAST_OWNER_STATUS.enabled) {
-      setMsg('ownMsg', 'turn on a profile first');
+    if (!LAST_AUTO_TUNE_STATUS || !LAST_AUTO_TUNE_STATUS.enabled) {
+      setMsg('autoTuneMsg', 'turn on a profile first');
       return;
     }
     const body = { continuous: newContinuous };
-    setMsg('ownMsg', 'Sending…');
+    setMsg('autoTuneMsg', 'Sending…');
     lockWrites();
     try {
       await sendJson('PATCH', caps.tuner, body);
-      setMsg('ownMsg', 'Queued: continuous ' + (newContinuous ? 'ON' : 'OFF'), true);
+      setMsg('autoTuneMsg', 'Queued: continuous ' + (newContinuous ? 'ON' : 'OFF'), true);
       USER_EDITING_CONTINUOUS = false;
       setTimeout(async () => {
-        await pollOwnerTune();
-        if (!USER_EDITING_CONTINUOUS && LAST_OWNER_STATUS) {
-          $('ownContinuous').checked = !!LAST_OWNER_STATUS.continuous;
+        await pollAutoTune();
+        if (!USER_EDITING_CONTINUOUS && LAST_AUTO_TUNE_STATUS) {
+          $('autoTuneContinuous').checked = !!LAST_AUTO_TUNE_STATUS.continuous;
         }
       }, 2500);
-    } catch (e) { setMsg('ownMsg', 'Failed: ' + e.message); }
+    } catch (e) { setMsg('autoTuneMsg', 'Failed: ' + e.message); }
     return;
   }
 
@@ -2576,15 +2576,15 @@ async function applyOwner() {
     body.continuous = newContinuous;
   }
 
-  setMsg('ownMsg', 'Sending…');
+  setMsg('autoTuneMsg', 'Sending…');
   lockWrites();
   try {
     await sendJson('PATCH', caps.tuner, body);
     const extraTxt = (v !== 'off' && newContinuous) ? ' + continuous' : '';
-    setMsg('ownMsg', 'Queued: ' + label + extraTxt + ' (applies within ~1 s)', true);
+    setMsg('autoTuneMsg', 'Queued: ' + label + extraTxt + ' (applies within ~1 s)', true);
     USER_EDITING_CONTINUOUS = false;
-    setTimeout(pollOwnerTune, 2500);
-  } catch (e) { setMsg('ownMsg', 'Failed: ' + e.message); }
+    setTimeout(pollAutoTune, 2500);
+  } catch (e) { setMsg('autoTuneMsg', 'Failed: ' + e.message); }
 }
 
 // ---- Menus ----
@@ -2631,8 +2631,8 @@ $('psuModeSelect').addEventListener('change', syncPsuMode);
 $('psuApplyBtn').addEventListener('click', applyPsuProfile);
 $('poolSave').addEventListener('click', savePool);
 $('poolReboot').addEventListener('click', poolApplyNow);
-$('ownApply').addEventListener('click', applyOwner);
-$('ownContinuous').addEventListener('change', () => { USER_EDITING_CONTINUOUS = true; });
+$('autoTuneApply').addEventListener('click', applyAutoTune);
+$('autoTuneContinuous').addEventListener('change', () => { USER_EDITING_CONTINUOUS = true; });
 $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(b => {
   b.addEventListener('click', () => {
     $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(x => x.classList.remove('active'));
@@ -2655,7 +2655,7 @@ loadPool();
 applySystem();
 if (location.hash) { try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {} }
 tick(); setInterval(tick, 2000);
-setInterval(pollOwnerTune, 5000);
+setInterval(pollAutoTune, 5000);
 </script>
 </body>
 </html>

@@ -1,4 +1,4 @@
-//! Owner autotuner core, copied from IxTechCrypto/mujina
+//! AutoTune core, copied from IxTechCrypto/mujina
 //! `mujina-miner/src/api/autotune.rs` (commit a607f1f) with only the pieces that
 //! cannot compile in nano-mujina removed (API/BoardCommand/telemetry glue,
 //! snapshot_boards, the AutoTuners map, persistence, ChipProfile lookups). See
@@ -98,7 +98,7 @@ pub struct TuneEnvelope {
 }
 
 impl TuneEnvelope {
-    /// The BM1370 envelope (the owner repo's default). `chip_profile` does not
+    /// The BM1370 envelope (the upstream default). `chip_profile` does not
     /// exist in nano-mujina, so its BM1370 numbers are inlined here.
     pub const fn bm1370() -> Self {
         Self {
@@ -1219,6 +1219,21 @@ impl AutoTuner {
 
         // Reconcile back to the best point actually found, rather than holding
         // wherever the search ended.
+        // If voltage is currently ABOVE `best` while frequency was backed off
+        // BELOW `best` (e.g. after a power-cap backoff at an elevated voltage),
+        // lower voltage back to `best.core_voltage_mv` FIRST so raising
+        // frequency back to `best.frequency_mhz` does not spike power over the cap.
+        if commanded_v > best.core_voltage_mv + VOLT_TOLERANCE_MV
+            && m.frequency_mhz < best.frequency_mhz - FREQ_TOLERANCE_MHZ
+        {
+            self.phase = TunePhase::Seeking;
+            self.last_commanded_voltage_mv = Some(best.core_voltage_mv);
+            self.log_event(
+                format!("reverting to best known-good {} mV", best.core_voltage_mv),
+                m,
+            );
+            return Some(TuneAction::SetVoltage(best.core_voltage_mv));
+        }
         if (m.frequency_mhz - best.frequency_mhz).abs() > FREQ_TOLERANCE_MHZ {
             // A clock above best that lost even after voltage recovery is a
             // dead end — but the ~300 s hashrate estimate is noisy, so require

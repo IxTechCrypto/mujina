@@ -17,7 +17,7 @@ pub(crate) struct BoardCaps {
 
 impl BoardCaps {
     /// Avalon Nano 3S: per-chip grid, asic + outlet NTC, harness-driven fan
-    /// with a curve, owner tuner and manual tuning.
+    /// with a curve, AutoTune and manual tuning.
     pub(crate) fn nano3s(name: &str) -> Self {
         Self {
             chip_grid: "per_chip",
@@ -69,10 +69,10 @@ pub(crate) fn build_sha() -> Option<String> {
 }
 
 /// Continuous power ceiling shown to the user: only known when a PD contract
-/// was detected (`None` otherwise). `owner_ceiling` is the owner tuner's
+/// was detected (`None` otherwise). `auto_tune_ceiling` is the AutoTune's
 /// formula applied to the detected values.
-pub(crate) fn ceiling_if_known(psu_contract_w: Option<f64>, owner_ceiling: f32) -> Option<f64> {
-    psu_contract_w.filter(|w| w.is_finite()).map(|_| owner_ceiling as f64)
+pub(crate) fn ceiling_if_known(psu_contract_w: Option<f64>, auto_tune_ceiling: f32) -> Option<f64> {
+    psu_contract_w.filter(|w| w.is_finite()).map(|_| auto_tune_ceiling as f64)
 }
 
 pub(crate) fn build_system(i: &SystemInfo) -> Value {
