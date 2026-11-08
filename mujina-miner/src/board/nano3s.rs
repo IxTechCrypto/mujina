@@ -3597,21 +3597,22 @@ fn run_worker(
                             }
                         }
                     }
-                    // Auto-engage: if owner is locked, operating thermals have settled,
-                    // and chip tuning has not been explicitly disabled by manual directive,
+                    // Auto-engage: if owner is enabled (either locked or continuous dynamic tuning is active),
+                    // operating thermals have settled, and chip tuning has not been explicitly disabled,
                     // automatically instantiate the per-chip tuner if absent.
-                    if chip_tuner.is_none() && owner.is_locked() && persisted_tuning.chip_tune {
-                        eprintln!("[nano3s] owner tuner locked: auto-engaging per-chip tuner");
+                    let chip_tune_allowed = owner.is_locked() || (owner.is_enabled() && persisted_tuning.continuous);
+                    if chip_tuner.is_none() && chip_tune_allowed && persisted_tuning.chip_tune {
+                        eprintln!("[nano3s] auto-engaging per-chip tuner (locked={} continuous={})", owner.is_locked(), persisted_tuning.continuous);
                         chip_tuner = Some(new_chip_tuner(owner.profile(), chip_offset_mhz));
                     }
 
                     if let Some(ct) = chip_tuner.as_mut() {
                         let base = (last_applied_pll_freq[0], last_applied_voltage_mv);
-                        let ready = owner.is_locked() && chip_base == Some(base);
+                        let ready = chip_tune_allowed && chip_base == Some(base);
                         if !ready && chip_base.is_some() {
                             ct.interrupt();
                         }
-                        chip_base = owner.is_locked().then_some(base);
+                        chip_base = chip_tune_allowed.then_some(base);
                         // A partial or zeroed status (startup, a missed read)
                         // would look like dead chips; skip the tick.
                         let complete = st.chip_count as usize >= CHIP_COUNT && st.ghsspd > 0;
