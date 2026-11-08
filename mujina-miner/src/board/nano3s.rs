@@ -2551,7 +2551,7 @@ fn run_worker(
     // TUNING_CONF_PATH's doc comment for why this exists at all (this
     // used to live only in local variables and silently reset to
     // hardcoded defaults on every reboot, a real reported bug).
-    let persisted_tuning = load_tuning();
+    let mut persisted_tuning = load_tuning();
     let startup_pll_freq = persisted_tuning.pll_freq_mhz.unwrap_or(NANO3S_PLL_FREQ_TARGET);
     let mut chip_offset_mhz: [i16; CHIP_COUNT] = persisted_tuning.chip_offset_mhz.unwrap_or_default();
     let mut psu_override_max_w = load_psu_override_w();
@@ -2738,7 +2738,11 @@ fn run_worker(
     // Per-chip tuner: runs on the owner tick while the owner tuner is locked
     // and its base point hasn't moved since the last tick.
     let new_chip_tuner = |p: Option<TuneProfile>, o: [i16; CHIP_COUNT]| {
-        ChipTuner::new(ChipTunerConfig::default(), chip_goal(p), o)
+        let mut cfg = ChipTunerConfig::default();
+        if p == Some(TuneProfile::MaxHash) {
+            cfg.max_board_fail_pct = 25.0;
+        }
+        ChipTuner::new(cfg, chip_goal(p), o)
     };
     let mut chip_tuner = persisted_tuning
         .chip_tune
@@ -2793,6 +2797,7 @@ fn run_worker(
                         eprintln!("[nano3s] chip offsets {o:?} (via dashboard/API)");
                         if chip_tuner.take().is_some() {
                             persist_chip_tune(false);
+                            persisted_tuning.chip_tune = false;
                             owner.set_chip_status(None);
                             eprintln!("[nano3s] per-chip tuner off (manual offsets)");
                         }
@@ -2806,6 +2811,7 @@ fn run_worker(
                 let fan_given = parsed.as_ref().is_ok_and(|d| d.fan_target_c.is_some());
                 if let Ok(Some(on)) = parsed.as_ref().map(|d| d.chip_tune) {
                     persist_chip_tune(on);
+                    persisted_tuning.chip_tune = on;
                     let mut start = chip_offset_mhz;
                     if let Some(ct) = chip_tuner.take() {
                         start = stop_chip_tuner(ct, &mut chip_offset_mhz);
@@ -2819,6 +2825,7 @@ fn run_worker(
                 }
                 if let Ok(Some(c)) = parsed.as_ref().map(|d| d.continuous) {
                     persist_continuous(c);
+                    persisted_tuning.continuous = c;
                     owner.set_continuous(c);
                     owner.publish(None);
                     eprintln!("[nano3s] continuous tuning {}", if c { "on" } else { "off" });

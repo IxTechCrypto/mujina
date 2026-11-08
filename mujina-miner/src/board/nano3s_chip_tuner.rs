@@ -76,8 +76,8 @@ pub struct ChipTunerConfig {
 impl Default for ChipTunerConfig {
     fn default() -> Self {
         Self {
-            settle_ticks: 20,
-            discard_ticks: 8,
+            settle_ticks: 6,
+            discard_ticks: 2,
             step_mhz: 10,
             min_offset_mhz: -60,
             max_offset_mhz: 40,
@@ -232,14 +232,16 @@ impl ChipTuner {
     /// Feeds one tick. Returns true when [`Self::offsets`] changed.
     pub fn tick(&mut self, m: &ChipMetrics) -> bool {
         let board_fail = m.chip_fail_pct.iter().sum::<f32>() / CHIPS as f32;
-        // Fast safety: a trial that pushes the board unstable or over the
-        // power cap is put back on this tick, not after the settle.
+        // Fast safety: a step-up trial that pushes the board unstable or over
+        // the power cap is put back on this tick, not after the settle.
+        // Step-down trials reduce clock/power/errors and must not be aborted
+        // by pre-existing high board fail rate or power.
         if let ChipPhase::Trial { chip, from } = self.phase
+            && self.offsets[chip] > from
             && (board_fail > self.cfg.max_board_fail_pct || m.board_w > self.cfg.power_cap_w)
         {
-            let up = self.offsets[chip] > from;
             self.offsets[chip] = from;
-            self.mark_done(chip, up);
+            self.mark_done(chip, true);
             self.restart_keeping_marks();
             self.discard = self.cfg.discard_ticks;
             self.last_event = format!(
@@ -310,9 +312,15 @@ impl ChipTuner {
         let reference = self.reference.unwrap_or(base);
         let up = self.offsets[chip] > from;
         let chip_gain = win.chip_ghs[chip] / base.chip_ghs[chip].max(DEAD_GHS) - 1.0;
+        let fail_drop = base.chip_fail[chip] - win.chip_fail[chip];
         let step = self.board_ratio(&win, &base);
         let total = self.board_ratio(&win, &reference);
-        let keep = chip_gain >= self.cfg.chip_margin
+        let chip_improved = if up {
+            chip_gain >= self.cfg.chip_margin
+        } else {
+            chip_gain >= self.cfg.chip_margin || fail_drop >= 2.0
+        };
+        let keep = chip_improved
             && step >= 1.0 - self.cfg.board_guard
             && total >= 1.0 - self.cfg.total_guard;
         if keep {
@@ -381,7 +389,11 @@ impl ChipTuner {
             .iter()
             .copied()
             .filter(|&i| !self.done_down[i] && self.offsets[i] - step >= self.cfg.min_offset_mhz)
-            .filter(|&i| win.chip_fail[i] > self.cfg.weak_fail_pct && win.chip_fail[i] > 2.0 * median)
+            .filter(|&i| {
+                win.chip_fail[i] > self.cfg.weak_fail_pct
+                    && (win.chip_fail[i] > 2.0 * median
+                        || win.chip_fail[i] > self.cfg.max_board_fail_pct)
+            })
             .max_by(|&a, &b| win.chip_fail[a].total_cmp(&win.chip_fail[b]));
         if let Some(i) = weak {
             return Some((i, -step));
@@ -642,6 +654,35 @@ mod tests {
         run(&mut t, &sim, 4000, 7);
         let tuned = sim.measure(&t.committed_offsets());
         assert!(tuned.board_ths >= uniform.board_ths * 0.99, "{} vs {}", tuned.board_ths, uniform.board_ths);
+    }
+
+    #[test]
+    fn step_down_trial_is_not_aborted_by_high_board_fail_and_completes_within_owner_window() {
+        let mut t = tuner(ChipTunerConfig::default());
+        let mut m = flat(8.0);
+        m.chip_fail_pct[5] = 80.0; // board_fail = 14.0% > max_board_fail_pct (10.0%)
+        m.chip_ghs[5] = 80.0;
+        m.board_ths = m.chip_ghs.iter().sum::<f32>() / 1000.0;
+
+        // Baseline completes in 6 ticks and starts step-down trial on chip 5 (-10 MHz)
+        for _ in 0..t.cfg.settle_ticks {
+            t.tick(&m);
+        }
+        assert_eq!(t.offsets()[5], -10);
+        assert_eq!(t.phase(), ChipPhase::Trial { chip: 5, from: 0 });
+
+        // During discard + trial (2 + 6 = 8 ticks), board_fail is still > 10%,
+        // but because this is a step-down trial, fast-safety must NOT revert it.
+        let mut improved = m;
+        improved.chip_fail_pct[5] = 35.0; // still > 10% board_fail (10.25%), but much lower fail and higher GH/s
+        improved.chip_ghs[5] = 320.0;
+        improved.board_ths = improved.chip_ghs.iter().sum::<f32>() / 1000.0;
+
+        for _ in 0..(t.cfg.discard_ticks + t.cfg.settle_ticks) {
+            t.tick(&improved);
+        }
+        // Total ticks elapsed = 6 + 2 + 6 = 14 ticks (< 19 ticks in owner's 20-tick window)
+        assert_eq!(t.committed_offsets()[5], -10, "step-down must be committed: {}", t.last_event());
     }
 
     #[test]
