@@ -232,12 +232,19 @@ print(f"kdimg SHA-256: {kdimg_sha256}")
 print(f"app   SHA-256: {app_sha256}")
 print(f"data  SHA-256: {data_sha256}")
 
+VERSION = "v5.0.3"
+
 for dl_dir in ["/mnt/c/Users/grant/Downloads", "/mnt/d/downloads"]:
     if os.path.isdir(dl_dir):
+        # Version-explicit filenames
+        shutil.copy2(out_kdimg, os.path.join(dl_dir, f"nano-mujina-{VERSION}-release.kdimg"))
+        shutil.copy2(v5_app_img, os.path.join(dl_dir, f"{VERSION}_app_release.img"))
+        shutil.copy2(v5_data_img, os.path.join(dl_dir, f"{VERSION}_data_release.img"))
+        # Unversioned aliases for backward compatibility with tooling
         shutil.copy2(out_kdimg, os.path.join(dl_dir, "nano-mujina-v5-release.kdimg"))
         shutil.copy2(v5_app_img, os.path.join(dl_dir, "v5_app_release.img"))
         shutil.copy2(v5_data_img, os.path.join(dl_dir, "v5_data_release.img"))
-        print(f"Copied artifacts to {dl_dir}")
+        print(f"Copied artifacts to {dl_dir} (with {VERSION} and v5 naming)")
         dup_path = os.path.join(dl_dir, "nano-mujina-v5-release (1).kdimg")
         if os.path.exists(dup_path):
             shutil.copy2(out_kdimg, dup_path)
