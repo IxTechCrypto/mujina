@@ -52,6 +52,12 @@ enum {
 	 * Fire-and-forget. Older rtos_core builds treat it as wrong_peer, so
 	 * mujina only sends it when an offset is non-zero. */
 	IPC_MSG_SET_CHIP_PLL_OFFSET = 12,
+	/* Split JOB messages for payloads exceeding K_IPCMSG_MAX_CONTENT_LEN
+	 * (e.g. Ocean pool's ~554B coinbase + 8+ merkle branches).
+	 * IPC_MSG_JOB_SPLIT_HEAD: scalar fields, header, target, vmask, merkles.
+	 * IPC_MSG_JOB_SPLIT_COINBASE: job_id + offset + coinbase chunk. */
+	IPC_MSG_JOB_SPLIT_HEAD     = 13,
+	IPC_MSG_JOB_SPLIT_COINBASE = 14,
 };
 
 struct ipc_job {
@@ -199,5 +205,13 @@ int ipc_job_pack(const struct ipc_job *job, uint8_t *buf, uint16_t buf_cap, uint
  * or truncated buffer, including a length that doesn't exactly match the
  * declared nmerkles/coinbase_len. */
 int ipc_job_unpack(const uint8_t *buf, uint16_t len, struct ipc_job *job);
+
+/* Packs split job head (all fields except coinbase). */
+int ipc_job_split_head_pack(const struct ipc_job *job, uint8_t *buf, uint16_t buf_cap, uint16_t *out_len);
+int ipc_job_split_head_unpack(const uint8_t *buf, uint16_t len, struct ipc_job *job);
+
+/* Packs/unpacks coinbase chunk for split job. */
+int ipc_job_split_coinbase_pack(uint32_t job_id, uint16_t offset, const uint8_t *chunk, uint16_t chunk_len, uint8_t *buf, uint16_t buf_cap, uint16_t *out_len);
+int ipc_job_split_coinbase_unpack(const uint8_t *buf, uint16_t len, uint32_t *out_job_id, uint16_t *out_offset, const uint8_t **out_data, uint16_t *out_chunk_len);
 
 #endif

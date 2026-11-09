@@ -82,7 +82,7 @@ pub(crate) fn build_system(i: &SystemInfo) -> Value {
         "platform": i.platform,
         "firmware": {
             "name": "mujina-minerd",
-            "version": i.version,
+            "version": if i.version.starts_with('v') { i.version.to_string() } else { format!("v{}", i.version) },
             "build": i.build,
             "update": i.update,
         },
@@ -121,7 +121,7 @@ mod tests {
         SystemInfo {
             mode: "embedded",
             platform: "nano3s-k230".into(),
-            version: "0.1.0",
+            version: "5.0.3",
             build: Some("abc1234".into()),
             update: "bundle",
             device_model: Some("Avalon Nano 3S".into()),
@@ -148,6 +148,7 @@ mod tests {
         assert_eq!(v["mode"], "embedded");
         assert_eq!(v["platform"], "nano3s-k230");
         assert_eq!(v["firmware"]["update"], "bundle");
+        assert_eq!(v["firmware"]["version"], "v5.0.3");
         assert_eq!(v["firmware"]["build"], "abc1234");
         assert_eq!(v["device"]["model"], "Avalon Nano 3S");
         assert_eq!(v["device"]["can_reboot"], true);

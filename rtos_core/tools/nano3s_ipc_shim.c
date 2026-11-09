@@ -247,13 +247,45 @@ int nano3s_ipc_send_job(
 	job.work_restart = work_restart;
 	memcpy(job.vmask, vmask, sizeof(job.vmask));
 
-	if (ipc_job_pack(&job, wire, sizeof(wire), &wire_len) != 0) {
-		fprintf(stderr, "[nano3s_ipc_shim] ipc_job_pack failed (job_id=0x%08x)\n", job_id);
+	size_t need = (size_t)IPC_JOB_WIRE_HDR_LEN + (size_t)nmerkles * 32u + coinbase_len;
+	if (need <= K_IPCMSG_MAX_CONTENT_LEN) {
+		if (ipc_job_pack(&job, wire, sizeof(wire), &wire_len) != 0) {
+			fprintf(stderr, "[nano3s_ipc_shim] ipc_job_pack failed (job_id=0x%08x)\n", job_id);
+			return -1;
+		}
+		if (send_only(g_ipc_id, IPC_MSG_JOB, wire, wire_len) != 0) {
+			fprintf(stderr, "[nano3s_ipc_shim] JOB send_only failed (job_id=0x%08x)\n", job_id);
+			return -1;
+		}
+		return 0;
+	}
+
+	/* Split path for large jobs (e.g. Ocean pool coinbase + merkle branches) */
+	if (ipc_job_split_head_pack(&job, wire, sizeof(wire), &wire_len) != 0) {
+		fprintf(stderr, "[nano3s_ipc_shim] ipc_job_split_head_pack failed (job_id=0x%08x)\n", job_id);
 		return -1;
 	}
-	if (send_only(g_ipc_id, IPC_MSG_JOB, wire, wire_len) != 0) {
-		fprintf(stderr, "[nano3s_ipc_shim] JOB send_only failed (job_id=0x%08x)\n", job_id);
+	if (send_only(g_ipc_id, IPC_MSG_JOB_SPLIT_HEAD, wire, wire_len) != 0) {
+		fprintf(stderr, "[nano3s_ipc_shim] JOB_SPLIT_HEAD send_only failed (job_id=0x%08x)\n", job_id);
 		return -1;
+	}
+
+	{
+		uint16_t offset = 0;
+		const uint16_t max_chunk = K_IPCMSG_MAX_CONTENT_LEN - 8; /* 1016 bytes */
+		while (offset < coinbase_len) {
+			uint16_t chunk_len = (uint16_t)((coinbase_len - offset) > max_chunk ? max_chunk : (coinbase_len - offset));
+			uint16_t c_wire_len;
+			if (ipc_job_split_coinbase_pack(job_id, offset, coinbase + offset, chunk_len, wire, sizeof(wire), &c_wire_len) != 0) {
+				fprintf(stderr, "[nano3s_ipc_shim] ipc_job_split_coinbase_pack failed (job_id=0x%08x)\n", job_id);
+				return -1;
+			}
+			if (send_only(g_ipc_id, IPC_MSG_JOB_SPLIT_COINBASE, wire, c_wire_len) != 0) {
+				fprintf(stderr, "[nano3s_ipc_shim] JOB_SPLIT_COINBASE send_only failed (job_id=0x%08x)\n", job_id);
+				return -1;
+			}
+			offset += chunk_len;
+		}
 	}
 	return 0;
 }

@@ -1567,6 +1567,9 @@ struct stage6_ctx {
 	pthread_mutex_t lock; /* protects everything below, shared with stage6_recv_handler() */
 	a3197s_job_t pending_job;
 	int have_pending_job; /* 0 = none, 1 = applied already, 2 = new, apply on next loop tick */
+	struct ipc_job split_job_staging;
+	int split_job_head_valid;
+	uint32_t split_job_received_coinbase_len;
 	uint32_t pending_pll_freq[4];
 	int have_pending_mode;
 	uint32_t pending_rolltime_raw; /* IPC_MSG_SET_ROLLTIME_RAW override */
@@ -1644,6 +1647,69 @@ static void stage6_recv_handler(uint16_t cmd, const void *body, uint16_t len)
 
 		fprintf(ctx->fp, "[recv] JOB job_id=0x%08x coinbase_len=%u nmerkles=%d\n",
 			job.job_id, (unsigned)job.coinbase_len, job.nmerkles);
+		fflush(ctx->fp);
+	} else if (cmd == IPC_MSG_JOB_SPLIT_HEAD) {
+		struct ipc_job job;
+
+		if (ipc_job_split_head_unpack(body, len, &job) != 0) {
+			fprintf(ctx->fp, "[recv] JOB_SPLIT_HEAD unpack failed (len=%u)\n", (unsigned)len);
+			fflush(ctx->fp);
+			return;
+		}
+
+		pthread_mutex_lock(&ctx->lock);
+		ctx->split_job_staging = job;
+		ctx->split_job_head_valid = 1;
+		ctx->split_job_received_coinbase_len = 0;
+		pthread_mutex_unlock(&ctx->lock);
+
+		fprintf(ctx->fp, "[recv] JOB_SPLIT_HEAD job_id=0x%08x expected_cb_len=%u nmerkles=%d\n",
+			job.job_id, (unsigned)job.coinbase_len, job.nmerkles);
+		fflush(ctx->fp);
+	} else if (cmd == IPC_MSG_JOB_SPLIT_COINBASE) {
+		uint32_t job_id;
+		uint16_t offset;
+		const uint8_t *data;
+		uint16_t chunk_len;
+		int job_ready = 0;
+		struct ipc_job completed_job;
+
+		if (ipc_job_split_coinbase_unpack(body, len, &job_id, &offset, &data, &chunk_len) != 0) {
+			fprintf(ctx->fp, "[recv] JOB_SPLIT_COINBASE unpack failed (len=%u)\n", (unsigned)len);
+			fflush(ctx->fp);
+			return;
+		}
+
+		pthread_mutex_lock(&ctx->lock);
+		if (ctx->split_job_head_valid && ctx->split_job_staging.job_id == job_id) {
+			if ((size_t)offset + chunk_len <= ctx->split_job_staging.coinbase_len &&
+			    (size_t)offset + chunk_len <= sizeof(ctx->split_job_staging.coinbase)) {
+				memcpy(ctx->split_job_staging.coinbase + offset, data, chunk_len);
+				ctx->split_job_received_coinbase_len += chunk_len;
+				if (ctx->split_job_received_coinbase_len >= ctx->split_job_staging.coinbase_len) {
+					completed_job = ctx->split_job_staging;
+					ctx->split_job_head_valid = 0;
+					job_ready = 1;
+
+					a3197s_job_from_ipc(&ctx->pending_job, &completed_job);
+					ctx->have_pending_job = 2;
+					ctx->result.jobs_received++;
+					ctx->result.last_job_id = completed_job.job_id;
+				}
+			} else {
+				fprintf(ctx->fp, "[recv] JOB_SPLIT_COINBASE overflow off=%u len=%u expected=%u\n",
+					offset, chunk_len, ctx->split_job_staging.coinbase_len);
+			}
+		} else {
+			fprintf(ctx->fp, "[recv] JOB_SPLIT_COINBASE orphan or job_id mismatch (0x%08x vs expected 0x%08x)\n",
+				job_id, ctx->split_job_head_valid ? ctx->split_job_staging.job_id : 0);
+		}
+		pthread_mutex_unlock(&ctx->lock);
+
+		if (job_ready) {
+			fprintf(ctx->fp, "[recv] JOB_SPLIT complete job_id=0x%08x coinbase_len=%u nmerkles=%d\n",
+				completed_job.job_id, (unsigned)completed_job.coinbase_len, completed_job.nmerkles);
+		}
 		fflush(ctx->fp);
 	} else if (cmd == IPC_MSG_SET_MODE) {
 		struct ipc_set_mode sm;
