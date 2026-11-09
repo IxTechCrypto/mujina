@@ -72,6 +72,27 @@ for root, dirs, files in os.walk(data_stage):
             except Exception:
                 pass
 
+# [P1] Strip unit-specific donor factory files and hardware serials
+donor_files = [
+    os.path.join(data_stage, "factory", "hashrate_cali.ini"),
+    os.path.join(data_stage, "factory", "efuse_info.txt"),
+    os.path.join(data_stage, "userdata", "nano", "board_id_cache"),
+    os.path.join(data_stage, "userconfig", "activation.ini"),
+]
+for df in donor_files:
+    if os.path.exists(df):
+        os.remove(df)
+        print(f"  [P1] Stripped donor artifact: {os.path.basename(df)}")
+
+# [P1] Sanitize pool configs to clean default placeholder (replacing donor wallet)
+pool_path = os.path.join(data_stage, "userconfig", "pool.conf")
+with open(pool_path, "w") as f:
+    f.write("url=stratum+tcp://pool.256foundation.org:3333\nuser=YOUR_WALLET.YOUR_WORKER\n")
+
+cgminer_path = os.path.join(data_stage, "userconfig", "cgminer.conf")
+with open(cgminer_path, "w") as f:
+    f.write("""{\n  "pools": {\n    "pool0": {\n      "url": "stratum+tcp://pool.256foundation.org:3333",\n      "user": "YOUR_WALLET.YOUR_WORKER",\n      "pass": "x"\n    }\n  },\n  "standard": "--lowmem --real-quiet"\n}\n""")
+
 wpa_path = os.path.join(data_stage, "userconfig", "wpa_supplicant.conf")
 with open(wpa_path, "w") as f:
     f.write("ctrl_interface=/var/run/wpa_supplicant\nupdate_config=1\n")
@@ -82,11 +103,41 @@ for root, dirs, files in os.walk(app_stage):
     for f in files:
         if (f.endswith('.log') or '.log.' in f or f.endswith('.tmp')
                 or f.endswith('.real_backup') or f.startswith('.')
-                or f == 'biglog'):
+                or f == 'biglog' or '.pre_' in f or '.stock_backup' in f):
             try:
                 os.remove(os.path.join(root, f))
             except Exception:
                 pass
+
+# [P0] Fix execute permissions across app partition before mkfs.ubifs
+app_bin_dir = os.path.join(app_stage, "release", "linux", "app")
+scripts_750 = ["volt_bringup.sh", "gpio34_high_bringup.sh", "backlight_bringup.sh",
+               "wifi_bringup.sh", "fan_bringup.sh"]
+for s in scripts_750:
+    p = os.path.join(app_bin_dir, s)
+    if os.path.exists(p):
+        os.chmod(p, 0o750)
+
+bins_755 = ["wdt_disable_hold", "fb_button", "fb_draw", "mujina_test_harness", "mujina_display_startup.sh"]
+for b in bins_755:
+    p = os.path.join(app_bin_dir, b)
+    if os.path.exists(p):
+        os.chmod(p, 0o755)
+
+rtos_elf = os.path.join(app_stage, "release", "rtt", "rtos_core.elf")
+if os.path.exists(rtos_elf):
+    os.chmod(rtos_elf, 0o755)
+
+# [P0 Assert] Verify execute bits are strictly enforced
+for s in scripts_750:
+    p = os.path.join(app_bin_dir, s)
+    mode = oct(os.stat(p).st_mode & 0o777)
+    assert mode in ("0o750", "0o755"), f"Permission failure on {s}: mode is {mode}"
+for b in bins_755:
+    p = os.path.join(app_bin_dir, b)
+    mode = oct(os.stat(p).st_mode & 0o777)
+    assert mode == "0o755", f"Permission failure on {b}: mode is {mode}"
+print("  [P0] Asserted execution permissions (0o750 / 0o755) across all app binaries and scripts.")
 
 print("[3] Building app UBI partition (v5_app.img)...")
 app_ubifs = os.path.join(out_v5, "app.ubifs")
@@ -200,6 +251,17 @@ with open(v5_data_img, "wb") as f:
     f.write(full_data)
 print(f"Wrote {v5_data_img} ({len(full_data)} bytes)")
 
+print("[4.5] Generating OTA bundle (nano-mujina-v5-bundle.bin)...")
+minerd_bytes = open(dst_minerd, "rb").read()
+bundle_magic = b"MJBUNDL1"
+bundle_hdr = bundle_magic + struct.pack("<I", len(minerd_bytes))
+bundle_bin = os.path.join(out_v5, "nano-mujina-v5-bundle.bin")
+with open(bundle_bin, "wb") as f:
+    f.write(bundle_hdr + minerd_bytes)
+bundle_size = os.path.getsize(bundle_bin)
+bundle_sha256 = hashlib.sha256(open(bundle_bin, "rb").read()).hexdigest()
+print(f"  Built OTA bundle: {bundle_bin} ({bundle_size} bytes, SHA-256: {bundle_sha256})")
+
 print("[5] Repacking nano-mujina-v5-release.kdimg with updated app_ubi and data...")
 src_kdimg = "/home/grant/udisk_build/nano-mujina-v4.kdimg"
 out_kdimg = "/home/grant/udisk_build/nano-mujina-v5-release.kdimg"
@@ -240,10 +302,12 @@ for dl_dir in ["/mnt/c/Users/grant/Downloads", "/mnt/d/downloads"]:
         shutil.copy2(out_kdimg, os.path.join(dl_dir, f"nano-mujina-{VERSION}-release.kdimg"))
         shutil.copy2(v5_app_img, os.path.join(dl_dir, f"{VERSION}_app_release.img"))
         shutil.copy2(v5_data_img, os.path.join(dl_dir, f"{VERSION}_data_release.img"))
+        shutil.copy2(bundle_bin, os.path.join(dl_dir, f"nano-mujina-{VERSION}-bundle.bin"))
         # Unversioned aliases for backward compatibility with tooling
         shutil.copy2(out_kdimg, os.path.join(dl_dir, "nano-mujina-v5-release.kdimg"))
         shutil.copy2(v5_app_img, os.path.join(dl_dir, "v5_app_release.img"))
         shutil.copy2(v5_data_img, os.path.join(dl_dir, "v5_data_release.img"))
+        shutil.copy2(bundle_bin, os.path.join(dl_dir, "nano-mujina-v5-bundle.bin"))
         print(f"Copied artifacts to {dl_dir} (with {VERSION} and v5 naming)")
         dup_path = os.path.join(dl_dir, "nano-mujina-v5-release (1).kdimg")
         if os.path.exists(dup_path):
