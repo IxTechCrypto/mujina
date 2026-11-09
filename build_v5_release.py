@@ -14,7 +14,7 @@ def run_cmd(cmd, cwd=None):
         raise RuntimeError(f"Command failed: {cmd}")
     return res.stdout
 
-print("=== MUJINA FIRMWARE RELEASE BUILD (v5.0.2) ===")
+print("=== MUJINA FIRMWARE RELEASE BUILD (v5.0.3) ===")
 print("[1] Updating staged binaries for data and app partitions...")
 
 # Data binaries
