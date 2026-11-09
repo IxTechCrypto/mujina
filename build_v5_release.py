@@ -33,10 +33,11 @@ if os.path.exists(stage_dir):
 os.makedirs(data_stage, exist_ok=True)
 run_cmd(f"cp -a /home/grant/udisk_build/data_extracted/590221451/ubi_data_part/* {data_stage}/")
 
-# Clean up any transient logs/caches
+# Clean up any transient logs/caches/backups
 for root, dirs, files in os.walk(data_stage):
     for f in files:
-        if f.endswith('.log') or f.endswith('.tmp') or f.startswith('.'):
+        if (f.endswith('.log') or '.log.' in f or f.endswith('.tmp')
+                or f.endswith('.real_backup') or f.startswith('.')):
             try:
                 os.remove(os.path.join(root, f))
             except Exception:
@@ -96,11 +97,25 @@ os.makedirs(gtmp_v5, exist_ok=True)
 genimage_bin = "/home/grant/udisk_build/build/tools/genimage"
 run_cmd(f"{genimage_bin} --rootpath {stage_dir} --tmppath {gtmp_v5} --inputpath {out_v5} --outputpath {out_v5} --config {cfg_path}")
 
+print("[3b] Running ubinize with fixed image_seq=590221451 and dynamic autoresize...")
+ubinize_ini = "/home/grant/udisk_build/ubinize_v5.ini"
+data_ubifs = os.path.join(out_v5, "data.ubifs")
 raw_data_ubi = os.path.join(out_v5, "data.ubi")
-raw_data = open(raw_data_ubi, "rb").read()
-print(f"genimage produced data.ubi: {len(raw_data)} bytes")
+with open(ubinize_ini, "w") as f:
+    f.write(f"""[ubi_data_part]
+mode=ubi
+image={data_ubifs}
+vol_id=0
+vol_type=dynamic
+vol_name=ubi_data_part
+vol_flags=autoresize
+""")
+run_cmd(f"/usr/sbin/ubinize -o {raw_data_ubi} -p 131072 -m 2048 -s 2048 -Q 590221451 {ubinize_ini}")
 
-# Read empty PEB template from v4_data.img
+raw_data = open(raw_data_ubi, "rb").read()
+print(f"ubinize produced data.ubi: {len(raw_data)} bytes ({len(raw_data) // 131072} PEBs)")
+
+# Read empty PEB template from v4_data.img (PEB 120 has UBI EC header with image_seq=590221451)
 with open("/home/grant/udisk_build/v4_data.img", "rb") as f:
     f.seek(120 * 131072)
     empty_peb = f.read(131072)
@@ -109,6 +124,28 @@ pebs_needed = 448 - (len(raw_data) // 131072)
 print(f"Padding {pebs_needed} empty PEBs to reach 448 PEBs (58,720,256 bytes)...")
 full_data = raw_data + empty_peb * pebs_needed
 assert len(full_data) == 58720256, f"Full data size mismatch: {len(full_data)}"
+
+# Verify every PEB has consistent UBI EC header and image_seq=590221451 (0x232e108b)
+expected_seq = 590221451
+vol_table_pebs = []
+for peb_idx in range(448):
+    peb_off = peb_idx * 131072
+    ec_magic = full_data[peb_off:peb_off + 4]
+    assert ec_magic == b"UBI#", f"PEB {peb_idx} missing UBI# magic: {ec_magic!r}"
+    seq = struct.unpack_from(">I", full_data, peb_off + 24)[0]
+    assert seq == expected_seq, f"PEB {peb_idx} image_seq mismatch: {seq:#x} != {expected_seq:#x}"
+    vid_magic = full_data[peb_off + 2048:peb_off + 2052]
+    if vid_magic == b"UBI!":
+        vol_id = struct.unpack_from(">I", full_data, peb_off + 2048 + 8)[0]
+        if vol_id == 0x7fffefff:
+            vol_table_pebs.append(peb_idx)
+            reserved_pebs = struct.unpack_from(">I", full_data, peb_off + 4096)[0]
+            vol_flags = full_data[peb_off + 4096 + 144]
+            assert 100 <= reserved_pebs <= 140, f"Unexpected reserved_pebs={reserved_pebs} in PEB {peb_idx}"
+            assert vol_flags == 1, f"Expected autoresize flag (1), got {vol_flags} in PEB {peb_idx}"
+
+assert len(vol_table_pebs) == 2, f"Expected 2 layout volume PEBs, found {vol_table_pebs}"
+print(f"Verified all 448 PEBs have image_seq={expected_seq:#x}, layout PEBs={vol_table_pebs}, reserved_pebs={reserved_pebs}, vol_flags={vol_flags}")
 
 v5_data_img = "/home/grant/udisk_build/v5_data.img"
 with open(v5_data_img, "wb") as f:
@@ -140,7 +177,19 @@ assert header_crc == calc_hdr_crc, f"Header CRC mismatch: {header_crc:#x} != {ca
 print(f"CRC checks passed: header_crc={header_crc:#x}, tbl_crc={tbl_crc:#x}")
 
 print("[6] Copying release artifacts to Windows Downloads...")
-win_downloads = "/mnt/c/Users/grant/Downloads"
-shutil.copy2(out_kdimg, os.path.join(win_downloads, "nano-mujina-v5-release.kdimg"))
-shutil.copy2(v5_data_img, os.path.join(win_downloads, "v5_data_release.img"))
-print("[+] Build complete! Both nano-mujina-v5-release.kdimg and v5_data_release.img ready in C:\\Users\\grant\\Downloads.")
+kdimg_sha256 = hashlib.sha256(raw).hexdigest()
+data_sha256 = hashlib.sha256(full_data).hexdigest()
+print(f"kdimg SHA-256: {kdimg_sha256}")
+print(f"data  SHA-256: {data_sha256}")
+
+for dl_dir in ["/mnt/c/Users/grant/Downloads", "/mnt/d/downloads"]:
+    if os.path.isdir(dl_dir):
+        shutil.copy2(out_kdimg, os.path.join(dl_dir, "nano-mujina-v5-release.kdimg"))
+        shutil.copy2(v5_data_img, os.path.join(dl_dir, "v5_data_release.img"))
+        print(f"Copied nano-mujina-v5-release.kdimg and v5_data_release.img to {dl_dir}")
+        dup_path = os.path.join(dl_dir, "nano-mujina-v5-release (1).kdimg")
+        if os.path.exists(dup_path):
+            shutil.copy2(out_kdimg, dup_path)
+            print(f"Updated existing {dup_path}")
+
+print("[+] Build complete!")
