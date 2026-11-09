@@ -113,7 +113,10 @@ async fn serve_auth_js() -> impl IntoResponse {
 }
 
 async fn serve_page() -> impl IntoResponse {
-    Html(DASHBOARD_HTML)
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store, no-cache, must-revalidate")],
+        Html(DASHBOARD_HTML),
+    )
 }
 
 async fn serve_logo_svg() -> impl IntoResponse {
