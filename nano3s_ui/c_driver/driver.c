@@ -72,6 +72,16 @@
  * C_IP_BLUE ever changes. */
 #define C_IP_BLUE_HEX "7fbcff"
 #define C_WHITE lv_color_make(0xff, 0xff, 0xff)
+#define C_CYAN lv_color_make(0x00, 0xf0, 0xff)
+#define C_MAG lv_color_make(0xff, 0x2e, 0x97)
+#define C_AMBER lv_color_make(0xff, 0xb0, 0x00)
+
+static lv_color_t temp_to_color(double t) {
+    if (t < 50.0) return C_CYAN;     /* t-cool */
+    if (t < 70.0) return C_GREEN;    /* t-normal */
+    if (t < 85.0) return C_AMBER;    /* t-warm */
+    return C_MAG;                    /* t-hot */
+}
 
 /* ── Display flush ────────────────────────────────────────────────────── */
 
@@ -314,6 +324,16 @@ static lv_obj_t *scr_diag, *diag_chips_meter, *diag_chips_label, *diag_pll, *dia
 static lv_meter_scale_t *diag_chips_scale;
 static lv_meter_indicator_t *diag_chips_arc;
 
+/* Screen 3: Auto Tuner Profile & 12-Chip Thermal Focus */
+static lv_obj_t *scr_tuner;
+static lv_obj_t *chip_arcs[12];
+static lv_obj_t *tuner_title;
+static lv_obj_t *tuner_mode_card, *tuner_mode_bar, *tuner_mode_sub, *tuner_mode_val;
+static lv_obj_t *tuner_cont_pill, *tuner_cont_lbl;
+static lv_obj_t *tuner_cool_card, *tuner_cool_title, *tuner_cool_val;
+static lv_obj_t *tuner_hot_card, *tuner_hot_title, *tuner_hot_val;
+static lv_obj_t *tuner_avg_lbl;
+
 static lv_obj_t *scr_ip, *ip_caption, *ip_value, *ip_no_wifi;
 
 static lv_obj_t *scr_wifi_setup, *wifi_setup_status, *wifi_setup_detail, *wifi_setup_meter;
@@ -437,6 +457,164 @@ static void build_screens(void) {
     make_label(scr_diag, f14, C_TEXT_2, 190, "CORE VOLTAGE");
     diag_voltage = make_label(scr_diag, f14, C_TEXT_1, 206, NULL);
     diag_err = make_label(scr_diag, f14, C_TEXT_3, 224, NULL);
+
+    /* nano3s-tuner (Screen 3): Auto Tuner Profile & Per-Chip Thermal Notches */
+    scr_tuner = lv_obj_create(NULL);
+    style_bg(scr_tuner, C_BG);
+
+    /* 12 Perimeter Chips brought comfortably inset from bezel edge (size 222x222, 9px inset from glass edge)
+     * with prominent 8-degree gaps (22 deg notch, 8 deg gap) */
+    for (int i = 0; i < 12; i++) {
+        chip_arcs[i] = lv_arc_create(scr_tuner);
+        lv_obj_remove_style(chip_arcs[i], NULL, LV_PART_KNOB);
+        lv_obj_clear_flag(chip_arcs[i], LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_size(chip_arcs[i], 222, 222);
+        lv_obj_center(chip_arcs[i]);
+        lv_obj_set_style_pad_all(chip_arcs[i], 0, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(chip_arcs[i], LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_width(chip_arcs[i], 0, LV_PART_MAIN);
+
+        uint16_t a1 = (uint16_t)(((270 + i * 30) % 360) + 4);
+        uint16_t a2 = (uint16_t)(a1 + 22);
+
+        lv_arc_set_rotation(chip_arcs[i], 0);
+        lv_arc_set_bg_angles(chip_arcs[i], a1, a2);
+        lv_arc_set_angles(chip_arcs[i], a1, a2);
+        lv_obj_set_style_arc_width(chip_arcs[i], 4, LV_PART_MAIN);
+        lv_obj_set_style_arc_width(chip_arcs[i], 4, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_color(chip_arcs[i], lv_color_make(20, 25, 34), LV_PART_MAIN);
+        lv_obj_set_style_arc_color(chip_arcs[i], C_GREEN, LV_PART_INDICATOR);
+    }
+
+    /* Top Title Header */
+    tuner_title = lv_label_create(scr_tuner);
+    lv_obj_set_style_text_font(tuner_title, f14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(tuner_title, C_CYAN, LV_PART_MAIN);
+    lv_obj_set_width(tuner_title, 240);
+    lv_obj_set_style_text_align(tuner_title, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_label_set_text(tuner_title, "// AUTO TUNER \\\\");
+    lv_obj_align(tuner_title, LV_ALIGN_TOP_MID, 0, 38);
+
+    /* Central Chamfered Workmode Card (132x38, centered, generous clearance) */
+    tuner_mode_card = lv_obj_create(scr_tuner);
+    lv_obj_remove_style_all(tuner_mode_card);
+    lv_obj_set_size(tuner_mode_card, 132, 38);
+    lv_obj_set_style_pad_all(tuner_mode_card, 0, LV_PART_MAIN);
+    lv_obj_align(tuner_mode_card, LV_ALIGN_TOP_MID, 0, 58);
+    lv_obj_set_style_bg_color(tuner_mode_card, lv_color_make(14, 20, 32), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(tuner_mode_card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(tuner_mode_card, C_CYAN, LV_PART_MAIN);
+    lv_obj_set_style_border_width(tuner_mode_card, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(tuner_mode_card, 4, LV_PART_MAIN);
+
+    /* Left Neon Vertical Accent Strip */
+    tuner_mode_bar = lv_obj_create(tuner_mode_card);
+    lv_obj_remove_style_all(tuner_mode_bar);
+    lv_obj_set_size(tuner_mode_bar, 3, 38);
+    lv_obj_align(tuner_mode_bar, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_style_bg_color(tuner_mode_bar, C_CYAN, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(tuner_mode_bar, LV_OPA_COVER, LV_PART_MAIN);
+
+    tuner_mode_sub = lv_label_create(tuner_mode_card);
+    lv_obj_set_style_text_font(tuner_mode_sub, f14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(tuner_mode_sub, C_TEXT_3, LV_PART_MAIN);
+    lv_obj_set_width(tuner_mode_sub, 126);
+    lv_obj_set_style_text_align(tuner_mode_sub, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(tuner_mode_sub, LV_ALIGN_TOP_MID, 2, 2);
+    lv_label_set_text(tuner_mode_sub, "TARGET PROFILE");
+
+    tuner_mode_val = lv_label_create(tuner_mode_card);
+    lv_obj_set_style_text_font(tuner_mode_val, f14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(tuner_mode_val, C_AMBER, LV_PART_MAIN);
+    lv_obj_set_width(tuner_mode_val, 126);
+    lv_obj_set_style_text_align(tuner_mode_val, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(tuner_mode_val, LV_ALIGN_BOTTOM_MID, 2, -2);
+    lv_label_set_text(tuner_mode_val, "MAX HASH");
+
+    /* Continuous Tuning Pill (136x24, single line no-wrap) */
+    tuner_cont_pill = lv_obj_create(scr_tuner);
+    lv_obj_remove_style_all(tuner_cont_pill);
+    lv_obj_set_size(tuner_cont_pill, 136, 24);
+    lv_obj_set_style_pad_all(tuner_cont_pill, 0, LV_PART_MAIN);
+    lv_obj_align(tuner_cont_pill, LV_ALIGN_TOP_MID, 0, 102);
+    lv_obj_set_style_bg_color(tuner_cont_pill, lv_color_make(12, 38, 24), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(tuner_cont_pill, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(tuner_cont_pill, C_GREEN, LV_PART_MAIN);
+    lv_obj_set_style_border_width(tuner_cont_pill, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(tuner_cont_pill, 12, LV_PART_MAIN);
+
+    tuner_cont_lbl = lv_label_create(tuner_cont_pill);
+    lv_obj_set_style_text_font(tuner_cont_lbl, f14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(tuner_cont_lbl, C_GREEN, LV_PART_MAIN);
+    lv_label_set_long_mode(tuner_cont_lbl, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(tuner_cont_lbl, 136);
+    lv_obj_set_style_text_align(tuner_cont_lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(tuner_cont_lbl, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(tuner_cont_lbl, "CONTINUOUS: ON");
+
+    /* Dedicated Lower Thermal Extremity Cards (Coolest vs Hottest) */
+    tuner_cool_card = lv_obj_create(scr_tuner);
+    lv_obj_remove_style_all(tuner_cool_card);
+    lv_obj_set_size(tuner_cool_card, 58, 36);
+    lv_obj_set_style_pad_all(tuner_cool_card, 0, LV_PART_MAIN);
+    lv_obj_align(tuner_cool_card, LV_ALIGN_TOP_MID, -33, 132);
+    lv_obj_set_style_bg_color(tuner_cool_card, lv_color_make(14, 20, 32), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(tuner_cool_card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(tuner_cool_card, C_DIVIDER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(tuner_cool_card, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(tuner_cool_card, 4, LV_PART_MAIN);
+
+    tuner_cool_title = lv_label_create(tuner_cool_card);
+    lv_obj_set_style_text_font(tuner_cool_title, f14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(tuner_cool_title, C_TEXT_3, LV_PART_MAIN);
+    lv_obj_set_width(tuner_cool_title, 58);
+    lv_obj_set_style_text_align(tuner_cool_title, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(tuner_cool_title, LV_ALIGN_TOP_MID, 0, 2);
+    lv_label_set_text(tuner_cool_title, "C11");
+
+    tuner_cool_val = lv_label_create(tuner_cool_card);
+    lv_obj_set_style_text_font(tuner_cool_val, f14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(tuner_cool_val, C_GREEN, LV_PART_MAIN);
+    lv_obj_set_width(tuner_cool_val, 58);
+    lv_obj_set_style_text_align(tuner_cool_val, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(tuner_cool_val, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_label_set_text(tuner_cool_val, "59.0C");
+
+    tuner_hot_card = lv_obj_create(scr_tuner);
+    lv_obj_remove_style_all(tuner_hot_card);
+    lv_obj_set_size(tuner_hot_card, 58, 36);
+    lv_obj_set_style_pad_all(tuner_hot_card, 0, LV_PART_MAIN);
+    lv_obj_align(tuner_hot_card, LV_ALIGN_TOP_MID, 33, 132);
+    lv_obj_set_style_bg_color(tuner_hot_card, lv_color_make(14, 20, 32), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(tuner_hot_card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(tuner_hot_card, C_DIVIDER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(tuner_hot_card, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(tuner_hot_card, 4, LV_PART_MAIN);
+
+    tuner_hot_title = lv_label_create(tuner_hot_card);
+    lv_obj_set_style_text_font(tuner_hot_title, f14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(tuner_hot_title, C_TEXT_3, LV_PART_MAIN);
+    lv_obj_set_width(tuner_hot_title, 58);
+    lv_obj_set_style_text_align(tuner_hot_title, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(tuner_hot_title, LV_ALIGN_TOP_MID, 0, 2);
+    lv_label_set_text(tuner_hot_title, "C05");
+
+    tuner_hot_val = lv_label_create(tuner_hot_card);
+    lv_obj_set_style_text_font(tuner_hot_val, f14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(tuner_hot_val, C_MAG, LV_PART_MAIN);
+    lv_obj_set_width(tuner_hot_val, 58);
+    lv_obj_set_style_text_align(tuner_hot_val, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(tuner_hot_val, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_label_set_text(tuner_hot_val, "85.9C");
+
+    /* Bottom Summary Label */
+    tuner_avg_lbl = lv_label_create(scr_tuner);
+    lv_obj_set_style_text_font(tuner_avg_lbl, f14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(tuner_avg_lbl, C_TEXT_1, LV_PART_MAIN);
+    lv_obj_set_width(tuner_avg_lbl, 240);
+    lv_obj_set_style_text_align(tuner_avg_lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_label_set_text(tuner_avg_lbl, "AVG CHIP: -- C");
+    lv_obj_align(tuner_avg_lbl, LV_ALIGN_TOP_MID, 0, 176);
 
     /* ip / network */
     scr_ip = lv_obj_create(NULL);
@@ -641,6 +819,136 @@ static void refresh_diag(void) {
     lv_scr_load(scr_diag);
 }
 
+static void refresh_tuner(void) {
+    /* 1. Target Profile / Workmode */
+    const char *mode = kv_str("autotune_mode");
+    const char *mode_display = "OFF";
+    lv_color_t mode_color = C_TEXT_3;
+
+    if (mode && *mode) {
+        if (strcasecmp(mode, "max_hash") == 0 || strcasecmp(mode, "max hash") == 0 || strcasecmp(mode, "max") == 0) {
+            mode_display = "MAX HASH";
+            mode_color = C_AMBER;
+        } else if (strcasecmp(mode, "balanced") == 0) {
+            mode_display = "BALANCED";
+            mode_color = C_CYAN;
+        } else if (strcasecmp(mode, "efficient") == 0) {
+            mode_display = "EFFICIENT";
+            mode_color = C_GREEN;
+        } else if (strcasecmp(mode, "quiet") == 0) {
+            mode_display = "QUIET";
+            mode_color = C_GREEN;
+        } else if (strcasecmp(mode, "off") == 0) {
+            mode_display = "OFF";
+            mode_color = C_TEXT_3;
+        } else {
+            mode_display = mode;
+            mode_color = C_TEXT_1;
+        }
+    }
+    lv_label_set_text(tuner_mode_val, mode_display);
+    lv_obj_set_style_text_color(tuner_mode_val, mode_color, LV_PART_MAIN);
+
+    /* 2. Continuous Tuning Pill */
+    int cont = kv_bool("autotune_continuous");
+    if (cont) {
+        lv_label_set_text(tuner_cont_lbl, "CONTINUOUS: ON");
+        lv_obj_set_style_text_color(tuner_cont_lbl, C_GREEN, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(tuner_cont_pill, lv_color_make(12, 38, 24), LV_PART_MAIN);
+        lv_obj_set_style_border_color(tuner_cont_pill, C_GREEN, LV_PART_MAIN);
+    } else {
+        lv_label_set_text(tuner_cont_lbl, "CONTINUOUS: OFF");
+        lv_obj_set_style_text_color(tuner_cont_lbl, C_TEXT_3, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(tuner_cont_pill, lv_color_make(18, 22, 28), LV_PART_MAIN);
+        lv_obj_set_style_border_color(tuner_cont_pill, C_DIVIDER, LV_PART_MAIN);
+    }
+
+    /* 3. Perimeter Chip Thermal Arcs (12 arcs spread around full 360 circle with zero gap)
+     * As chips get hotter, their arc expands inward towards the center and changes color. */
+    const char *csv = kv_str("chip_temps");
+    if (csv && *csv) {
+        char copy[128];
+        strncpy(copy, csv, sizeof(copy) - 1);
+        copy[sizeof(copy) - 1] = '\0';
+        char *saveptr = NULL;
+        char *token = strtok_r(copy, ",", &saveptr);
+        int idx = 0;
+        while (token && idx < 12) {
+            double t = atof(token);
+            lv_color_t tc = temp_to_color(t);
+            int w = 4;
+            if (t <= 45.0) {
+                w = 4;
+            } else if (t >= 85.0) {
+                w = 12;
+            } else {
+                w = 4 + (int)((t - 45.0) / (85.0 - 45.0) * 8.0 + 0.5);
+            }
+            lv_obj_set_style_arc_width(chip_arcs[idx], w, LV_PART_MAIN);
+            lv_obj_set_style_arc_width(chip_arcs[idx], w, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_color(chip_arcs[idx], tc, LV_PART_INDICATOR);
+            lv_obj_invalidate(chip_arcs[idx]);
+            token = strtok_r(NULL, ",", &saveptr);
+            idx++;
+        }
+        for (; idx < 12; idx++) {
+            lv_obj_set_style_arc_width(chip_arcs[idx], 4, LV_PART_MAIN);
+            lv_obj_set_style_arc_width(chip_arcs[idx], 4, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_color(chip_arcs[idx], lv_color_make(30, 35, 45), LV_PART_INDICATOR);
+            lv_obj_invalidate(chip_arcs[idx]);
+        }
+    } else {
+        for (int i = 0; i < 12; i++) {
+            lv_obj_set_style_arc_width(chip_arcs[i], 4, LV_PART_MAIN);
+            lv_obj_set_style_arc_width(chip_arcs[i], 4, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_color(chip_arcs[i], lv_color_make(30, 35, 45), LV_PART_INDICATOR);
+            lv_obj_invalidate(chip_arcs[i]);
+        }
+    }
+
+    /* 4. Thermal Extremity Cards (Coolest vs Hottest) & Average */
+    double min_t = 0.0, max_t = 0.0, avg_t = 0.0;
+    int have_min = kv_f64("temp_min", &min_t);
+    int have_max = kv_f64("temp_max", &max_t);
+    int have_avg = kv_f64("temp_avg", &avg_t);
+    const char *min_chip = kv_str("temp_min_chip");
+    const char *max_chip = kv_str("temp_max_chip");
+
+    if (have_min) {
+        char buf_min[32];
+        snprintf(buf_min, sizeof(buf_min), "%.1fC", min_t);
+        lv_label_set_text(tuner_cool_val, buf_min);
+        lv_obj_set_style_text_color(tuner_cool_val, temp_to_color(min_t), LV_PART_MAIN);
+        lv_label_set_text(tuner_cool_title, (min_chip && *min_chip) ? min_chip : "MIN");
+    } else {
+        lv_label_set_text(tuner_cool_val, "--");
+        lv_label_set_text(tuner_cool_title, "MIN");
+    }
+
+    if (have_max) {
+        char buf_max[32];
+        snprintf(buf_max, sizeof(buf_max), "%.1fC", max_t);
+        lv_label_set_text(tuner_hot_val, buf_max);
+        lv_obj_set_style_text_color(tuner_hot_val, temp_to_color(max_t), LV_PART_MAIN);
+        lv_label_set_text(tuner_hot_title, (max_chip && *max_chip) ? max_chip : "MAX");
+    } else {
+        lv_label_set_text(tuner_hot_val, "--");
+        lv_label_set_text(tuner_hot_title, "MAX");
+    }
+
+    if (have_avg) {
+        char buf_avg[32];
+        snprintf(buf_avg, sizeof(buf_avg), "AVG CHIP: %.1fC", avg_t);
+        lv_label_set_text(tuner_avg_lbl, buf_avg);
+        lv_obj_set_style_text_color(tuner_avg_lbl, temp_to_color(avg_t), LV_PART_MAIN);
+    } else {
+        lv_label_set_text(tuner_avg_lbl, "AVG CHIP: -- C");
+        lv_obj_set_style_text_color(tuner_avg_lbl, C_TEXT_2, LV_PART_MAIN);
+    }
+
+    lv_scr_load(scr_tuner);
+}
+
 static void refresh_ip(void) {
     char ip[32];
     if (wlan_ip(ip, sizeof(ip))) {
@@ -768,10 +1076,11 @@ static void refresh_pizza(void) {
 
 /* ── Page-file polling loop (mirrors fb_draw.rs's run_live_nano3s()) ────── */
 
-typedef enum { PG_LIVE, PG_DIAG, PG_IP, PG_PIZZA, PG_DOOM, PG_WIFI_SETUP } page_t;
+typedef enum { PG_LIVE, PG_DIAG, PG_TUNER, PG_IP, PG_PIZZA, PG_DOOM, PG_WIFI_SETUP } page_t;
 
 static page_t parse_page(const char *s) {
     if (strcmp(s, "nano3s-diag") == 0) return PG_DIAG;
+    if (strcmp(s, "nano3s-tuner") == 0) return PG_TUNER;
     if (strcmp(s, "ip") == 0) return PG_IP;
     if (strcmp(s, "pizza") == 0) return PG_PIZZA;
     if (strcmp(s, "wifi-setup") == 0) return PG_WIFI_SETUP;
@@ -837,6 +1146,8 @@ static void run_event_loop(void) {
             } else if (read_kv_file(NANO3S_LIVE_FILE)) {
                 if (pg == PG_DIAG) {
                     refresh_diag();
+                } else if (pg == PG_TUNER) {
+                    refresh_tuner();
                 } else {
                     refresh_live();
                 }

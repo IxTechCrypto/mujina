@@ -61,7 +61,8 @@ fn toggle_page() {
     let current = fs::read_to_string(PAGE_FILE).unwrap_or_else(|_| "nano3s".to_owned());
     let next = match current.trim() {
         "nano3s" => "nano3s-diag",
-        "nano3s-diag" => "ip",
+        "nano3s-diag" => "nano3s-tuner",
+        "nano3s-tuner" => "ip",
         "ip" => "pizza",
         "pizza" => "nano3s",
         _ => "nano3s",

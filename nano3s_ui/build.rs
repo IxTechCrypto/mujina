@@ -15,6 +15,8 @@ fn main() {
     println!("cargo:rerun-if-changed={}", c_driver.join("driver.h").display());
 
     let mut build = cc::Build::new();
+    build.flag("-march=rv64gc");
+    build.flag("-mabi=lp64d");
     add_c_files(&mut build, &lvgl_src);
     build
         .file(c_driver.join("driver.c"))

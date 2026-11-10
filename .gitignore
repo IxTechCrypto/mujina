@@ -1,5 +1,8 @@
 Cargo.lock
-/target/
+target/
+**/target/
+rtos_core/build/
+rtos_core/vendor/
 /.cache/
 /bundle_tmp.bin
 *-bundle.bin

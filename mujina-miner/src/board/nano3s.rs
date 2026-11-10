@@ -2499,6 +2499,34 @@ fn write_live_status(ipc_ok: bool, current_job_id: Option<u32>, shares_found: u3
         Some(id) => format!("{id:016x}"),
         None => "-".to_string(),
     };
+    let (min_t, max_t, min_idx, max_idx, temps_csv) = {
+        let mut min_t = 999.0f64;
+        let mut max_t = -999.0f64;
+        let mut min_idx = 0usize;
+        let mut max_idx = 0usize;
+        let mut parts = Vec::with_capacity(12);
+        let count = (st.chip_count as usize).min(12).min(NANO3S_STATUS_MAX_CHIPS);
+        for i in 0..count {
+            let t = st.chips[i].temp_c as f64;
+            if t > 0.0 {
+                if t < min_t { min_t = t; min_idx = i; }
+                if t > max_t { max_t = t; max_idx = i; }
+            }
+            parts.push(format!("{t:.1}"));
+        }
+        (min_t, max_t, min_idx, max_idx, parts.join(","))
+    };
+
+    let cfg = load_tuning();
+    let mode_str = match cfg.auto_tune_profile {
+        Some(TuneProfile::Quiet) => "Quiet",
+        Some(TuneProfile::Balanced) => "Balanced",
+        Some(TuneProfile::Efficient) => "Efficient",
+        Some(TuneProfile::MaxHash) => "Max Hash",
+        None => "Off",
+    };
+    let cont_val = if cfg.continuous { 1 } else { 0 };
+
     let body = format!(
         "pool_connected={ipc}\n\
          ipc_connected={ipc}\n\
@@ -2511,6 +2539,12 @@ fn write_live_status(ipc_ok: bool, current_job_id: Option<u32>, shares_found: u3
          hashrate_ghs={ghsmm}\n\
          temp_avg={temp_avg:.1}\n\
          temp_max={temp_max:.1}\n\
+         temp_min={temp_min:.1}\n\
+         temp_min_chip={min_idx}\n\
+         temp_max_chip={max_idx}\n\
+         autotune_mode={mode_str}\n\
+         autotune_continuous={cont_val}\n\
+         chip_temps={temps_csv}\n\
          pll0={pll0}\n\
          pll1={pll1}\n\
          pll2={pll2}\n\
@@ -2522,7 +2556,13 @@ fn write_live_status(ipc_ok: bool, current_job_id: Option<u32>, shares_found: u3
         asics_total = st.asics_total,
         ghsmm = st.ghsmm,
         temp_avg = st.temp_avg,
-        temp_max = st.temp_max,
+        temp_max = if max_t > -900.0 { max_t } else { st.temp_max as f64 },
+        temp_min = if min_t < 900.0 { min_t } else { st.temp_avg as f64 },
+        min_idx = format!("C{min_idx:02}"),
+        max_idx = format!("C{max_idx:02}"),
+        mode_str = mode_str,
+        cont_val = cont_val,
+        temps_csv = temps_csv,
         pll0 = st.pll_freq[0],
         pll1 = st.pll_freq[1],
         pll2 = st.pll_freq[2],
