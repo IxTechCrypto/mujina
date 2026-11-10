@@ -1172,10 +1172,7 @@ async fn patch_board_led(
     ),
 )]
 async fn post_reboot() -> StatusCode {
-    tokio::spawn(async {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let _ = std::process::Command::new("reboot").status();
-    });
+    trigger_system_reboot();
     StatusCode::OK
 }
 
@@ -1323,11 +1320,24 @@ fn validate_and_stage_firmware(target: &str, body: &[u8]) -> Result<String, (Sta
     Ok(live_path.to_string())
 }
 
-fn schedule_reboot() {
+fn trigger_system_reboot() {
     tokio::spawn(async {
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let _ = std::process::Command::new("reboot").status();
+        // Signal supervisor watchdog via /sharefs
+        let _ = std::fs::write("/sharefs/reboot_request", b"reboot");
+        // Flush filesystem buffers
+        let _ = std::process::Command::new("/bin/sync").status();
+        let _ = std::process::Command::new("sync").status();
+        // Execute immediate hardware reboot
+        let res = std::process::Command::new("/sbin/reboot").arg("-f").status();
+        if res.is_err() {
+            let _ = std::process::Command::new("reboot").arg("-f").status();
+        }
     });
+}
+
+fn schedule_reboot() {
+    trigger_system_reboot();
 }
 
 /// Parses a `POST /firmware/bundle` body into its (up to 2) sections.

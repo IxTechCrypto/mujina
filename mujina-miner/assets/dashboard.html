@@ -1183,7 +1183,7 @@
     </div>
     <div class="pacts">
       <button class="btn pri wbtn" id="poolSave">Save</button>
-      <button class="btn wbtn" id="poolReboot" data-apply="restart" style="display:none;border-color:var(--mag);color:var(--mag)">Restart now</button>
+      <button class="btn" id="poolReboot" data-apply="restart" style="display:none;border-color:var(--mag);color:var(--mag)">Restart now</button>
     </div>
     <div class="msg" id="poolMsg"></div>
   </div>
@@ -2307,7 +2307,6 @@ async function togglePause() {
   pauseBusy = false;
 }
 async function powerAction(path, btnId, msgId, confirmText, doneText) {
-  if (writeBusy(msgId)) return;
   if (!confirm(confirmText)) return;
   lockWrites();
   const b = $(btnId); b.dataset.dead = '1'; b.disabled = true;
@@ -2425,9 +2424,9 @@ async function savePool() {
   if (user) body.user = user;
   if (pass) body.password = pass;
   if (!Object.keys(body).length) { setMsg('poolMsg', 'nothing to save'); return; }
-  if (writeBusy('poolMsg')) return;
+  const saveBtn = $('poolSave');
+  saveBtn.disabled = true;
   setMsg('poolMsg', 'saving…');
-  lockWrites();
   try {
     const r = await fetch('/api/v0/pool', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     if (!r.ok) { setMsg('poolMsg', r.status === 400 ? 'rejected: URL must start with stratum+tcp:// or stratum+ssl://' : 'save failed (HTTP ' + r.status + ')'); return; }
@@ -2439,9 +2438,13 @@ async function savePool() {
     else if (how === 'reboot') tail = ' — reboot the device to apply (mining stops for a couple of minutes)';
     setMsg('poolMsg', 'saved ✓' + tail, true);
     const canApply = (how === 'reboot' && dev.can_reboot) || (how === 'restart' && dev.can_restart_miner);
+    const pr = $('poolReboot');
+    pr.disabled = false;
+    delete pr.dataset.dead;
     show('poolReboot', canApply);
     loadPool();
   } catch (e) { setMsg('poolMsg', 'failed: ' + e); }
+  finally { saveBtn.disabled = false; }
 }
 async function poolApplyNow() {
   const how = $('poolReboot').dataset.apply;
