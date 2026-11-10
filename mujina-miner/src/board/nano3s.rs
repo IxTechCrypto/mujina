@@ -565,7 +565,7 @@ fn word_bswap32(bytes: &[u8]) -> Vec<u8> {
 /// contract `rtos_core.elf`'s `miner_gen_nonce2_work()` parses.
 const HEADER_MERKLE_OFFSET: i32 = 36;
 /// Nonce2 field width -- the A3197S's single 32-bit nonce2 register.
-const NONCE2_SIZE: i32 = 4;
+const _NONCE2_SIZE: i32 = 4;
 
 // ---------------------------------------------------------------------------
 // Board registration
@@ -630,6 +630,8 @@ struct JobContext {
     coinbase1: Vec<u8>,
     coinbase2: Vec<u8>,
     extranonce1: Vec<u8>,
+    /// Negotiated extranonce2 width (e.g. 3 for PowerPool, 6 for Braiins, 8 for Ocean)
+    en2_size: u8,
     /// Fixed upper 32 bits of the pool's 8-byte extranonce2 space for
     /// this job. The chip only varies the lower 32 bits (its one 32-bit
     /// nonce2 register); this fixed upper half is spliced into the
@@ -655,13 +657,18 @@ struct JobContext {
 /// into `coinbase1` declares, so it is not a well-formed, parseable
 /// transaction, but `sha256d` doesn't care.
 fn compute_merkle_root_for_nonce2(ctx: &JobContext, nonce2: u32) -> bitcoin::TxMerkleNode {
+    let en2_size = ctx.en2_size as usize;
+    let chip_bytes = en2_size.min(4);
+    let high_bytes = en2_size.saturating_sub(4);
     let mut coinbase = Vec::with_capacity(
-        ctx.coinbase1.len() + ctx.extranonce1.len() + NONCE2_SIZE as usize + 4 + ctx.coinbase2.len(),
+        ctx.coinbase1.len() + ctx.extranonce1.len() + en2_size + ctx.coinbase2.len(),
     );
     coinbase.extend_from_slice(&ctx.coinbase1);
     coinbase.extend_from_slice(&ctx.extranonce1);
-    coinbase.extend_from_slice(&nonce2.to_le_bytes());
-    coinbase.extend_from_slice(&ctx.en2_high.to_le_bytes());
+    coinbase.extend_from_slice(&nonce2.to_le_bytes()[..chip_bytes]);
+    if high_bytes > 0 {
+        coinbase.extend_from_slice(&ctx.en2_high.to_le_bytes()[..high_bytes]);
+    }
     coinbase.extend_from_slice(&ctx.coinbase2);
 
     let mut current = sha256d::Hash::hash(&coinbase).to_byte_array();
@@ -749,10 +756,21 @@ fn verify_and_build_share(ctx: &JobContext, nonce2: u32, nonce: u32, mid_id: u8)
         hash,
         version,
         ntime: ctx.ntime,
-        // Full 8-byte value (fixed en2_high | chip-variable nonce2), not
-        // just NONCE2_SIZE=4 bytes -- must match `state.extranonce2_size`
-        // (8) exactly.
-        extranonce2: Extranonce2::new(((ctx.en2_high as u64) << 32) | (nonce2 as u64), 8).ok(),
+        // Dynamic extranonce2 matching pool's negotiated en2_size (e.g. 3, 6, 8 bytes).
+        extranonce2: {
+            let en2_size = ctx.en2_size;
+            let val = if en2_size <= 4 {
+                let mask = if en2_size == 4 {
+                    0xFFFF_FFFFu64
+                } else {
+                    (1u64 << (en2_size * 8)) - 1
+                };
+                (nonce2 as u64) & mask
+            } else {
+                ((ctx.en2_high as u64) << 32) | (nonce2 as u64)
+            };
+            Extranonce2::new(val, en2_size).ok()
+        },
         // Uses this nonce's own achieved difficulty (`diff`, computed
         // above) rather than `ctx.share_target`, since every reported
         // nonce is recorded (not just accepted shares) -- an unbiased
@@ -935,19 +953,11 @@ fn send_task_to_chain(job_id: u32, task: &HashTask, work_restart: bool) -> Resul
     let en2 = task
         .en2
         .ok_or_else(|| anyhow!("nano3s: task has no extranonce2 assigned"))?;
-    // Chip has a single 32-bit nonce2 register, so only the low 32 bits
-    // of the scheduler's (up to 8-byte) en2 allocation are what the chip
-    // actually varies.
+    let en2_size = en2.size();
+    let chip_nonce2_size = (en2_size.min(4)) as i32;
+    let high_en2_bytes = en2_size.saturating_sub(4) as usize;
     let nonce2_start = (en2.value() & 0xFFFF_FFFF) as u32;
-    // Upper 32 bits of the 8-byte en2 allocation, fixed for this job
-    // since only the chip's one register varies. Spliced into the
-    // coinbase right after the chip's 4-byte region, so the coinbase
-    // length (and merkle root) match what the pool's reconstruction
-    // expects, and `verify_and_build_share()` reports the full 8-byte
-    // value at submission time. rtos_core.elf only ever varies bytes
-    // [nonce2_offset, nonce2_offset+4) and copies the rest of the
-    // coinbase (including this fixed segment) verbatim.
-    let en2_high = (en2.value() >> 32) as u32;
+    let en2_high = if high_en2_bytes > 0 { (en2.value() >> 32) as u32 } else { 0 };
 
     let coinbase1 = mrt.coinbase1.clone();
     let extranonce1 = mrt.extranonce1.clone();
@@ -955,14 +965,16 @@ fn send_task_to_chain(job_id: u32, task: &HashTask, work_restart: bool) -> Resul
     let nonce2_offset = (coinbase1.len() + extranonce1.len()) as i32;
 
     // Nonce2 embedded little-endian, matching miner_gen_nonce2_work()'s
-    // convention. rtos_core.elf's miner_gen_nonce2_work() overwrites these
-    // bytes on every task_send_work() call using its own internal nonce2
-    // counter, so this initial value only matters for the first send.
-    let mut coinbase = Vec::with_capacity(coinbase1.len() + extranonce1.len() + NONCE2_SIZE as usize + 4 + coinbase2.len());
+    // convention. rtos_core.elf's miner_gen_nonce2_work() copies
+    // `chip_nonce2_size` bytes on every task_send_work() call using its own
+    // internal nonce2 counter, so this initial value only matters for the first send.
+    let mut coinbase = Vec::with_capacity(coinbase1.len() + extranonce1.len() + en2_size as usize + coinbase2.len());
     coinbase.extend_from_slice(&coinbase1);
     coinbase.extend_from_slice(&extranonce1);
-    coinbase.extend_from_slice(&nonce2_start.to_le_bytes());
-    coinbase.extend_from_slice(&en2_high.to_le_bytes());
+    coinbase.extend_from_slice(&nonce2_start.to_le_bytes()[..chip_nonce2_size as usize]);
+    if high_en2_bytes > 0 {
+        coinbase.extend_from_slice(&en2_high.to_le_bytes()[..high_en2_bytes]);
+    }
     coinbase.extend_from_slice(&coinbase2);
 
     let nmerkles = mrt.merkle_branches.len();
@@ -991,7 +1003,7 @@ fn send_task_to_chain(job_id: u32, task: &HashTask, work_restart: bool) -> Resul
             job_id,
             nonce2_start,
             nonce2_offset,
-            NONCE2_SIZE,
+            chip_nonce2_size,
             coinbase.as_ptr(),
             coinbase.len() as u32,
             HEADER_MERKLE_OFFSET,
@@ -1014,6 +1026,7 @@ fn send_task_to_chain(job_id: u32, task: &HashTask, work_restart: bool) -> Resul
         coinbase1,
         coinbase2,
         extranonce1,
+        en2_size,
         en2_high,
         merkle_branches: mrt.merkle_branches.clone(),
         ntime: task.ntime,
@@ -3816,6 +3829,48 @@ fn run_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_extranonce2_coinbase_and_share_construction() {
+        let (tx, _rx) = mpsc::channel(1);
+        let cases: &[(u8, usize, u32, u32, &[u8])] = &[
+            // (en2_size, expected_coinbase_len, nonce2, en2_high, expected_en2_bytes)
+            (3, 42 + 0 + 3 + 42, 0x123456, 0, &[0x56, 0x34, 0x12]),
+            (4, 42 + 4 + 4 + 42, 0x12345678, 0, &[0x78, 0x56, 0x34, 0x12]),
+            (6, 42 + 0 + 6 + 42, 0x12345678, 0x00000001, &[0x78, 0x56, 0x34, 0x12, 0x01, 0x00]),
+            (8, 42 + 4 + 8 + 42, 0x12345678, 0x9abcdef0, &[0x78, 0x56, 0x34, 0x12, 0xf0, 0xde, 0xbc, 0x9a]),
+        ];
+
+        for &(en2_size, exp_len, nonce2, en2_high, exp_bytes) in cases {
+            let en1 = if en2_size == 3 || en2_size == 6 { vec![] } else { vec![0xaa, 0xbb, 0xcc, 0xdd] };
+            let ctx = JobContext {
+                version_base: bitcoin::block::Version::from_consensus(0x20000000),
+                prev_blockhash: bitcoin::BlockHash::all_zeros(),
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x180222f9),
+                coinbase1: vec![0x11; 42],
+                coinbase2: vec![0x22; 42],
+                extranonce1: en1,
+                en2_size,
+                en2_high,
+                merkle_branches: vec![bitcoin::TxMerkleNode::all_zeros()],
+                ntime: 1700000000,
+                share_target: bitcoin::pow::Target::MAX,
+                share_tx: tx.clone(),
+                vmask_candidates: [0x20000000; 8],
+            };
+
+            // Test merkle root computation runs and does not panic
+            let root = compute_merkle_root_for_nonce2(&ctx, nonce2);
+            assert_ne!(root, bitcoin::TxMerkleNode::all_zeros());
+
+            // Test share building reproduces exact Extranonce2 bytes and width
+            let (share, _passed) = verify_and_build_share(&ctx, nonce2, 0x99999999, 0);
+            let share_en2 = share.extranonce2.expect("share must have extranonce2");
+            assert_eq!(share_en2.size(), en2_size, "extranonce2 size mismatch");
+            assert_eq!(Vec::<u8>::from(share_en2), exp_bytes, "serialized bytes mismatch");
+        }
+    }
+
 
     #[test]
     fn led_effect_parse_and_as_str_roundtrip() {
