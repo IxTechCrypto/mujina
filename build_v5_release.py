@@ -254,12 +254,19 @@ print(f"Wrote {v5_data_img} ({len(full_data)} bytes)")
 print("[4.5] Generating OTA bundle (nano-mujina-v5-bundle.bin)...")
 minerd_bytes = open(dst_minerd, "rb").read()
 bundle_magic = b"MJBUNDL1"
-bundle_hdr = bundle_magic + struct.pack("<I", len(minerd_bytes))
+harness_bytes = b""  # Omitted in this bundle (length = 0)
+bundle_data = (
+    bundle_magic
+    + struct.pack("<I", len(minerd_bytes))
+    + minerd_bytes
+    + struct.pack("<I", len(harness_bytes))
+    + harness_bytes
+)
 bundle_bin = os.path.join(out_v5, "nano-mujina-v5-bundle.bin")
 with open(bundle_bin, "wb") as f:
-    f.write(bundle_hdr + minerd_bytes)
+    f.write(bundle_data)
 bundle_size = os.path.getsize(bundle_bin)
-bundle_sha256 = hashlib.sha256(open(bundle_bin, "rb").read()).hexdigest()
+bundle_sha256 = hashlib.sha256(bundle_data).hexdigest()
 print(f"  Built OTA bundle: {bundle_bin} ({bundle_size} bytes, SHA-256: {bundle_sha256})")
 
 print("[5] Repacking nano-mujina-v5-release.kdimg with updated app_ubi and data...")
