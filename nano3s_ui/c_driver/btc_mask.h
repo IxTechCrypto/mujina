@@ -111,4 +111,13 @@ static inline int is_btc_mask(int x, int y) {
     return (int)((btc_mask_rows[y - BTC_MASK_Y_MIN] >> (x - BTC_MASK_X_MIN)) & 1ULL);
 }
 
+
+static inline int is_btc_border(int x, int y) {
+    if (is_btc_mask(x, y)) return 0;
+    return is_btc_mask(x + 1, y) || is_btc_mask(x - 1, y) ||
+           is_btc_mask(x, y + 1) || is_btc_mask(x - 1, y) ||
+           is_btc_mask(x + 1, y + 1) || is_btc_mask(x - 1, y - 1) ||
+           is_btc_mask(x + 1, y - 1) || is_btc_mask(x - 1, y + 1);
+}
+
 #endif /* BTC_MASK_H */

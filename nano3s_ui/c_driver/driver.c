@@ -1077,11 +1077,19 @@ static void refresh_pizza(void) {
 }
 
 /* ── Procedural Plasma Disk Animation with Black Bitcoin B ──────────────── */
-#define PLASMA_NUM_STREAMERS 9
+#define PLASMA_NUM_STREAMERS 14
 
-#define PLASMA_COLOR_CORE   0xFF4F  /* Incandescent hot yellow-orange */
-#define PLASMA_COLOR_GLOW   0xF483  /* Electric Bitcoin Orange #F7931A */
-#define PLASMA_COLOR_HALO   0xD280  /* Fiery deep amber */
+/* Pure Electric Bitcoin Orange Palette (#F7931A):
+ * Exact #F7931A is (247, 147, 26) -> RGB565: (30, 36, 3) -> 0xF483
+ * Core: Bright intense golden-orange (255, 180, 50) -> RGB565: (31, 45, 6) -> 0xFDA6
+ * Glow: Pure Bitcoin Orange #F7931A (247, 147, 26) -> RGB565: (30, 36, 3) -> 0xF483
+ * Halo: Deep fiery amber (220, 85, 0) -> RGB565: (27, 21, 0) -> 0xDAA0
+ * Border / Rim: Pure Bitcoin Orange #F7931A -> 0xF483
+ */
+#define PLASMA_COLOR_CORE   0xFDA6  /* Intense electric golden-orange */
+#define PLASMA_COLOR_GLOW   0xF483  /* Exact Bitcoin Orange #F7931A */
+#define PLASMA_COLOR_HALO   0xDAA0  /* Deep fiery amber */
+#define PLASMA_COLOR_BORDER 0xF483  /* Pure #F7931A border */
 
 typedef struct {
     float x, y;
@@ -1110,10 +1118,11 @@ static inline uint16_t plasma_blend_add(uint16_t bg, uint16_t fg) {
 
 static inline uint16_t plasma_decay_pixel(uint16_t p) {
     if (!p) return 0;
-    /* Retain ~72% for smooth persistence glow, drop blue faster to keep amber/orange warm */
-    uint32_t r = ((p >> 11) & 0x1F) * 23 >> 5;
-    uint32_t g = ((p >> 5) & 0x3F) * 22 >> 5;
-    uint32_t b = (p & 0x1F) * 16 >> 5;
+    /* Red decays slowest (retention ~81%), green drops faster (~56%), blue drops rapidly (~25%)
+     * This keeps persistence trails warmly electric orange and fiery amber without green shift */
+    uint32_t r = ((p >> 11) & 0x1F) * 26 >> 5;
+    uint32_t g = ((p >> 5) & 0x3F) * 18 >> 5;
+    uint32_t b = (p & 0x1F) * 8 >> 5;
     return (uint16_t)((r << 11) | (g << 5) | b);
 }
 
@@ -1130,6 +1139,7 @@ static inline void plasma_put_pixel_safe(int x, int y, uint16_t col) {
     }
 }
 
+/* Thicker, more substantial lightning arc drawing */
 static void plasma_draw_line(int x0, int y0, int x1, int y1, int is_branch) {
     int dx = abs(x1 - x0);
     int dy = abs(y1 - y0);
@@ -1138,20 +1148,37 @@ static void plasma_draw_line(int x0, int y0, int x1, int y1, int is_branch) {
     int err = dx - dy;
 
     uint16_t c_core = is_branch ? PLASMA_COLOR_GLOW : PLASMA_COLOR_CORE;
-    uint16_t c_glow = is_branch ? PLASMA_COLOR_HALO : PLASMA_COLOR_GLOW;
+    uint16_t c_glow = PLASMA_COLOR_GLOW;
+    uint16_t c_halo = PLASMA_COLOR_HALO;
 
     while (1) {
+        /* Core center + immediate cross (thickness 2-3px) */
         plasma_put_pixel_safe(x0, y0, c_core);
-        /* Glow flank */
-        plasma_put_pixel_safe(x0 + 1, y0, c_glow);
-        plasma_put_pixel_safe(x0 - 1, y0, c_glow);
-        plasma_put_pixel_safe(x0, y0 + 1, c_glow);
-        plasma_put_pixel_safe(x0, y0 - 1, c_glow);
+        plasma_put_pixel_safe(x0 + 1, y0, c_core);
+        plasma_put_pixel_safe(x0 - 1, y0, c_core);
+        plasma_put_pixel_safe(x0, y0 + 1, c_core);
+        plasma_put_pixel_safe(x0, y0 - 1, c_core);
+
+        /* Glowing flank ring (radius 2) */
+        plasma_put_pixel_safe(x0 + 1, y0 + 1, c_glow);
+        plasma_put_pixel_safe(x0 - 1, y0 + 1, c_glow);
+        plasma_put_pixel_safe(x0 + 1, y0 - 1, c_glow);
+        plasma_put_pixel_safe(x0 - 1, y0 - 1, c_glow);
+        plasma_put_pixel_safe(x0 + 2, y0, c_glow);
+        plasma_put_pixel_safe(x0 - 2, y0, c_glow);
+        plasma_put_pixel_safe(x0, y0 + 2, c_glow);
+        plasma_put_pixel_safe(x0 - 2, y0, c_glow);
+
+        /* Outer halo ring (radius 3) */
         if (!is_branch) {
-            plasma_put_pixel_safe(x0 + 1, y0 + 1, PLASMA_COLOR_HALO);
-            plasma_put_pixel_safe(x0 - 1, y0 + 1, PLASMA_COLOR_HALO);
-            plasma_put_pixel_safe(x0 + 1, y0 - 1, PLASMA_COLOR_HALO);
-            plasma_put_pixel_safe(x0 - 1, y0 - 1, PLASMA_COLOR_HALO);
+            plasma_put_pixel_safe(x0 + 2, y0 + 1, c_halo);
+            plasma_put_pixel_safe(x0 - 2, y0 + 1, c_halo);
+            plasma_put_pixel_safe(x0 + 2, y0 - 1, c_halo);
+            plasma_put_pixel_safe(x0 - 2, y0 - 1, c_halo);
+            plasma_put_pixel_safe(x0 + 1, y0 + 2, c_halo);
+            plasma_put_pixel_safe(x0 - 1, y0 + 2, c_halo);
+            plasma_put_pixel_safe(x0 + 1, y0 - 2, c_halo);
+            plasma_put_pixel_safe(x0 - 1, y0 - 2, c_halo);
         }
 
         if (x0 == x1 && y0 == y1) break;
@@ -1196,7 +1223,7 @@ static void plasma_render_arc(plasma_pt_t start, plasma_pt_t end, float roughnes
             pts[i].x = mx + nx * offset;
             pts[i].y = my + ny * offset;
         }
-        disp *= 0.52f;
+        disp *= 0.54f;
     }
 
     for (int i = 0; i < num_pts - 1; i++) {
@@ -1204,19 +1231,20 @@ static void plasma_render_arc(plasma_pt_t start, plasma_pt_t end, float roughnes
                          (int)(pts[i + 1].x + 0.5f), (int)(pts[i + 1].y + 0.5f), is_branch);
     }
 
+    /* Sub-branches */
     if (!is_branch) {
-        int num_branches = ((rand() % 100) < 65) ? 1 : 0;
-        if ((rand() % 100) < 25) num_branches = 2;
+        int num_branches = ((rand() % 100) < 70) ? 1 : 0;
+        if ((rand() % 100) < 35) num_branches = 2;
         for (int b = 0; b < num_branches; b++) {
             int b_idx = 3 + (rand() % (num_pts - 6));
             plasma_pt_t b_start = pts[b_idx];
             float cur_angle = atan2f(b_start.y - 120.0f, b_start.x - 120.0f);
-            float branch_angle = cur_angle + plasma_frand(-0.35f, 0.35f);
+            float branch_angle = cur_angle + plasma_frand(-0.38f, 0.38f);
             plasma_pt_t b_target = {
                 120.0f + 114.0f * cosf(branch_angle),
                 120.0f + 114.0f * sinf(branch_angle)
             };
-            plasma_render_arc(b_start, b_target, roughness * 0.6f, 3, 1);
+            plasma_render_arc(b_start, b_target, roughness * 0.65f, 3, 1);
         }
     }
 }
@@ -1243,24 +1271,25 @@ static void refresh_plasma(int init) {
     if (!plasma_inited || init) {
         memset(plasma_fb, 0, sizeof(plasma_fb));
         for (int i = 0; i < PLASMA_NUM_STREAMERS; i++) {
-            float base_ang = (float)i * (2.0f * 3.14159265f / PLASMA_NUM_STREAMERS) + plasma_frand(-0.1f, 0.1f);
+            float base_ang = (float)i * (2.0f * 3.14159265f / PLASMA_NUM_STREAMERS) + plasma_frand(-0.08f, 0.08f);
             plasma_streamers[i].angle = base_ang;
-            plasma_streamers[i].target_angle = base_ang + plasma_frand(-0.4f, 0.4f);
-            plasma_streamers[i].life = 12 + (rand() % 20);
-            plasma_streamers[i].intensity = plasma_frand(0.8f, 1.0f);
+            plasma_streamers[i].target_angle = base_ang + plasma_frand(-0.35f, 0.35f);
+            plasma_streamers[i].life = 10 + (rand() % 18);
+            plasma_streamers[i].intensity = plasma_frand(0.85f, 1.0f);
         }
         plasma_inited = 1;
     }
 
     plasma_decay_buffer();
 
+    /* Render 14 streamers covering all 360 degrees */
     for (int i = 0; i < PLASMA_NUM_STREAMERS; i++) {
-        plasma_streamers[i].angle += (plasma_streamers[i].target_angle - plasma_streamers[i].angle) * 0.14f + plasma_frand(-0.04f, 0.04f);
+        plasma_streamers[i].angle += (plasma_streamers[i].target_angle - plasma_streamers[i].angle) * 0.15f + plasma_frand(-0.03f, 0.03f);
         plasma_streamers[i].life--;
         if (plasma_streamers[i].life <= 0) {
-            plasma_streamers[i].target_angle += plasma_frand(-0.6f, 0.6f);
-            plasma_streamers[i].life = 10 + (rand() % 22);
-            plasma_streamers[i].intensity = plasma_frand(0.7f, 1.0f);
+            plasma_streamers[i].target_angle += plasma_frand(-0.5f, 0.5f);
+            plasma_streamers[i].life = 8 + (rand() % 18);
+            plasma_streamers[i].intensity = plasma_frand(0.8f, 1.0f);
         }
 
         plasma_pt_t p_start = plasma_find_boundary(plasma_streamers[i].angle);
@@ -1270,26 +1299,42 @@ static void refresh_plasma(int init) {
             120.0f + 114.0f * sinf(rim_angle)
         };
 
-        plasma_render_arc(p_start, p_target, 15.0f * plasma_streamers[i].intensity, 4, 0);
+        plasma_render_arc(p_start, p_target, 17.0f * plasma_streamers[i].intensity, 4, 0);
 
-        plasma_put_pixel_safe((int)p_target.x, (int)p_target.y, PLASMA_COLOR_GLOW);
-        plasma_put_pixel_safe((int)p_target.x + 1, (int)p_target.y, PLASMA_COLOR_HALO);
-        plasma_put_pixel_safe((int)p_target.x - 1, (int)p_target.y, PLASMA_COLOR_HALO);
-        plasma_put_pixel_safe((int)p_target.x, (int)p_target.y + 1, PLASMA_COLOR_HALO);
-        plasma_put_pixel_safe((int)p_target.x, (int)p_target.y - 1, PLASMA_COLOR_HALO);
+        /* Large grounding flare on outer rim */
+        int rx = (int)p_target.x;
+        int ry = (int)p_target.y;
+        plasma_put_pixel_safe(rx, ry, PLASMA_COLOR_CORE);
+        plasma_put_pixel_safe(rx + 1, ry, PLASMA_COLOR_GLOW);
+        plasma_put_pixel_safe(rx - 1, ry, PLASMA_COLOR_GLOW);
+        plasma_put_pixel_safe(rx, ry + 1, PLASMA_COLOR_GLOW);
+        plasma_put_pixel_safe(rx, ry - 1, PLASMA_COLOR_GLOW);
+        plasma_put_pixel_safe(rx + 1, ry + 1, PLASMA_COLOR_HALO);
+        plasma_put_pixel_safe(rx - 1, ry + 1, PLASMA_COLOR_HALO);
+        plasma_put_pixel_safe(rx + 1, ry - 1, PLASMA_COLOR_HALO);
+        plasma_put_pixel_safe(rx - 1, ry - 1, PLASMA_COLOR_HALO);
     }
 
-    /* Outer glass rim glow */
+    /* Outer glass rim glow in #F7931A */
     for (int a = 0; a < 360; a++) {
         float rad = (float)a * 3.14159265f / 180.0f;
         int rx = (int)(120.0f + 114.0f * cosf(rad) + 0.5f);
         int ry = (int)(120.0f + 114.0f * sinf(rad) + 0.5f);
         if (rx >= 0 && rx < HOR_RES && ry >= 0 && ry < VER_RES) {
-            plasma_fb[ry * HOR_RES + rx] = plasma_blend_add(plasma_fb[ry * HOR_RES + rx], 0x6180);
+            plasma_fb[ry * HOR_RES + rx] = plasma_blend_add(plasma_fb[ry * HOR_RES + rx], 0x9300);
         }
     }
 
-    /* Mask out center Bitcoin B and outside perimeter */
+    /* Energized orange corona around the Bitcoin B perimeter so the B is ALWAYS 100% visible */
+    for (int y = 71; y <= 169; y++) {
+        for (int x = 88; x <= 155; x++) {
+            if (is_btc_border(x, y)) {
+                plasma_fb[y * HOR_RES + x] = plasma_blend_add(plasma_fb[y * HOR_RES + x], PLASMA_COLOR_BORDER);
+            }
+        }
+    }
+
+    /* Final mask: The interior of the Bitcoin B is solid jet black, and outside perimeter is black */
     for (int y = 0; y < VER_RES; y++) {
         for (int x = 0; x < HOR_RES; x++) {
             int dx = x - 120;
