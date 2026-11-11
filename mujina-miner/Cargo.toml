@@ -1,6 +1,6 @@
 [package]
 name = "mujina-miner"
-version = "5.0.4"
+version = "5.0.5"
 edition.workspace = true
 description = "Bitcoin mining software"
 license.workspace = true

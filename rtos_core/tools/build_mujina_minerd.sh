@@ -16,6 +16,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # The Cargo workspace root (Cargo.toml, mujina-miner/) is two levels up
 # from this script.
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+echo "[*] Building companion binary: nano3s_ui..."
+cd "$WORKSPACE_ROOT/nano3s_ui"
+cargo build --release --target riscv64gc-unknown-linux-gnu
+riscv64-linux-gnu-strip --strip-all "$WORKSPACE_ROOT/nano3s_ui/target/riscv64gc-unknown-linux-gnu/release/nano3s_ui"
+
+echo "[*] Building companion binary: fb_button..."
+cd "$WORKSPACE_ROOT/fb_hijack"
+cargo build --release --target riscv64gc-unknown-linux-gnu --bin fb_button
+riscv64-linux-gnu-strip --strip-all "$WORKSPACE_ROOT/fb_hijack/target/riscv64gc-unknown-linux-gnu/release/fb_button"
+
 cd "$WORKSPACE_ROOT/mujina-miner"
 cargo build --release --target riscv64gc-unknown-linux-gnu --features nano3s --bin mujina-minerd --bin ble_setup
 # Built binary path (workspace-rooted target dir).

@@ -585,10 +585,77 @@ fn env_enabled() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(all(feature = "nano3s", target_arch = "riscv64"))]
+mod companion_binaries {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use tracing::{error, info, warn};
+
+    const EMBEDDED_NANO3S_UI: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../nano3s_ui/target/riscv64gc-unknown-linux-gnu/release/nano3s_ui"
+    ));
+
+    const EMBEDDED_FB_BUTTON: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../fb_hijack/target/riscv64gc-unknown-linux-gnu/release/fb_button"
+    ));
+
+    pub fn sync_companion_binaries() {
+        sync_one("/data/nano3s_ui", EMBEDDED_NANO3S_UI, "nano3s_ui");
+        sync_one("/mntapp/release/linux/app/fb_button", EMBEDDED_FB_BUTTON, "fb_button");
+    }
+
+    fn sync_one(live_path: &str, embedded: &[u8], proc_name: &str) {
+        if embedded.is_empty() {
+            return;
+        }
+        let needs_update = match fs::read(live_path) {
+            Ok(existing) => existing != embedded,
+            Err(_) => true,
+        };
+
+        if !needs_update {
+            return;
+        }
+
+        info!("Companion binary {} needs update ({} bytes). Staging...", live_path, embedded.len());
+        let staged_path = format!("{}.new", live_path);
+        if let Err(e) = fs::write(&staged_path, embedded) {
+            error!("Failed to write staged {}: {}", staged_path, e);
+            let _ = fs::remove_file(&staged_path);
+            return;
+        }
+
+        if let Err(e) = fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o755)) {
+            warn!("Failed to chmod {}: {}", staged_path, e);
+        }
+
+        if let Err(e) = fs::rename(&staged_path, live_path) {
+            error!("Failed to rename {} to {}: {}", staged_path, live_path, e);
+            let _ = fs::remove_file(&staged_path);
+            return;
+        }
+
+        info!("Successfully installed new companion binary at {}. Restarting process...", live_path);
+        // Kill existing process so supervisor restarts it with the new binary
+        let _ = Command::new("killall").arg("-9").arg(proc_name).status();
+        let _ = Command::new("pkill").arg("-9").arg("-f").arg(proc_name).status();
+    }
+}
+
+#[cfg(not(all(feature = "nano3s", target_arch = "riscv64")))]
+mod companion_binaries {
+    pub fn sync_companion_binaries() {}
+}
+
 async fn create_nano3s_board() -> Result<BackplaneConnector> {
     if !env_enabled() {
         anyhow::bail!("nano3s board not configured (MUJINA_NANO3S_ENABLE not set to 1)");
     }
+
+    companion_binaries::sync_companion_binaries();
 
     let info = BoardInfo {
         model: "Avalon Nano3s (A3197S x12)".into(),
