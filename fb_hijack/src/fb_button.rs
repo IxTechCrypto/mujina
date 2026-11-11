@@ -64,7 +64,8 @@ fn toggle_page() {
         "nano3s-diag" => "nano3s-tuner",
         "nano3s-tuner" => "ip",
         "ip" => "pizza",
-        "pizza" => "nano3s",
+        "pizza" => "plasma",
+        "plasma" => "nano3s",
         _ => "nano3s",
     };
     let _ = fs::write(PAGE_FILE, format!("{next}\n"));

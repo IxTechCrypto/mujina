@@ -13,6 +13,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", c_driver.join("driver.c").display());
     println!("cargo:rerun-if-changed={}", c_driver.join("driver.h").display());
+    println!("cargo:rerun-if-changed={}", c_driver.join("btc_mask.h").display());
 
     let mut build = cc::Build::new();
     build.flag("-march=rv64gc");

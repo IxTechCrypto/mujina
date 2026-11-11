@@ -1,8 +1,10 @@
 #include "driver.h"
 #include "lvgl.h"
+#include "btc_mask.h"
 
 #include <ctype.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1074,15 +1076,258 @@ static void refresh_pizza(void) {
     close(fd);
 }
 
+/* ── Procedural Plasma Disk Animation with Black Bitcoin B ──────────────── */
+#define PLASMA_NUM_STREAMERS 9
+
+#define PLASMA_COLOR_CORE   0xFF4F  /* Incandescent hot yellow-orange */
+#define PLASMA_COLOR_GLOW   0xF483  /* Electric Bitcoin Orange #F7931A */
+#define PLASMA_COLOR_HALO   0xD280  /* Fiery deep amber */
+
+typedef struct {
+    float x, y;
+} plasma_pt_t;
+
+typedef struct {
+    float angle;
+    float target_angle;
+    int life;
+    float intensity;
+} plasma_streamer_t;
+
+static uint16_t plasma_fb[HOR_RES * VER_RES];
+static plasma_streamer_t plasma_streamers[PLASMA_NUM_STREAMERS];
+static int plasma_inited = 0;
+
+static inline uint16_t plasma_blend_add(uint16_t bg, uint16_t fg) {
+    uint32_t r = ((bg >> 11) & 0x1F) + ((fg >> 11) & 0x1F);
+    uint32_t g = ((bg >> 5) & 0x3F) + ((fg >> 5) & 0x3F);
+    uint32_t b = (bg & 0x1F) + (fg & 0x1F);
+    if (r > 31) r = 31;
+    if (g > 63) g = 63;
+    if (b > 31) b = 31;
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+static inline uint16_t plasma_decay_pixel(uint16_t p) {
+    if (!p) return 0;
+    /* Retain ~72% for smooth persistence glow, drop blue faster to keep amber/orange warm */
+    uint32_t r = ((p >> 11) & 0x1F) * 23 >> 5;
+    uint32_t g = ((p >> 5) & 0x3F) * 22 >> 5;
+    uint32_t b = (p & 0x1F) * 16 >> 5;
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+static void plasma_decay_buffer(void) {
+    for (int i = 0; i < HOR_RES * VER_RES; i++) {
+        plasma_fb[i] = plasma_decay_pixel(plasma_fb[i]);
+    }
+}
+
+static inline void plasma_put_pixel_safe(int x, int y, uint16_t col) {
+    if ((unsigned)x < HOR_RES && (unsigned)y < VER_RES) {
+        int idx = y * HOR_RES + x;
+        plasma_fb[idx] = plasma_blend_add(plasma_fb[idx], col);
+    }
+}
+
+static void plasma_draw_line(int x0, int y0, int x1, int y1, int is_branch) {
+    int dx = abs(x1 - x0);
+    int dy = abs(y1 - y0);
+    int sx = (x0 < x1) ? 1 : -1;
+    int sy = (y0 < y1) ? 1 : -1;
+    int err = dx - dy;
+
+    uint16_t c_core = is_branch ? PLASMA_COLOR_GLOW : PLASMA_COLOR_CORE;
+    uint16_t c_glow = is_branch ? PLASMA_COLOR_HALO : PLASMA_COLOR_GLOW;
+
+    while (1) {
+        plasma_put_pixel_safe(x0, y0, c_core);
+        /* Glow flank */
+        plasma_put_pixel_safe(x0 + 1, y0, c_glow);
+        plasma_put_pixel_safe(x0 - 1, y0, c_glow);
+        plasma_put_pixel_safe(x0, y0 + 1, c_glow);
+        plasma_put_pixel_safe(x0, y0 - 1, c_glow);
+        if (!is_branch) {
+            plasma_put_pixel_safe(x0 + 1, y0 + 1, PLASMA_COLOR_HALO);
+            plasma_put_pixel_safe(x0 - 1, y0 + 1, PLASMA_COLOR_HALO);
+            plasma_put_pixel_safe(x0 + 1, y0 - 1, PLASMA_COLOR_HALO);
+            plasma_put_pixel_safe(x0 - 1, y0 - 1, PLASMA_COLOR_HALO);
+        }
+
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) {
+            err -= dy;
+            x0 += sx;
+        }
+        if (e2 < dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+static inline float plasma_frand(float min, float max) {
+    return min + (float)rand() / (float)RAND_MAX * (max - min);
+}
+
+static void plasma_render_arc(plasma_pt_t start, plasma_pt_t end, float roughness, int depth, int is_branch) {
+    int num_pts = (1 << depth) + 1;
+    plasma_pt_t pts[33];
+    pts[0] = start;
+    pts[num_pts - 1] = end;
+
+    float disp = roughness;
+    for (int step = (num_pts - 1) / 2; step > 0; step /= 2) {
+        for (int i = step; i < num_pts; i += step * 2) {
+            plasma_pt_t p1 = pts[i - step];
+            plasma_pt_t p2 = pts[i + step];
+            float mx = (p1.x + p2.x) * 0.5f;
+            float my = (p1.y + p2.y) * 0.5f;
+            float dx = p2.x - p1.x;
+            float dy = p2.y - p1.y;
+            float len = sqrtf(dx * dx + dy * dy);
+            float nx = 0, ny = 1;
+            if (len > 0.001f) {
+                nx = -dy / len;
+                ny = dx / len;
+            }
+            float offset = plasma_frand(-disp, disp);
+            pts[i].x = mx + nx * offset;
+            pts[i].y = my + ny * offset;
+        }
+        disp *= 0.52f;
+    }
+
+    for (int i = 0; i < num_pts - 1; i++) {
+        plasma_draw_line((int)(pts[i].x + 0.5f), (int)(pts[i].y + 0.5f),
+                         (int)(pts[i + 1].x + 0.5f), (int)(pts[i + 1].y + 0.5f), is_branch);
+    }
+
+    if (!is_branch) {
+        int num_branches = ((rand() % 100) < 65) ? 1 : 0;
+        if ((rand() % 100) < 25) num_branches = 2;
+        for (int b = 0; b < num_branches; b++) {
+            int b_idx = 3 + (rand() % (num_pts - 6));
+            plasma_pt_t b_start = pts[b_idx];
+            float cur_angle = atan2f(b_start.y - 120.0f, b_start.x - 120.0f);
+            float branch_angle = cur_angle + plasma_frand(-0.35f, 0.35f);
+            plasma_pt_t b_target = {
+                120.0f + 114.0f * cosf(branch_angle),
+                120.0f + 114.0f * sinf(branch_angle)
+            };
+            plasma_render_arc(b_start, b_target, roughness * 0.6f, 3, 1);
+        }
+    }
+}
+
+static plasma_pt_t plasma_find_boundary(float angle) {
+    float ca = cosf(angle);
+    float sa = sinf(angle);
+    plasma_pt_t best = { 120.0f + 35.0f * ca, 120.0f + 35.0f * sa };
+    for (int r = 16; r < 80; r += 2) {
+        int tx = (int)(120.0f + r * ca);
+        int ty = (int)(120.0f + r * sa);
+        if (tx >= 0 && tx < HOR_RES && ty >= 0 && ty < VER_RES) {
+            if (!is_btc_mask(tx, ty)) {
+                best.x = (float)tx;
+                best.y = (float)ty;
+                break;
+            }
+        }
+    }
+    return best;
+}
+
+static void refresh_plasma(int init) {
+    if (!plasma_inited || init) {
+        memset(plasma_fb, 0, sizeof(plasma_fb));
+        for (int i = 0; i < PLASMA_NUM_STREAMERS; i++) {
+            float base_ang = (float)i * (2.0f * 3.14159265f / PLASMA_NUM_STREAMERS) + plasma_frand(-0.1f, 0.1f);
+            plasma_streamers[i].angle = base_ang;
+            plasma_streamers[i].target_angle = base_ang + plasma_frand(-0.4f, 0.4f);
+            plasma_streamers[i].life = 12 + (rand() % 20);
+            plasma_streamers[i].intensity = plasma_frand(0.8f, 1.0f);
+        }
+        plasma_inited = 1;
+    }
+
+    plasma_decay_buffer();
+
+    for (int i = 0; i < PLASMA_NUM_STREAMERS; i++) {
+        plasma_streamers[i].angle += (plasma_streamers[i].target_angle - plasma_streamers[i].angle) * 0.14f + plasma_frand(-0.04f, 0.04f);
+        plasma_streamers[i].life--;
+        if (plasma_streamers[i].life <= 0) {
+            plasma_streamers[i].target_angle += plasma_frand(-0.6f, 0.6f);
+            plasma_streamers[i].life = 10 + (rand() % 22);
+            plasma_streamers[i].intensity = plasma_frand(0.7f, 1.0f);
+        }
+
+        plasma_pt_t p_start = plasma_find_boundary(plasma_streamers[i].angle);
+        float rim_angle = plasma_streamers[i].angle + plasma_frand(-0.2f, 0.2f);
+        plasma_pt_t p_target = {
+            120.0f + 114.0f * cosf(rim_angle),
+            120.0f + 114.0f * sinf(rim_angle)
+        };
+
+        plasma_render_arc(p_start, p_target, 15.0f * plasma_streamers[i].intensity, 4, 0);
+
+        plasma_put_pixel_safe((int)p_target.x, (int)p_target.y, PLASMA_COLOR_GLOW);
+        plasma_put_pixel_safe((int)p_target.x + 1, (int)p_target.y, PLASMA_COLOR_HALO);
+        plasma_put_pixel_safe((int)p_target.x - 1, (int)p_target.y, PLASMA_COLOR_HALO);
+        plasma_put_pixel_safe((int)p_target.x, (int)p_target.y + 1, PLASMA_COLOR_HALO);
+        plasma_put_pixel_safe((int)p_target.x, (int)p_target.y - 1, PLASMA_COLOR_HALO);
+    }
+
+    /* Outer glass rim glow */
+    for (int a = 0; a < 360; a++) {
+        float rad = (float)a * 3.14159265f / 180.0f;
+        int rx = (int)(120.0f + 114.0f * cosf(rad) + 0.5f);
+        int ry = (int)(120.0f + 114.0f * sinf(rad) + 0.5f);
+        if (rx >= 0 && rx < HOR_RES && ry >= 0 && ry < VER_RES) {
+            plasma_fb[ry * HOR_RES + rx] = plasma_blend_add(plasma_fb[ry * HOR_RES + rx], 0x6180);
+        }
+    }
+
+    /* Mask out center Bitcoin B and outside perimeter */
+    for (int y = 0; y < VER_RES; y++) {
+        for (int x = 0; x < HOR_RES; x++) {
+            int dx = x - 120;
+            int dy = y - 120;
+            if (dx * dx + dy * dy > 115 * 115) {
+                plasma_fb[y * HOR_RES + x] = 0;
+            } else if (is_btc_mask(x, y)) {
+                plasma_fb[y * HOR_RES + x] = 0;
+            }
+        }
+    }
+
+    /* Blit to /dev/fb0 */
+    int fd = open(FB_DEV, O_WRONLY);
+    if (fd >= 0) {
+        lseek(fd, 0, SEEK_SET);
+        size_t written = 0;
+        size_t total = sizeof(plasma_fb);
+        const uint8_t *ptr = (const uint8_t *)plasma_fb;
+        while (written < total) {
+            ssize_t wn = write(fd, ptr + written, total - written);
+            if (wn <= 0) break;
+            written += (size_t)wn;
+        }
+        close(fd);
+    }
+}
+
 /* ── Page-file polling loop (mirrors fb_draw.rs's run_live_nano3s()) ────── */
 
-typedef enum { PG_LIVE, PG_DIAG, PG_TUNER, PG_IP, PG_PIZZA, PG_DOOM, PG_WIFI_SETUP } page_t;
+typedef enum { PG_LIVE, PG_DIAG, PG_TUNER, PG_IP, PG_PIZZA, PG_PLASMA, PG_DOOM, PG_WIFI_SETUP } page_t;
 
 static page_t parse_page(const char *s) {
     if (strcmp(s, "nano3s-diag") == 0) return PG_DIAG;
     if (strcmp(s, "nano3s-tuner") == 0) return PG_TUNER;
     if (strcmp(s, "ip") == 0) return PG_IP;
     if (strcmp(s, "pizza") == 0) return PG_PIZZA;
+    if (strcmp(s, "plasma") == 0) return PG_PLASMA;
     if (strcmp(s, "wifi-setup") == 0) return PG_WIFI_SETUP;
     /* "doom" fully yields /dev/fb0 -- nano3s_doom owns the panel while
      * this page is selected, same idea as the pizza page's raw-image
@@ -1128,6 +1373,13 @@ static void run_event_loop(void) {
              * page changes back. */
             strcpy(last_page, page);
             usleep(POLL_INTERVAL_MS * 1000);
+            continue;
+        }
+
+        if (pg == PG_PLASMA) {
+            refresh_plasma(page_changed);
+            strcpy(last_page, page);
+            usleep(50 * 1000); /* 20 FPS procedural lightning animation */
             continue;
         }
 
