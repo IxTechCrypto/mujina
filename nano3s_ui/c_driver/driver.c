@@ -1326,8 +1326,8 @@ static void refresh_plasma(int init) {
     }
 
     /* Energized orange corona around the Bitcoin B perimeter so the B is ALWAYS 100% visible */
-    for (int y = 71; y <= 169; y++) {
-        for (int x = 88; x <= 155; x++) {
+    for (int y = 65; y <= 175; y++) {
+        for (int x = 75; x <= 165; x++) {
             if (is_btc_border(x, y)) {
                 plasma_fb[y * HOR_RES + x] = plasma_blend_add(plasma_fb[y * HOR_RES + x], PLASMA_COLOR_BORDER);
             }
