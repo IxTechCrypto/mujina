@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <title>MUJINA // FLEET MONITOR</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
@@ -16,6 +16,7 @@
       --purple: #b967ff;
       --bg: #05060c;
       --panel: #0a0f1c;
+      --panel2: #0d1424;
       --line: #14243a;
       --dim: #4a6a86;
       --ink: #d6f7ff;
@@ -133,7 +134,7 @@
     .cfilterbtn {
       background: #080d18; border: 1px solid var(--line); color: var(--dim); font-size: 9px;
       letter-spacing: .1em; padding: 3px 8px; border-radius: 3px; cursor: pointer; text-transform: uppercase;
-      font-family: 'Share Tech Mono', monospace; transition: .15s;
+      font-family: 'Share Tech Mono', monospace; transition: .15s; touch-action: manipulation;
     }
     .cfilterbtn.active { color: var(--cyan); border-color: var(--cyan); background: rgba(0,240,255,.1); }
 
@@ -356,14 +357,53 @@
     .sw input:checked+span { background: rgba(0,240,255,.15); border-color: var(--cyan); box-shadow: 0 0 10px rgba(0,240,255,.3); }
     .sw input:checked+span::before { transform: translateX(22px); background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
     
+    /* Toggle switch row */
+    .toggle-row {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      min-height: 44px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px;
+      background: var(--panel2); cursor: pointer; user-select: none;
+    }
+    .toggle-row .toggle-label-wrap { flex: 1 1 auto; min-width: 0; }
+    .toggle-row .toggle-label {
+      font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink);
+      font-weight: 700; cursor: pointer; display: block;
+    }
+    .toggle-row small { color: var(--dim); display: block; margin-top: 3px; font-size: 11px; line-height: 1.4; }
+    .toggle-row .toggle-ctrl { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+    #ownContinuousState {
+      font-family: 'Orbitron', sans-serif; font-size: 11px; font-weight: 700; letter-spacing: .1em;
+      color: var(--dim); min-width: 28px; text-align: right; transition: color .2s;
+    }
+    #ownContinuousState.on { color: var(--cyan); text-shadow: 0 0 6px var(--cyan); }
+    .switch {
+      position: relative; display: inline-block; width: 48px; height: 26px; flex-shrink: 0;
+      cursor: pointer; touch-action: manipulation;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; position: absolute; margin: 0; pointer-events: none; }
+    .switch .slider {
+      position: absolute; inset: 0; background: var(--panel); border: 1px solid var(--line);
+      border-radius: 26px; transition: .2s ease;
+    }
+    .switch .slider::before {
+      content: ""; position: absolute; height: 18px; width: 18px; left: 3px; top: 3px;
+      background: var(--dim); border-radius: 50%; transition: .2s ease;
+    }
+    .switch input:checked + .slider {
+      background: rgba(0, 240, 255, .15); border-color: var(--cyan); box-shadow: 0 0 10px rgba(0, 240, 255, .3);
+    }
+    .switch input:checked + .slider::before {
+      transform: translateX(22px); background: var(--cyan); box-shadow: 0 0 8px var(--cyan);
+    }
+    .switch input:focus-visible + .slider { outline: 2px solid var(--cyan); outline-offset: 2px; }
+    .switch input:disabled + .slider { opacity: .4; cursor: not-allowed; }
+
     .acts { display: flex; gap: 10px; margin-top: 22px; }
     .btn {
       flex: 1; cursor: pointer; font-family: 'Orbitron', sans-serif; font-weight: 700; font-size: 12px; letter-spacing: .14em;
       text-transform: uppercase; padding: 11px; border-radius: 4px; border: 1px solid var(--line); background: #0a1120; color: var(--dim); transition: .15s;
+      touch-action: manipulation;
     }
-    .btn:hover { color: var(--ink); border-color: var(--dim); }
     .btn.pri { border-color: var(--cyan); color: var(--cyan); }
-    .btn.pri:hover { background: rgba(0,240,255,.12); box-shadow: 0 0 14px rgba(0,240,255,.35); text-shadow: 0 0 8px var(--cyan); }
     .msg { margin-top: 14px; font-size: 12px; letter-spacing: .08em; min-height: 14px; color: var(--amber); }
     .msg.ok { color: var(--lime); }
 
@@ -469,9 +509,9 @@
       font-family: 'Orbitron', sans-serif; font-weight: 700; font-size: 11px; letter-spacing: .14em;
       text-transform: uppercase; padding: 9px 14px; border-radius: 4px;
       display: inline-flex; align-items: center; justify-content: center; text-align: center;
-      text-decoration: none; box-sizing: border-box;
+      text-decoration: none; box-sizing: border-box; touch-action: manipulation;
     }
-    .menubar .menubtn:hover, .menubar .menubtn.on { border-color: var(--cyan); box-shadow: 0 0 10px rgba(0,240,255,.3); }
+    .menubar .menubtn.on { border-color: var(--cyan); box-shadow: 0 0 10px rgba(0,240,255,.3); }
     .menusheet .sheet { width: min(640px, 96vw); position: relative; }
     .menusheet .sheetclose { position: sticky; top: 0; float: right; z-index: 2; margin: 0 0 8px 8px; }
     .menusheet .sheet .sec:first-of-type { margin-top: 4px; }
@@ -479,6 +519,34 @@
     @media(max-width: 480px) {
       .menubar .menubtn { flex: 1 1 30%; padding: 9px 6px; text-align: center; justify-content: center; }
       .menusheet .sheet { width: 100vw; max-width: 100vw; height: 100vh; max-height: 100vh; border-radius: 0; }
+    }
+
+    /* Mobile touch target size & iOS Safari auto-zoom prevention */
+    @media (pointer: coarse), (max-width: 600px) {
+      select,
+      input[type="text"],
+      input[type="number"],
+      input[type="password"] {
+        min-height: 44px;
+        font-size: 16px;
+      }
+    }
+
+    /* Hover gating to prevent sticky hover states on mobile taps */
+    @media (hover: hover) and (pointer: fine) {
+      .menubar .menubtn:hover { border-color: var(--cyan); box-shadow: 0 0 10px rgba(0,240,255,.3); }
+      .btn:hover { color: var(--ink); border-color: var(--dim); }
+      .btn.pri:hover { background: rgba(0,240,255,.12); box-shadow: 0 0 14px rgba(0,240,255,.35); text-shadow: 0 0 8px var(--cyan); }
+      body.theme-minimal .btn:hover,
+      body.theme-minimal .btab-tune-btn:hover,
+      body.theme-minimal .cfilterbtn:hover {
+        background: rgba(255, 255, 255, 0.6) !important;
+        border-color: rgba(255, 255, 255, 0.8) !important;
+        box-shadow: 0 6px 18px rgba(165, 175, 200, 0.18), inset 0 1px 3px rgba(255, 255, 255, 0.8) !important;
+      }
+      body.theme-minimal .menubar .menubtn:hover { background: rgba(255,255,255,.7) !important; }
+      body.theme-parasite .btn:hover { background: #ffffff !important; color: #000000 !important; }
+      body.theme-parasite .menubar .menubtn:hover { background: #fff !important; color: #000 !important; }
     }
     body.theme-minimal {
       color-scheme: light !important;
@@ -492,6 +560,7 @@
       --purple: #af52de;
       --bg: #eef2fa;
       --panel: rgba(255, 255, 255, 0.35);
+      --panel2: rgba(255, 255, 255, 0.45);
       --line: rgba(255, 255, 255, 0.5);
       --dim: #6b7a90;
       --ink: #2d3e50;
@@ -556,14 +625,26 @@
       background: #ffffff !important;
       color: #2d3e50 !important;
     }
-    body.theme-minimal .btn:hover,
-    body.theme-minimal .btab-tune-btn:hover,
-    body.theme-minimal .cfilterbtn:hover {
-      background: rgba(255, 255, 255, 0.6) !important;
-      border-color: rgba(255, 255, 255, 0.8) !important;
-      box-shadow: 
-        0 6px 18px rgba(165, 175, 200, 0.18), 
-        inset 0 1px 3px rgba(255, 255, 255, 0.8) !important;
+    body.theme-minimal .toggle-row {
+      background: rgba(255, 255, 255, 0.4) !important;
+      border: 1.5px solid rgba(255, 255, 255, 0.6) !important;
+      border-radius: 14px !important;
+    }
+    body.theme-minimal .toggle-row .toggle-label { color: #2d3e50 !important; }
+    body.theme-minimal #ownContinuousState.on { color: #0066cc !important; text-shadow: none !important; }
+    body.theme-minimal .switch .slider {
+      border-radius: 26px !important;
+      background: rgba(0, 0, 0, 0.06) !important;
+      border-color: rgba(0, 0, 0, 0.1) !important;
+    }
+    body.theme-minimal .switch input:checked + .slider {
+      background: rgba(0, 102, 204, 0.2) !important;
+      border-color: #0066cc !important;
+      box-shadow: none !important;
+    }
+    body.theme-minimal .switch input:checked + .slider::before {
+      background: #0066cc !important;
+      box-shadow: none !important;
     }
     body.theme-minimal .btn.pri,
     body.theme-minimal .cfilterbtn.active {
@@ -798,6 +879,7 @@
       --purple: #ffffff;
       --bg: #000000;
       --panel: #000000;
+      --panel2: #000000;
       --line: #ffffff;
       --dim: #aaaaaa;
       --ink: #ffffff;
@@ -831,9 +913,31 @@
       box-shadow: none !important;
       outline: none !important;
     }
-    body.theme-parasite .btn:hover {
+    body.theme-parasite .toggle-row {
+      border: 3px double #ffffff !important;
+      border-radius: 0 !important;
+      background: #000000 !important;
+    }
+    body.theme-parasite .toggle-row .toggle-label { color: #ffffff !important; }
+    body.theme-parasite #ownContinuousState.on { color: #ffffff !important; text-shadow: none !important; }
+    body.theme-parasite .switch .slider {
+      border: 2px solid #ffffff !important;
+      border-radius: 0 !important;
+      background: #000000 !important;
+      box-shadow: none !important;
+    }
+    body.theme-parasite .switch .slider::before {
+      border-radius: 0 !important;
       background: #ffffff !important;
-      color: #000000 !important;
+      box-shadow: none !important;
+    }
+    body.theme-parasite .switch input:checked + .slider {
+      background: #ffffff !important;
+    }
+    body.theme-parasite .switch input:checked + .slider::before {
+      background: #000000 !important;
+      transform: translateX(22px) !important;
+      box-shadow: none !important;
     }
     body.theme-parasite .btab {
       clip-path: none !important;
@@ -942,11 +1046,11 @@
     .sysnotice { border: 1px solid var(--amber); color: var(--amber); padding: 8px 12px; margin: 0 0 14px; font-size: 12px; line-height: 1.4; }
     body.theme-minimal .menubar .menubtn { background: rgba(255,255,255,.45) !important; color: #2d3e50 !important;
       border: 1px solid rgba(255,255,255,.6) !important; border-radius: 10px !important; box-shadow: none !important; }
-    body.theme-minimal .menubar .menubtn:hover, body.theme-minimal .menubar .menubtn.on { background: rgba(255,255,255,.7) !important; }
+    body.theme-minimal .menubar .menubtn.on { background: rgba(255,255,255,.7) !important; }
     body.theme-minimal .modebadge { color: #2d3e50; border-color: rgba(255,255,255,.6); background: rgba(255,255,255,.45); border-radius: 10px; }
     body.theme-parasite .menubar .menubtn { background: #000 !important; color: #fff !important; border: 3px double #fff !important;
       border-radius: 0 !important; box-shadow: none !important; }
-    body.theme-parasite .menubar .menubtn:hover, body.theme-parasite .menubar .menubtn.on { background: #fff !important; color: #000 !important; }
+    body.theme-parasite .menubar .menubtn.on { background: #fff !important; color: #000 !important; }
     body.theme-parasite .modebadge { color: #fff; border: 3px double #fff; border-radius: 0; }
     body.theme-parasite .sysnotice { color: #fff; border: 3px double #fff; }
   </style>
@@ -966,6 +1070,7 @@
   </div>
 
   <div class="menubar" id="menubar">
+    <a class="menubtn on" data-menu="dashboard" href="/dashboard">Dashboard</a>
     <button type="button" class="menubtn" data-menu="power" style="display:none">Power</button>
     <button type="button" class="menubtn" data-menu="tuning" style="display:none">Tuning</button>
     <button type="button" class="menubtn" data-menu="fan" style="display:none">Fan</button>
@@ -974,6 +1079,7 @@
     <a class="menubtn" data-menu="led" href="/led">LED</a>
     <a class="menubtn" data-menu="firmware" href="/firmware" style="display:none">Firmware</a>
     <button type="button" class="menubtn" data-menu="display">Display</button>
+    <a class="menubtn" data-menu="info" href="/info">Info</a>
   </div>
   <div class="sysnotice" id="sysNotice" style="display:none"></div>
 
@@ -1053,13 +1159,21 @@
         <label for="ownTemp">Chip temp target <small style="color:var(--dim)">°C, blank = unchanged</small></label>
         <input type="number" id="ownTemp" min="30" max="95" step="1" placeholder="unchanged">
       </div>
-      <div class="row" style="margin-top:10px;flex-wrap:wrap">
-        <label for="ownContinuous" style="cursor:pointer">Continuous Tuning</label>
-        <input type="checkbox" id="ownContinuous">
-        <small style="color:var(--dim);display:block;margin-top:3px;flex-basis:100%;line-height:1.4">
-          Disabled: warms up &amp; tunes board, optimizes individual chips, then locks in.<br>
-          Enabled: continuously re-tunes as cooling, fan speeds, or ambient temps change.
-        </small>
+      <div class="toggle-row" id="ownContinuousRow" style="margin-top:10px">
+        <div class="toggle-label-wrap">
+          <label for="ownContinuous" class="toggle-label">Continuous Tuning</label>
+          <small>
+            Disabled: warms up &amp; tunes board, optimizes individual chips, then locks in.<br>
+            Enabled: continuously re-tunes as cooling, fan speeds, or ambient temps change.
+          </small>
+        </div>
+        <div class="toggle-ctrl">
+          <span id="ownContinuousState">OFF</span>
+          <label class="switch" for="ownContinuous">
+            <input type="checkbox" id="ownContinuous">
+            <span class="slider"></span>
+          </label>
+        </div>
       </div>
       <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
         <button class="btn pri wbtn" id="ownApply" type="button">Apply</button>
@@ -1630,7 +1744,7 @@ async function loadSystem() {
 }
 
 function applySystem() {
-  const on = { power: false, tuning: false, fan: false, curve: false, pool: false, led: true, firmware: false, display: true };
+  const on = { dashboard: true, power: false, tuning: false, fan: false, curve: false, pool: false, led: true, firmware: false, display: true, info: true };
   if (SYS) {
     const boards = SYS.boards || [], dev = SYS.device || {};
     const any = f => boards.some(b => b.caps && f(b.caps));
@@ -1641,12 +1755,23 @@ function applySystem() {
     on.pool = true;
     on.led = true;
     on.firmware = !!(SYS.firmware && SYS.firmware.update === 'bundle');
+    on.display = true;
   }
-  document.querySelectorAll('.menubtn').forEach(b => show(b, !!on[b.dataset.menu]));
-  document.querySelectorAll('.menusheet.show').forEach(m => {
-    const k = m.id.replace('menu-', '');
-    if (!on[k]) closeMenus();
+  document.querySelectorAll('.menubtn').forEach(b => {
+    if (b.dataset.menu) {
+      if (b.dataset.menu === 'dashboard' || b.dataset.menu === 'info') {
+        show(b, true);
+      } else if (b.dataset.menu in on) {
+        show(b, !!on[b.dataset.menu]);
+      }
+    }
   });
+  if (SYS) {
+    document.querySelectorAll('.menusheet.show').forEach(m => {
+      const k = m.id.replace('menu-', '');
+      if (k in on && !on[k]) closeMenus();
+    });
+  }
   show('sysNotice', !SYS);
   if (!SYS) $('sysNotice').textContent = 'Device capability info (/api/v0/system) is unavailable. Showing read-only status; controls are hidden until it responds.';
   const badge = $('modeBadge');
@@ -1699,9 +1824,9 @@ function applyBoardCaps() {
   const contChk = $('ownContinuous');
   if (!tuner) {
     if (pcElem) pcElem.textContent = '';
-    if (contChk) { contChk.checked = false; contChk.disabled = true; }
+    if (contChk) { contChk.checked = false; contChk.disabled = true; syncContinuousUI(); }
   } else {
-    if (contChk) contChk.disabled = false;
+    if (contChk) { contChk.disabled = false; syncContinuousUI(); }
   }
   show('manualSection', manual);
   show('tuningNone', !!SYS && !tuner && !manual);
@@ -2511,6 +2636,7 @@ function renderOwnerTune(o) {
   if (!OWN_SYNCED) {
     $('ownProfile').value = o.enabled ? (o.profile || 'off') : 'off';
     $('ownContinuous').checked = !!o.continuous;
+    syncContinuousUI();
     OWN_SYNCED = true;
   }
   const best = $('atbest'), list = $('atlist'), st = $('at-phase-label'), pcElem = $('at-per-chip');
@@ -2613,6 +2739,7 @@ async function applyOwner() {
         await pollOwnerTune();
         if (!USER_EDITING_CONTINUOUS && LAST_OWNER_STATUS) {
           $('ownContinuous').checked = !!LAST_OWNER_STATUS.continuous;
+          syncContinuousUI();
         }
       }, 2500);
     } catch (e) { setMsg('ownMsg', 'Failed: ' + e.message); }
@@ -2645,17 +2772,32 @@ async function applyOwner() {
 }
 
 // ---- Menus ----
+function syncContinuousUI() {
+  const el = $('ownContinuous'), st = $('ownContinuousState');
+  if (!el || !st) return;
+  const on = !!el.checked;
+  st.textContent = on ? 'ON' : 'OFF';
+  st.classList.toggle('on', on);
+}
 function closeMenus() {
   document.querySelectorAll('.menusheet.show').forEach(m => m.classList.remove('show'));
   document.querySelectorAll('.menubtn.on').forEach(b => b.classList.remove('on'));
+  const dashBtn = document.querySelector('.menubtn[data-menu="dashboard"]');
+  if (dashBtn) dashBtn.classList.add('on');
   if (location.hash) {
     try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
   }
 }
 function openMenu(key) {
+  if (key === 'dashboard') {
+    closeMenus();
+    return;
+  }
   const m = document.getElementById('menu-' + key);
   if (!m) return;
   closeMenus();
+  const dashBtn = document.querySelector('.menubtn[data-menu="dashboard"]');
+  if (dashBtn) dashBtn.classList.remove('on');
   m.classList.add('show');
   const b = document.querySelector('.menubtn[data-menu="' + key + '"]');
   if (b) b.classList.add('on');
@@ -2671,14 +2813,24 @@ function openMenu(key) {
   }
 }
 function openFromHash() {
-  if (location.hash === '#pool') {
-    openMenu('pool');
+  const h = location.hash.replace(/^#/, '');
+  if (['power', 'tuning', 'fan', 'curve', 'pool', 'display'].includes(h)) {
+    openMenu(h);
     try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
   }
 }
 
 // ---- wiring ----
-document.querySelectorAll('.menubtn').forEach(b => b.addEventListener('click', () => openMenu(b.dataset.menu)));
+document.querySelectorAll('.menubtn').forEach(b => b.addEventListener('click', (e) => {
+  if (b.dataset.menu === 'dashboard') {
+    e.preventDefault();
+    closeMenus();
+    return;
+  }
+  if (b.dataset.menu && document.getElementById('menu-' + b.dataset.menu)) {
+    openMenu(b.dataset.menu);
+  }
+}));
 document.querySelectorAll('.menusheet').forEach(m => m.addEventListener('click', e => {
   if (e.target === m || (e.target.dataset && e.target.dataset.close)) closeMenus();
 }));
@@ -2698,7 +2850,22 @@ $('psuApplyBtn').addEventListener('click', applyPsuProfile);
 $('poolSave').addEventListener('click', savePool);
 $('poolReboot').addEventListener('click', poolApplyNow);
 $('ownApply').addEventListener('click', applyOwner);
-$('ownContinuous').addEventListener('change', () => { USER_EDITING_CONTINUOUS = true; });
+$('ownContinuous').addEventListener('change', () => {
+  USER_EDITING_CONTINUOUS = true;
+  syncContinuousUI();
+});
+const contRow = $('ownContinuousRow');
+if (contRow) {
+  contRow.addEventListener('click', (e) => {
+    if (e.target.closest('label') || e.target.closest('input')) return;
+    const chk = $('ownContinuous');
+    if (chk && !chk.disabled) {
+      chk.checked = !chk.checked;
+      USER_EDITING_CONTINUOUS = true;
+      syncContinuousUI();
+    }
+  });
+}
 $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(b => {
   b.addEventListener('click', () => {
     $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(x => x.classList.remove('active'));
@@ -2719,7 +2886,8 @@ themeSel.addEventListener('change', () => {
 
 loadPool();
 applySystem();
-if (location.hash) { try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {} }
+openFromHash();
+syncContinuousUI();
 tick(); setInterval(tick, 2000);
 setInterval(pollOwnerTune, 5000);
 </script>

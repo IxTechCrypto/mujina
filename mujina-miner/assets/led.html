@@ -385,6 +385,7 @@
     outline: none;
     margin: 12px 0;
     cursor: pointer;
+    touch-action: pan-y;
   }
   input[type=range]::-webkit-slider-thumb {
     -webkit-appearance: none;
@@ -468,20 +469,169 @@
     .panel-card {
       padding: 14px 10px;
     }
+    #effectSelect {
+      min-height: 44px;
+      font-size: 16px;
+    }
+  }
+  @media (pointer: coarse), (max-width: 600px) {
+    input[type=range] {
+      touch-action: pan-y;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      width: 24px;
+      height: 24px;
+    }
+    input[type=range]::-moz-range-thumb {
+      width: 24px;
+      height: 24px;
+    }
+    #effectSelect {
+      min-height: 44px;
+      font-size: 16px;
+    }
   }
   @media (max-width: 480px) {
     .menubar .menubtn {
       flex: 1 1 30%;
       padding: 9px 6px;
-      min-height: 40px;
+      min-height: 44px;
       text-align: center;
       justify-content: center;
     }
+  }
+
+  /* Theme overrides matching dashboard.html */
+  body.theme-minimal {
+    color-scheme: light !important;
+    --bg: #eef2fa;
+    --panel: rgba(255, 255, 255, .78);
+    --panel2: rgba(255, 255, 255, .55);
+    --line: rgba(0, 0, 0, .12);
+    --cyan: #0066cc;
+    --ink: #1d2b3a;
+    --dim: #5b6b7f;
+    background: var(--bg) !important;
+    color: var(--ink) !important;
+  }
+  body.theme-minimal h1 { color: var(--ink) !important; text-shadow: none !important; }
+  body.theme-minimal h1 .chev { color: var(--cyan) !important; text-shadow: none !important; }
+  body.theme-minimal .menubar .menubtn {
+    background: rgba(255, 255, 255, .45) !important;
+    color: #2d3e50 !important;
+    border: 1px solid rgba(255, 255, 255, .6) !important;
+    border-radius: 10px !important;
+    box-shadow: none !important;
+  }
+  body.theme-minimal .menubar .menubtn:hover,
+  body.theme-minimal .menubar .menubtn.on {
+    background: rgba(255, 255, 255, .7) !important;
+    border-color: var(--cyan) !important;
+  }
+  body.theme-minimal .panel-card,
+  body.theme-minimal .strip-container {
+    border-radius: 12px;
+    background: var(--panel) !important;
+    border-color: var(--line) !important;
+  }
+  body.theme-minimal .eff-btn {
+    border-radius: 8px;
+    background: rgba(255, 255, 255, .55);
+    border-color: rgba(0, 0, 0, .12);
+    color: var(--dim);
+  }
+  body.theme-minimal .eff-btn.active {
+    background: rgba(0, 102, 204, .12);
+    border-color: var(--cyan);
+    color: var(--cyan);
+    box-shadow: 0 0 10px rgba(0, 102, 204, .2);
+  }
+  body.theme-minimal #effectSelect {
+    border-radius: 8px;
+    background: rgba(255, 255, 255, .6);
+    border-color: rgba(0, 0, 0, .15);
+    color: var(--ink);
+  }
+  body.theme-minimal #testShareBtn {
+    border-radius: 8px;
+    background: rgba(255, 255, 255, .6);
+    border-color: var(--cyan);
+    color: var(--cyan);
+  }
+  body.theme-minimal input[type=range] {
+    background: rgba(0, 0, 0, .15);
+  }
+
+  body.theme-parasite {
+    --bg: #000;
+    --panel: #000;
+    --panel2: #000;
+    --line: #fff;
+    --cyan: #fff;
+    --ink: #fff;
+    --dim: #bbb;
+    background: var(--bg) !important;
+    color: var(--ink) !important;
+  }
+  body.theme-parasite * {
+    font-family: "Courier New", Courier, monospace !important;
+    text-shadow: none !important;
+    box-shadow: none !important;
+  }
+  body.theme-parasite .menubar .menubtn {
+    background: #000 !important;
+    color: #fff !important;
+    border: 3px double #fff !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+  }
+  body.theme-parasite .menubar .menubtn:hover,
+  body.theme-parasite .menubar .menubtn.on {
+    background: #fff !important;
+    color: #000 !important;
+  }
+  body.theme-parasite .panel-card,
+  body.theme-parasite .strip-container {
+    border: 4px double #fff !important;
+    border-radius: 0 !important;
+    background: #000 !important;
+  }
+  body.theme-parasite .eff-btn,
+  body.theme-parasite #effectSelect,
+  body.theme-parasite #testShareBtn {
+    border: 3px double #fff !important;
+    border-radius: 0 !important;
+    background: #000 !important;
+    color: #fff !important;
+  }
+  body.theme-parasite .eff-btn:hover,
+  body.theme-parasite #testShareBtn:hover {
+    background: #fff !important;
+    color: #000 !important;
+  }
+  body.theme-parasite .eff-btn.active {
+    background: #fff !important;
+    color: #000 !important;
+    border-color: #fff !important;
+  }
+  body.theme-parasite input[type=range] {
+    background: #333;
+  }
+  body.theme-parasite input[type=range]::-webkit-slider-thumb {
+    background: #fff;
+    border-color: #000;
+    box-shadow: none;
+  }
+  body.theme-parasite input[type=range]::-moz-range-thumb {
+    background: #fff;
+    border-color: #000;
+    box-shadow: none;
   }
 </style>
 <script src="/auth.js"></script>
 </head>
 <body>
+<script>(function(){var t='cyberpunk';try{t=localStorage.getItem('mujina-theme')||t;}catch(e){}if(t==='apple')t='minimal';if(['cyberpunk','minimal','parasite'].indexOf(t)<0)t='cyberpunk';document.body.className='theme-'+t;})();</script>
 <div class="wrap">
   <div class="top">
     <h1><span class="chev">//</span>MUJINA <span style="color:var(--dim);font-weight:400">/ LED</span></h1>
@@ -489,11 +639,15 @@
   </div>
   <nav class="menubar" aria-label="Main Menu">
     <a class="menubtn" href="/dashboard">Dashboard</a>
-    <a class="menubtn" href="/info">Info</a>
+    <a class="menubtn" href="/dashboard#power">Power</a>
+    <a class="menubtn" href="/dashboard#tuning">Tuning</a>
+    <a class="menubtn" href="/dashboard#fan">Fan</a>
+    <a class="menubtn" href="/dashboard#curve">Fan Curve</a>
+    <a class="menubtn" href="/dashboard#pool">Pool</a>
     <a class="menubtn on" href="/led">LED</a>
-    <a class="menubtn" href="/pool">Pool</a>
-    <a class="menubtn" href="/tuning">Tuning</a>
     <a class="menubtn" href="/firmware">Firmware</a>
+    <a class="menubtn" href="/dashboard#display">Display</a>
+    <a class="menubtn" href="/info">Info</a>
   </nav>
 
   <div id="body">

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>MUJINA // FIRMWARE</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
@@ -31,10 +31,10 @@
     font-variant-numeric: tabular-nums;
     -webkit-font-smoothing: antialiased;
   }
-  .wrap { max-width: 720px; margin: 0 auto; padding: 24px 20px 60px; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 24px 18px 60px; }
   .top {
     display: flex; align-items: baseline; justify-content: space-between;
-    border-bottom: 1px solid var(--line); padding-bottom: 14px; margin-bottom: 20px;
+    border-bottom: 1px solid var(--line); padding-bottom: 14px; margin-bottom: 14px;
     flex-wrap: wrap; gap: 10px;
   }
   h1 {
@@ -42,12 +42,41 @@
     font-size: 22px; letter-spacing: .16em; text-transform: uppercase;
   }
   h1 .chev { color: var(--cyan); text-shadow: 0 0 8px rgba(0,240,255,.5); }
-  .nav a {
-    color: var(--dim); text-decoration: none; font-size: 12px;
-    letter-spacing: .1em; text-transform: uppercase; margin-left: 18px;
-    border-bottom: 1px solid transparent; padding-bottom: 3px;
+  .menubar {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 0 0 20px;
   }
-  .nav a:hover, .nav a.active { color: var(--cyan); border-color: var(--cyan); }
+  .menubar .menubtn {
+    background: #0a1120;
+    border: 1px solid var(--line);
+    color: var(--cyan);
+    cursor: pointer;
+    font-family: 'Orbitron', sans-serif;
+    font-weight: 700;
+    font-size: 11px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    padding: 9px 14px;
+    border-radius: 4px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    text-decoration: none;
+    box-sizing: border-box;
+    touch-action: manipulation;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    transition: border-color .12s, box-shadow .12s, background .12s;
+  }
+  .menubar .menubtn.on {
+    border-color: var(--cyan);
+    box-shadow: 0 0 10px rgba(0,240,255,.3);
+    background: rgba(0,240,255,.08);
+  }
   .status-strip {
     display: flex; gap: 8px; align-items: center; font-size: 12px;
     color: var(--dim); letter-spacing: .05em;
@@ -78,6 +107,8 @@
   input[type=file] {
     flex: 1; min-width: 220px; background: var(--panel2); color: var(--ink);
     border: 1px solid var(--line); border-radius: 4px; padding: 9px 10px; font: inherit; font-size: 12px;
+    min-height: 44px;
+    box-sizing: border-box;
   }
 
   .btn {
@@ -85,11 +116,25 @@
     padding: 11px 18px; font-family: 'Orbitron', sans-serif; font-weight: 700;
     font-size: 11px; letter-spacing: .1em; text-transform: uppercase; cursor: pointer;
     border-radius: 4px; transition: all .12s;
+    touch-action: manipulation;
+    min-height: 44px;
+    display: inline-flex; align-items: center; justify-content: center;
+    box-sizing: border-box;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
   }
-  .btn:hover:not(:disabled) { border-color: var(--cyan); color: var(--cyan); }
   .btn.danger { border-color: var(--red); color: var(--red); }
-  .btn.danger:hover:not(:disabled) { background: rgba(255,56,96,.1); box-shadow: 0 0 12px rgba(255,56,96,.25); }
   .btn:disabled { opacity: .4; cursor: default; }
+
+  @media (hover: hover) and (pointer: fine) {
+    .menubar .menubtn:hover {
+      border-color: var(--cyan);
+      box-shadow: 0 0 10px rgba(0,240,255,.3);
+    }
+    .btn:hover:not(:disabled) { border-color: var(--cyan); color: var(--cyan); }
+    .btn.danger:hover:not(:disabled) { background: rgba(255,56,96,.1); box-shadow: 0 0 12px rgba(255,56,96,.25); }
+  }
 
   .progress-track { height: 6px; background: var(--panel2); border: 1px solid var(--line); border-radius: 3px;
     overflow: hidden; margin-top: 12px; display: none; }
@@ -99,25 +144,157 @@
   .msg.ok { color: var(--green); }
   .msg.err { color: var(--red); }
   .msg.pending { color: var(--amber); }
+
+  @media (max-width: 480px) {
+    .menubar .menubtn {
+      flex: 1 1 30%;
+      padding: 9px 6px;
+      min-height: 44px;
+      text-align: center;
+      justify-content: center;
+    }
+  }
+
+  /* Theme overrides matching dashboard.html */
+  body.theme-minimal {
+    color-scheme: light !important;
+    --bg: #eef2fa;
+    --panel: rgba(255, 255, 255, .78);
+    --panel2: rgba(255, 255, 255, .55);
+    --line: rgba(0, 0, 0, .12);
+    --cyan: #0066cc;
+    --ink: #1d2b3a;
+    --dim: #5b6b7f;
+    background: var(--bg) !important;
+    color: var(--ink) !important;
+  }
+  body.theme-minimal h1 { color: var(--ink) !important; text-shadow: none !important; }
+  body.theme-minimal h1 .chev { color: var(--cyan) !important; text-shadow: none !important; }
+  body.theme-minimal .menubar .menubtn {
+    background: rgba(255, 255, 255, .45) !important;
+    color: #2d3e50 !important;
+    border: 1px solid rgba(255, 255, 255, .6) !important;
+    border-radius: 10px !important;
+    box-shadow: none !important;
+  }
+  body.theme-minimal .menubar .menubtn:hover,
+  body.theme-minimal .menubar .menubtn.on {
+    background: rgba(255, 255, 255, .7) !important;
+    border-color: var(--cyan) !important;
+  }
+  body.theme-minimal .card {
+    border-radius: 12px;
+    background: var(--panel);
+    border-color: var(--line);
+  }
+  body.theme-minimal .warn-banner {
+    background: rgba(255, 149, 0, .12);
+    border-color: rgba(255, 149, 0, .4);
+    color: var(--ink);
+    border-radius: 10px;
+  }
+  body.theme-minimal .warn-banner b { color: #b45309; }
+  body.theme-minimal .btn {
+    border-radius: 8px;
+    background: rgba(255, 255, 255, .6);
+    border-color: rgba(0, 0, 0, .15);
+    color: var(--ink);
+  }
+  body.theme-minimal .btn.danger {
+    border-color: #ff3b30;
+    color: #ff3b30;
+    background: rgba(255, 59, 48, .08);
+  }
+  body.theme-minimal input[type=file] {
+    border-radius: 8px;
+    background: rgba(255, 255, 255, .6);
+    border-color: rgba(0, 0, 0, .15);
+    color: var(--ink);
+  }
+
+  body.theme-parasite {
+    --bg: #000;
+    --panel: #000;
+    --panel2: #000;
+    --line: #fff;
+    --cyan: #fff;
+    --ink: #fff;
+    --dim: #bbb;
+    background: var(--bg) !important;
+    color: var(--ink) !important;
+  }
+  body.theme-parasite * {
+    font-family: "Courier New", Courier, monospace !important;
+    text-shadow: none !important;
+    box-shadow: none !important;
+  }
+  body.theme-parasite .menubar .menubtn {
+    background: #000 !important;
+    color: #fff !important;
+    border: 3px double #fff !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+  }
+  body.theme-parasite .menubar .menubtn:hover,
+  body.theme-parasite .menubar .menubtn.on {
+    background: #fff !important;
+    color: #000 !important;
+  }
+  body.theme-parasite .card {
+    border: 4px double #fff !important;
+    border-radius: 0 !important;
+    background: #000 !important;
+  }
+  body.theme-parasite .warn-banner {
+    border: 3px double #fff !important;
+    border-radius: 0 !important;
+    background: #000 !important;
+    color: #fff !important;
+  }
+  body.theme-parasite .warn-banner b { color: #fff; text-decoration: underline; }
+  body.theme-parasite .btn,
+  body.theme-parasite input[type=file] {
+    border: 3px double #fff !important;
+    border-radius: 0 !important;
+    background: #000 !important;
+    color: #fff !important;
+  }
+  body.theme-parasite .btn:hover:not(:disabled) {
+    background: #fff !important;
+    color: #000 !important;
+  }
+  body.theme-parasite .progress-track {
+    border: 2px solid #fff;
+    border-radius: 0;
+    background: #000;
+  }
+  body.theme-parasite .progress-fill {
+    background: #fff;
+    box-shadow: none;
+  }
 </style>
 <script src="/auth.js"></script>
 </head>
 <body>
+<script>(function(){var t='cyberpunk';try{t=localStorage.getItem('mujina-theme')||t;}catch(e){}if(t==='apple')t='minimal';if(['cyberpunk','minimal','parasite'].indexOf(t)<0)t='cyberpunk';document.body.className='theme-'+t;})();</script>
 <div class="wrap">
   <div class="top">
     <h1><span class="chev">//</span>MUJINA <span style="color:var(--dim);font-weight:400">/ FIRMWARE</span></h1>
-    <div style="display:flex;align-items:center;gap:18px">
-      <div class="status-strip"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></div>
-      <nav class="nav">
-        <a href="/dashboard">Dashboard</a>
-        <a href="/info">Info</a>
-        <a href="/led">LED</a>
-        <a href="/pool">Pool</a>
-        <a href="/tuning">Tuning</a>
-        <a href="/firmware" class="active">Firmware</a>
-      </nav>
-    </div>
+    <div class="status-strip"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></div>
   </div>
+
+  <nav class="menubar" aria-label="Main Menu">
+    <a class="menubtn" href="/dashboard">Dashboard</a>
+    <a class="menubtn" href="/dashboard#power">Power</a>
+    <a class="menubtn" href="/dashboard#tuning">Tuning</a>
+    <a class="menubtn" href="/dashboard#fan">Fan</a>
+    <a class="menubtn" href="/dashboard#curve">Fan Curve</a>
+    <a class="menubtn" href="/dashboard#pool">Pool</a>
+    <a class="menubtn" href="/led">LED</a>
+    <a class="menubtn on" href="/firmware">Firmware</a>
+    <a class="menubtn" href="/dashboard#display">Display</a>
+    <a class="menubtn" href="/info">Info</a>
+  </nav>
 
   <div class="warn-banner">
     <b>One-step, no confirmation.</b> Uploading a bundle here swaps in whatever it contains and reboots the device immediately — there's no separate "apply" click. The upload is checked for a valid ELF header (and, for mujina-minerd, the <code>nano3s</code> feature symbols) before anything is written, but a working build that's simply wrong for this hardware can still be uploaded. Mining stops for a couple of minutes while it reboots.
@@ -182,6 +359,32 @@ async function looksLikeBundle(file) {
   const head = new Uint8Array(await file.slice(0, 8).arrayBuffer());
   return new TextDecoder().decode(head) === BUNDLE_MAGIC;
 }
+
+$('bundleFile').addEventListener('change', async () => {
+  const file = $('bundleFile').files[0];
+  const msg = $('msgBundle');
+  const track = $('progressBundle');
+  track.style.display = 'none';
+  if (!file) {
+    msg.textContent = '';
+    msg.className = 'msg';
+    return;
+  }
+  const sizeStr = file.size.toLocaleString() + ' bytes';
+  try {
+    const valid = await looksLikeBundle(file);
+    if (valid) {
+      msg.textContent = `${file.name} (${sizeStr}) — MJBUNDL1 header valid ✓`;
+      msg.className = 'msg ok';
+    } else {
+      msg.textContent = `"${file.name}" (${sizeStr}) doesn't start with the MJBUNDL1 bundle header -- build one with pack_firmware_bundle.py`;
+      msg.className = 'msg err';
+    }
+  } catch (e) {
+    msg.textContent = `Could not read "${file.name}": ${e.message || e}`;
+    msg.className = 'msg err';
+  }
+});
 
 async function uploadBundle() {
   const btn = $('uploadBundle'), msg = $('msgBundle'), track = $('progressBundle'), fill = $('progressBundleFill');
