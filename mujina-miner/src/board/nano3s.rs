@@ -1984,8 +1984,8 @@ enum LedEffect {
     /// WLED "Theater Chase": every 3rd LED lit in `color`, the pattern
     /// shifting by one LED per step.
     Chase,
-    /// Chase, but each lit group's hue advances over time instead of
-    /// using a fixed `color`.
+    /// Rainbow comet chase: bright head with a decaying multi-color tail
+    /// sweeping back and forth across the full rainbow spectrum.
     ChaseRainbow,
     /// Single lit LED (with a soft decaying tail) bouncing end to end
     /// ("Larson scanner"/Cylon eye), in `color`.
@@ -2335,6 +2335,32 @@ impl AnimState {
         }
     }
 
+    /// Advances `scanner_pos` by one ~200ms tick and bounces `scanner_dir`
+    /// cleanly at both ends (`0..=WS2812_LED_COUNT - 1`).
+    fn advance_scanner(&mut self, speed_frac: f32) {
+        let span = (WS2812_LED_COUNT - 1) as f32;
+        if self.scanner_pos >= span && self.scanner_dir > 0.0 {
+            self.scanner_dir = -1.0;
+        } else if self.scanner_pos <= 0.0 && self.scanner_dir < 0.0 {
+            self.scanner_dir = 1.0;
+        }
+        self.scanner_pos = (self.scanner_pos + self.scanner_dir * (0.4 + speed_frac * 1.2)).clamp(0.0, span);
+    }
+
+    /// Computes the directional comet intensity multiplier (`0.0..=1.0`) for
+    /// pixel `idx` given `head`, `dir`, and trailing tail weights.
+    fn comet_level(idx: i32, head: i32, dir: i32, tails: &[f32]) -> f32 {
+        if idx == head {
+            return 1.0;
+        }
+        for (step, &weight) in tails.iter().enumerate() {
+            if idx == head - (step as i32 + 1) * dir {
+                return weight;
+            }
+        }
+        0.0
+    }
+
     /// Renders one frame for `ov.effect` and advances this state by one
     /// ~200ms tick. Must be preceded by [`Self::sync_effect`] in the same
     /// tick. Panics-free fallback (all-off) for Auto/Off/Solid, which
@@ -2379,36 +2405,27 @@ impl AnimState {
                 colors
             }
             LedEffect::ChaseRainbow => {
-                self.chase_pos = (self.chase_pos + 0.2 + speed_frac * 2.0) % WS2812_LED_COUNT as f32;
-                self.phase_deg = (self.phase_deg + 3.0 + speed_frac * 6.0) % 360.0;
+                let head = self.scanner_pos.round() as i32;
+                let dir = self.scanner_dir as i32;
                 let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
-                let pos = self.chase_pos as i32;
                 for (i, c) in colors.iter_mut().enumerate() {
-                    if (i as i32 - pos).rem_euclid(3) == 0 {
-                        *c = hsv_to_rgb(self.phase_deg + i as f32 * 15.0, 1.0, v);
+                    let level = Self::comet_level(i as i32, head, dir, &[0.55, 0.25, 0.08]);
+                    if level > 0.0 {
+                        let hue = self.phase_deg + i as f32 * (360.0 / WS2812_LED_COUNT as f32);
+                        *c = hsv_to_rgb(hue, 1.0, v * level);
                     }
                 }
+                self.advance_scanner(speed_frac);
+                self.phase_deg = (self.phase_deg + 2.0 + speed_frac * 8.0) % 360.0;
                 colors
             }
             LedEffect::Scanner => {
-                let span = (WS2812_LED_COUNT - 1) as f32;
                 let head = self.scanner_pos.round() as i32;
                 let dir = self.scanner_dir as i32;
-                let tail1 = head - dir;
-                let tail2 = head - 2 * dir;
 
                 let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
                 for (i, c) in colors.iter_mut().enumerate() {
-                    let idx = i as i32;
-                    let level = if idx == head {
-                        1.0
-                    } else if idx == tail1 {
-                        0.45
-                    } else if idx == tail2 {
-                        0.18
-                    } else {
-                        0.0
-                    };
+                    let level = Self::comet_level(i as i32, head, dir, &[0.45, 0.18]);
                     *c = if level > 0.0 {
                         scale_color(ov.color, v * level)
                     } else {
@@ -2416,17 +2433,7 @@ impl AnimState {
                     };
                 }
 
-                if self.scanner_pos >= span && self.scanner_dir > 0.0 {
-                    self.scanner_dir = -1.0;
-                } else if self.scanner_pos <= 0.0 && self.scanner_dir < 0.0 {
-                    self.scanner_dir = 1.0;
-                }
-                self.scanner_pos += self.scanner_dir * (0.4 + speed_frac * 1.2);
-                if self.scanner_pos > span {
-                    self.scanner_pos = span;
-                } else if self.scanner_pos < 0.0 {
-                    self.scanner_pos = 0.0;
-                }
+                self.advance_scanner(speed_frac);
                 colors
             }
             LedEffect::Twinkle => {
@@ -4148,6 +4155,52 @@ mod tests {
         for i in 0..6 {
             assert_eq!(f6[i].0, 0, "Ahead LED {i} must be dark");
         }
+    }
+
+    #[test]
+    fn anim_state_chase_rainbow_head_tail_and_spectrum() {
+        let mut anim = AnimState::new();
+        let ov = LedOverrideState {
+            effect: LedEffect::ChaseRainbow,
+            color: (255, 0, 0),
+            brightness: 255,
+            speed: 128,
+        };
+
+        let lum = |c: (u8, u8, u8)| c.0.max(c.1).max(c.2);
+
+        // Frame 0 at pos 0, dir +1 -> Head at 0 full brightness, ahead LEDs dark
+        anim.sync_effect(ov.effect);
+        let f0 = anim.frame(ov);
+        assert_eq!(lum(f0[0]), 255);
+        for i in 1..WS2812_LED_COUNT {
+            assert_eq!(f0[i], (0, 0, 0), "Ahead LED {i} must be dark");
+        }
+
+        // Pos 4 moving right (dir +1):
+        // Head at 4 (100%), tail1 at 3 (55%), tail2 at 2 (25%), tail3 at 1 (8%), ahead dark
+        anim.scanner_pos = 4.0;
+        anim.scanner_dir = 1.0;
+        anim.phase_deg = 0.0;
+        let f4 = anim.frame(ov);
+        assert_eq!(lum(f4[4]), 255);
+        assert!(lum(f4[4]) > lum(f4[3]));
+        assert!(lum(f4[3]) > lum(f4[2]));
+        assert!(lum(f4[2]) > lum(f4[1]));
+        assert!(lum(f4[1]) > 0);
+        assert_eq!(f4[0], (0, 0, 0));
+        for i in 5..WS2812_LED_COUNT {
+            assert_eq!(f4[i], (0, 0, 0), "Ahead LED {i} must be dark");
+        }
+
+        // Rainbow spectrum across the strip: pixel 0 (hue ~0, red) vs pixel 4 (hue ~160, cyan/green)
+        assert!(f4[4].1 > f4[4].0, "LED 4 should be green/cyan-dominant, got {:?}", f4[4]);
+
+        // Reaching end of strip reverses direction cleanly
+        anim.scanner_pos = (WS2812_LED_COUNT - 1) as f32;
+        anim.scanner_dir = 1.0;
+        let _ = anim.frame(ov);
+        assert_eq!(anim.scanner_dir, -1.0);
     }
 
     #[test]

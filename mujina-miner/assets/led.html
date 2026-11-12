@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>MUJINA // LED</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
@@ -36,9 +36,9 @@
     -webkit-font-smoothing: antialiased;
   }
   .wrap {
-    max-width: 900px;
+    max-width: 1120px;
     margin: 0 auto;
-    padding: 24px 20px 60px;
+    padding: 24px 18px 60px;
   }
   .top {
     display: flex;
@@ -46,7 +46,7 @@
     justify-content: space-between;
     border-bottom: 1px solid var(--line);
     padding-bottom: 14px;
-    margin-bottom: 20px;
+    margin-bottom: 14px;
     flex-wrap: wrap;
     gap: 10px;
   }
@@ -59,28 +59,47 @@
     text-transform: uppercase;
   }
   h1 .chev { color: var(--cyan); text-shadow: 0 0 8px rgba(0,240,255,.5); }
-  .top-meta {
+  .menubar {
     display: flex;
-    align-items: center;
-    gap: 18px;
+    gap: 8px;
     flex-wrap: wrap;
-    max-width: 100%;
+    margin: 0 0 20px;
   }
-  .nav {
-    display: flex;
-    align-items: center;
-  }
-  .nav a {
-    color: var(--dim);
-    text-decoration: none;
-    font-size: 12px;
-    letter-spacing: .1em;
+  .menubar .menubtn {
+    background: #0a1120;
+    border: 1px solid var(--line);
+    color: var(--cyan);
+    cursor: pointer;
+    font-family: 'Orbitron', sans-serif;
+    font-weight: 700;
+    font-size: 11px;
+    letter-spacing: .14em;
     text-transform: uppercase;
-    margin-left: 18px;
-    border-bottom: 1px solid transparent;
-    padding-bottom: 3px;
+    padding: 9px 14px;
+    border-radius: 4px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    text-decoration: none;
+    box-sizing: border-box;
+    touch-action: manipulation;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    transition: border-color .12s, box-shadow .12s, background .12s;
   }
-  .nav a:hover, .nav a.active { color: var(--cyan); border-color: var(--cyan); }
+  .menubar .menubtn.on {
+    border-color: var(--cyan);
+    box-shadow: 0 0 10px rgba(0,240,255,.3);
+    background: rgba(0,240,255,.08);
+  }
+  @media (hover: hover) and (pointer: fine) {
+    .menubar .menubtn:hover {
+      border-color: var(--cyan);
+      box-shadow: 0 0 10px rgba(0,240,255,.3);
+    }
+  }
   .status-strip {
     display: flex;
     gap: 8px;
@@ -163,10 +182,16 @@
     justify-content: center;
     gap: 6px;
     transition: all .12s;
+    touch-action: manipulation;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
   }
-  #testShareBtn:hover {
-    background: rgba(0,240,255,.12);
-    box-shadow: 0 0 12px rgba(0,240,255,.3);
+  @media (hover: hover) and (pointer: fine) {
+    #testShareBtn:hover {
+      background: rgba(0,240,255,.12);
+      box-shadow: 0 0 12px rgba(0,240,255,.3);
+    }
   }
 
   .panel-card { background: var(--panel); border: 1px solid var(--line); padding: 16px; }
@@ -234,6 +259,7 @@
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
     gap: 8px;
+    touch-action: pan-y;
   }
   .eff-btn {
     background: var(--panel2);
@@ -247,7 +273,7 @@
     text-transform: uppercase;
     cursor: pointer;
     border-radius: 4px;
-    transition: all .12s;
+    transition: border-color .12s, color .12s, background .12s, box-shadow .12s;
     min-height: 42px;
     display: flex;
     align-items: center;
@@ -258,8 +284,14 @@
     overflow-wrap: break-word;
     line-height: 1.25;
     box-sizing: border-box;
+    touch-action: pan-y;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
   }
-  .eff-btn:hover { border-color: var(--cyan); color: var(--cyan); }
+  @media (hover: hover) and (pointer: fine) {
+    .eff-btn:hover { border-color: var(--cyan); color: var(--cyan); }
+  }
   .eff-btn.active {
     border-color: var(--cyan);
     color: var(--cyan);
@@ -309,10 +341,20 @@
     flex-shrink: 0;
     transition: transform .1s, outline .1s;
     box-sizing: border-box;
+    touch-action: manipulation;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
   }
-  .swatch:hover, .swatch:active {
+  .swatch:active {
     outline: 2px solid var(--cyan);
     transform: scale(1.05);
+  }
+  @media (hover: hover) and (pointer: fine) {
+    .swatch:hover {
+      outline: 2px solid var(--cyan);
+      transform: scale(1.05);
+    }
   }
 
   .sliders {
@@ -375,35 +417,15 @@
   /* Mobile viewport optimizations */
   @media (max-width: 640px) {
     .wrap {
-      padding: 12px 10px 48px;
+      padding: 18px 12px 48px;
     }
     .top {
       flex-wrap: wrap;
-      gap: 10px;
+      gap: 6px;
     }
-    .top-meta {
-      width: 100%;
-      justify-content: space-between;
-      gap: 10px;
-    }
-    .nav {
-      display: flex;
-      gap: 14px;
-      overflow-x: auto;
-      max-width: 100%;
-      width: 100%;
-      -webkit-overflow-scrolling: touch;
-      padding-bottom: 4px;
-      scrollbar-width: none;
-    }
-    .nav::-webkit-scrollbar {
-      display: none;
-    }
-    .nav a {
-      margin-left: 0;
-      font-size: 11px;
-      white-space: nowrap;
-      flex-shrink: 0;
+    h1 {
+      font-size: 20px;
+      letter-spacing: .08em;
     }
     .strip-container {
       padding: 14px 8px 12px;
@@ -447,6 +469,15 @@
       padding: 14px 10px;
     }
   }
+  @media (max-width: 480px) {
+    .menubar .menubtn {
+      flex: 1 1 30%;
+      padding: 9px 6px;
+      min-height: 40px;
+      text-align: center;
+      justify-content: center;
+    }
+  }
 </style>
 <script src="/auth.js"></script>
 </head>
@@ -454,18 +485,16 @@
 <div class="wrap">
   <div class="top">
     <h1><span class="chev">//</span>MUJINA <span style="color:var(--dim);font-weight:400">/ LED</span></h1>
-    <div class="top-meta">
-      <div class="status-strip"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></div>
-      <nav class="nav">
-        <a href="/dashboard">Dashboard</a>
-        <a href="/info">Info</a>
-        <a href="/led" class="active">LED</a>
-        <a href="/pool">Pool</a>
-        <a href="/tuning">Tuning</a>
-        <a href="/firmware">Firmware</a>
-      </nav>
-    </div>
+    <div class="status-strip"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></div>
   </div>
+  <nav class="menubar" aria-label="Main Menu">
+    <a class="menubtn" href="/dashboard">Dashboard</a>
+    <a class="menubtn" href="/info">Info</a>
+    <a class="menubtn on" href="/led">LED</a>
+    <a class="menubtn" href="/pool">Pool</a>
+    <a class="menubtn" href="/tuning">Tuning</a>
+    <a class="menubtn" href="/firmware">Firmware</a>
+  </nav>
 
   <div id="body">
     <div class="msg">loading…</div>
@@ -479,6 +508,10 @@ let BOARD = null;
 let STATE = { effect: 'auto', color: '#ff0000', brightness: 128, speed: 128 };
 let DRAGGING = false;
 let LAST_EFFECT = null;
+let INITIALIZED = false;
+let STATE_EPOCH = 0;
+let LAST_MUTATION_MS = 0;
+let PUSH_IN_FLIGHT = false;
 
 // Effect catalog. `needsColor`/`needsSpeed` drive which controls are
 // enabled per effect; `desc` is shown under the controls.
@@ -497,7 +530,7 @@ const EFFECTS = [
   { key: 'off',           label: 'Off',                   needsColor: false, needsSpeed: false, desc: 'Strip off.' },
   { key: 'colorloop',     label: 'Colorloop',             needsColor: false, needsSpeed: true,  desc: 'Whole strip one color, that color slowly cycling through hues.' },
   { key: 'blink',         label: 'Blink',                 needsColor: true,  needsSpeed: true,  desc: 'Color hard on/off toggle.' },
-  { key: 'chase_rainbow', label: 'Chase Rainbow',         needsColor: false, needsSpeed: true,  desc: 'Chase, but the lit LEDs cycle through hues.' },
+  { key: 'chase_rainbow', label: 'Chase Rainbow',         needsColor: false, needsSpeed: true,  desc: 'Rainbow comet chase sweeping across the strip with a decaying multi-color tail.' },
   { key: 'twinkle',       label: 'Twinkle',               needsColor: true,  needsSpeed: true,  desc: 'Random LEDs flash and fade.' },
   { key: 'fire_flicker',  label: 'Fire Flicker',          needsColor: false, needsSpeed: true,  desc: 'Warm flicker across red/orange/amber. Ignores your color pick -- always warm.' },
 ];
@@ -621,15 +654,62 @@ function buildStrip() {
   }
 }
 
+// Attaches a click handler that cancels when the user's finger moves
+// (>8px drag/scroll) or releases outside the button bounds, preventing
+// accidental button activation during touch scrolling/sliding on phones.
+function wireTapButton(el, onTap) {
+  let startX = 0, startY = 0, moved = false, activePointer = false;
+  const reset = () => { activePointer = false; };
+  const onDown = (x, y) => { startX = x; startY = y; moved = false; activePointer = true; };
+  const onMove = (x, y) => {
+    if (!activePointer || moved) return;
+    if (Math.hypot(x - startX, y - startY) > 8) moved = true;
+  };
+  if (window.PointerEvent) {
+    el.addEventListener('pointerdown', e => { if (e.isPrimary) onDown(e.clientX, e.clientY); });
+    el.addEventListener('pointermove', e => { if (e.isPrimary) onMove(e.clientX, e.clientY); });
+    el.addEventListener('pointercancel', () => { moved = true; reset(); });
+    el.addEventListener('pointerup', e => {
+      if (!activePointer) return;
+      const rect = el.getBoundingClientRect();
+      if (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom) {
+        moved = true;
+      }
+      reset();
+    });
+  } else {
+    el.addEventListener('touchstart', e => {
+      if (e.touches.length === 1) onDown(e.touches[0].clientX, e.touches[0].clientY);
+      else moved = true;
+    }, { passive: true });
+    el.addEventListener('touchmove', e => {
+      if (e.touches.length === 1) onMove(e.touches[0].clientX, e.touches[0].clientY);
+      else moved = true;
+    }, { passive: true });
+    el.addEventListener('touchcancel', () => { moved = true; reset(); });
+  }
+  el.addEventListener('click', e => {
+    if (moved) {
+      moved = false;
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    el.blur();
+    onTap();
+  });
+}
+
 function buildEffectButtons() {
   const wrap = $('effects');
   wrap.innerHTML = '';
   EFFECTS.forEach(e => {
     const b = document.createElement('button');
+    b.type = 'button';
     b.className = 'eff-btn' + (e.key === 'off' ? ' eff-off' : '');
     b.textContent = e.label;
     b.dataset.effect = e.key;
-    b.onclick = () => setEffect(e.key);
+    wireTapButton(b, () => setEffect(e.key));
     wrap.appendChild(b);
   });
   applyEffectUi();
@@ -680,13 +760,14 @@ function buildSwatches() {
     const s = document.createElement('div');
     s.className = 'swatch';
     s.style.background = hex;
-    s.onclick = () => {
+    wireTapButton(s, () => {
+      if ($('wheelBlock').classList.contains('dimmed')) return;
       STATE.color = hex;
       renderWheelDot();
       $('hexval').textContent = hex;
       if (!EFFECT_MAP[STATE.effect].needsColor) setEffect('solid', false);
       pushState();
-    };
+    });
     wrap.appendChild(s);
   });
 }
@@ -732,8 +813,17 @@ function buildWheel() {
     $('hexval').textContent = STATE.color;
     pushState();
   };
-  const start = e => { DRAGGING = true; pick(e.touches ? e.touches[0].clientX : e.clientX, e.touches ? e.touches[0].clientY : e.clientY); e.preventDefault(); };
-  const move = e => { if (!DRAGGING) return; pick(e.touches ? e.touches[0].clientX : e.clientX, e.touches ? e.touches[0].clientY : e.clientY); e.preventDefault(); };
+  const start = e => {
+    if ($('wheelBlock').classList.contains('dimmed')) return;
+    DRAGGING = true;
+    pick(e.touches ? e.touches[0].clientX : e.clientX, e.touches ? e.touches[0].clientY : e.clientY);
+    e.preventDefault();
+  };
+  const move = e => {
+    if (!DRAGGING) return;
+    pick(e.touches ? e.touches[0].clientX : e.clientX, e.touches ? e.touches[0].clientY : e.clientY);
+    e.preventDefault();
+  };
   const end = () => { DRAGGING = false; };
   canvas.addEventListener('mousedown', start);
   canvas.addEventListener('mousemove', move);
@@ -741,6 +831,8 @@ function buildWheel() {
   canvas.addEventListener('touchstart', start, { passive: false });
   canvas.addEventListener('touchmove', move, { passive: false });
   canvas.addEventListener('touchend', end);
+  canvas.addEventListener('touchcancel', end);
+  canvas.addEventListener('pointercancel', end);
 }
 
 let WHEEL_BITMAP = null;
@@ -812,12 +904,19 @@ function setEffect(e, send) {
 }
 
 let PUSH_TIMER = null;
+function markMutation() {
+  STATE_EPOCH++;
+  LAST_MUTATION_MS = Date.now();
+}
+
 function pushState() {
+  markMutation();
   // Coalesce rapid slider/wheel drag events into one request every ~80ms.
   if (PUSH_TIMER) return;
   PUSH_TIMER = setTimeout(async () => {
     PUSH_TIMER = null;
     if (!BOARD) return;
+    PUSH_IN_FLIGHT = true;
     try {
       await fetch(`/api/v0/boards/${encodeURIComponent(BOARD)}/led`, {
         method: 'PATCH',
@@ -825,7 +924,23 @@ function pushState() {
         body: JSON.stringify({ effect: STATE.effect, color: STATE.color, brightness: STATE.brightness, speed: STATE.speed }),
       });
     } catch (e) { /* next poll will resync */ }
+    finally { PUSH_IN_FLIGHT = false; }
   }, 80);
+}
+
+function cometLevelPreview(i, head, d, tail3) {
+  if (i === head) return 1.0;
+  if (i === head - d) return tail3 > 0 ? 0.55 : 0.45;
+  if (i === head - 2 * d) return tail3 > 0 ? 0.25 : 0.18;
+  if (tail3 > 0 && i === head - 3 * d) return tail3;
+  return 0.0;
+}
+
+function advanceScannerPreview(speedFrac) {
+  const span = 8;
+  if (P.scannerPos >= span && P.scannerDir > 0) P.scannerDir = -1;
+  else if (P.scannerPos <= 0 && P.scannerDir < 0) P.scannerDir = 1;
+  P.scannerPos = Math.max(0, Math.min(span, P.scannerPos + P.scannerDir * (0.2 + speedFrac * 0.6)));
 }
 
 // Mirrors AnimState::frame() in nano3s.rs closely enough for a
@@ -873,39 +988,24 @@ function updatePreview() {
       break;
     }
     case 'chase_rainbow': {
-      P.chasePos = (P.chasePos + 0.2 + speedFrac * 2) % 9;
-      P.phase = (P.phase + 3 + speedFrac * 6) % 360;
-      const pos = Math.trunc(P.chasePos);
-      colors = Array.from({ length: 9 }, (_, i) => (((i - pos) % 3) + 3) % 3 === 0 ? rgbToHex(...hsvToRgb(P.phase + i * 15, 1, v)) : '#000');
+      const head = Math.round(P.scannerPos);
+      const d = Math.trunc(P.scannerDir);
+      colors = Array.from({ length: 9 }, (_, i) => {
+        const level = cometLevelPreview(i, head, d, 0.08);
+        return level > 0 ? rgbToHex(...hsvToRgb(P.phase + i * 40, 1, v * level)) : '#000';
+      });
+      advanceScannerPreview(speedFrac);
+      P.phase = (P.phase + 1 + speedFrac * 4) % 360;
       break;
     }
     case 'scanner': {
-      const span = 8;
       const head = Math.round(P.scannerPos);
       const d = Math.trunc(P.scannerDir);
-      const tail1 = head - d;
-      const tail2 = head - 2 * d;
-
       colors = Array.from({ length: 9 }, (_, i) => {
-        let level = 0.0;
-        if (i === head) {
-          level = 1.0;
-        } else if (i === tail1) {
-          level = 0.45;
-        } else if (i === tail2) {
-          level = 0.18;
-        }
+        const level = cometLevelPreview(i, head, d, 0);
         return level > 0 ? scaleHex(STATE.color, v * level) : '#000';
       });
-
-      if (P.scannerPos >= span && P.scannerDir > 0) {
-        P.scannerDir = -1;
-      } else if (P.scannerPos <= 0 && P.scannerDir < 0) {
-        P.scannerDir = 1;
-      }
-      P.scannerPos += P.scannerDir * (0.2 + speedFrac * 0.6);
-      if (P.scannerPos > span) P.scannerPos = span;
-      if (P.scannerPos < 0) P.scannerPos = 0;
+      advanceScannerPreview(speedFrac);
       break;
     }
     case 'twinkle': {
@@ -1010,7 +1110,9 @@ async function findBoard() {
 }
 
 async function pollState() {
-  if (DRAGGING) return;
+  if (DRAGGING || PUSH_TIMER || PUSH_IN_FLIGHT) return;
+  if (INITIALIZED && (Date.now() - LAST_MUTATION_MS < 1500)) return;
+  const epoch = STATE_EPOCH;
   try {
     if (!BOARD) BOARD = await findBoard();
     if (!BOARD) {
@@ -1027,6 +1129,10 @@ async function pollState() {
     }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
+    if (INITIALIZED && (DRAGGING || PUSH_TIMER || PUSH_IN_FLIGHT || epoch !== STATE_EPOCH || (Date.now() - LAST_MUTATION_MS < 1500))) {
+      return;
+    }
+    INITIALIZED = true;
     STATE = d;
     $('connDot').className = 'dot ok';
     $('connText').textContent = 'live · ' + BOARD;

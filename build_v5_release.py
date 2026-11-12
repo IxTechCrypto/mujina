@@ -14,7 +14,7 @@ def run_cmd(cmd, cwd=None):
         raise RuntimeError(f"Command failed: {cmd}")
     return res.stdout
 
-print("=== MUJINA FIRMWARE RELEASE BUILD (v5.0.5) ===")
+print("=== MUJINA FIRMWARE RELEASE BUILD (v5.0.6) ===")
 print("[1] Updating staged binaries for data and app partitions...")
 
 # Data binaries
@@ -313,7 +313,7 @@ print(f"kdimg SHA-256: {kdimg_sha256}")
 print(f"app   SHA-256: {app_sha256}")
 print(f"data  SHA-256: {data_sha256}")
 
-VERSION = "v5.0.5"
+VERSION = "v5.0.6"
 
 for dl_dir in ["/mnt/c/Users/grant/Downloads", "/mnt/d/downloads"]:
     if os.path.isdir(dl_dir):
