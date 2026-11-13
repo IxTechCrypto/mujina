@@ -3377,7 +3377,15 @@ fn run_worker(
                 if new_mv == POWER_TARGET_AVOID_MV {
                     new_mv -= POWER_TARGET_STEP_MV;
                 }
-                new_mv = new_mv.clamp(POWER_TARGET_MIN_MV, POWER_TARGET_MAX_MV);
+                // A trip only ever steps voltage DOWN, one grid step. It used
+                // to clamp to POWER_TARGET_MIN/MAX_MV (3496..3860, the
+                // MED-table range of the power-target loop): from the tuner's
+                // 3912 mV that dropped two steps, and from a trimmed 3444 mV
+                // it RAISED voltage to 3496 on an over-power event. Bound it
+                // by the tuner envelope max instead, and never above the
+                // current voltage.
+                let floor = POWER_TARGET_MIN_MV.min(cur_mv);
+                new_mv = new_mv.max(floor).min(auto_tune::NANO3S_ENVELOPE.max_voltage_mv as i32);
                 if new_mv != cur_mv {
                     eprintln!(
                         "[nano3s] PSU safety trip: power={power_w:.1}W exceeds ceiling={effective_safety_w:.1}W (no power-target configured) cur={cur_mv}mV -> {new_mv}mV"
