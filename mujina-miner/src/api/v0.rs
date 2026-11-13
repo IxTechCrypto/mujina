@@ -688,7 +688,7 @@ async fn get_board_auto_tune(
     request_body = AutoTuneRequest,
     responses(
         (status = OK, description = "AutoTune directive queued"),
-        (status = BAD_REQUEST, description = "chip_temp_target_c outside 60..88"),
+        (status = BAD_REQUEST, description = "chip_temp_target_c outside 60..88, or target outside 20..140 W / 0.5..12 TH/s"),
         (status = NOT_FOUND, description = "Board not found"),
         (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support AutoTune"),
     ),
@@ -761,7 +761,7 @@ async fn get_board_tuner(
     request_body = AutoTuneRequest,
     responses(
         (status = OK, description = "Tuner directive queued"),
-        (status = BAD_REQUEST, description = "chip_temp_target_c outside 60..88"),
+        (status = BAD_REQUEST, description = "chip_temp_target_c outside 60..88, or target outside 20..140 W / 0.5..12 TH/s"),
         (status = NOT_FOUND, description = "Board not found"),
         (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support AutoTune"),
     ),

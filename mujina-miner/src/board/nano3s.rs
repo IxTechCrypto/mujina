@@ -43,10 +43,10 @@ use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256d;
 use tokio::sync::{mpsc, watch};
 
-use super::nano3s_auto_tune::{self as auto_tune, AutoTune, AutoTuneCmd};
+use super::nano3s_auto_tune::{self as auto_tune, AutoTune, AutoTuneCmd, TuneChoice};
 use super::nano3s_chip_tuner::{ChipGoal, ChipMetrics, ChipPhase, ChipTuner, ChipTunerConfig};
 use super::nano3s_auto_tune::ChipTuneStatus;
-use super::nano3s_tuner_core::{SearchMemory, TuneProfile, TuneSetpoint};
+use super::nano3s_tuner_core::{SearchMemory, TuneProfile, TuneSetpoint, TuneTarget};
 use super::{BackplaneConnector, BoardInfo, VirtualBoardDescriptor};
 use crate::api_client::types::{
     BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor, ThreadTelemetry,
@@ -1273,8 +1273,11 @@ pub(crate) fn read_psu_status() -> (Option<f64>, Option<bool>, Option<f64>, Opti
     let detected_ceiling_w = bus_v.map(pd_ceiling_w_for_voltage).filter(|w| w.is_finite());
     let override_max_w = load_psu_override_w();
     let effective_ceiling_w = if let Some(override_w) = override_max_w.filter(|w| w.is_finite() && *w > 0.0) {
-        // Explicit continuous power ceiling override (e.g. 130W Aggressive, 140W Mean Well)
-        override_w.clamp(40.0, 140.0)
+        // Explicit power ceiling override (e.g. 130W Aggressive, 140W Mean
+        // Well). Reported as the tuner's continuous ceiling, the same meaning
+        // as the PD branch below: the safety trip sits at the override and the
+        // tuner stays AUTO_TUNE_POWER_MARGIN_W under it.
+        override_w.clamp(40.0, 140.0) - auto_tune::AUTO_TUNE_POWER_MARGIN_W as f64
     } else {
         detected_ceiling_w
             .map(|w| (w * auto_tune::PD_CONTINUOUS_FRACTION).min(POWER_TARGET_SAFETY_W - PD_CEILING_MARGIN_W))
@@ -1397,10 +1400,11 @@ struct PersistedTuning {
     /// resumes searching from where it left off instead of restarting
     /// from the middle.
     autotune_level: Option<f64>,
-    /// AutoTune profile (`auto_tune:` directive). `Some` means AutoTune
-    /// owns frequency+voltage+fan escalation and the three aadhi loops
-    /// above are forced off, at startup and live. `None` = off (default).
-    auto_tune_profile: Option<TuneProfile>,
+    /// AutoTune profile or power/hashrate target (`auto_tune:` directive).
+    /// `Some` means AutoTune owns frequency+voltage+fan escalation and the
+    /// three aadhi loops above are forced off, at startup and live. `None` =
+    /// off (default). Stored as `auto_tune_profile=<name|power:W|hashrate:T>`.
+    auto_tune_profile: Option<TuneChoice>,
     /// Chip-temp target (C) the AutoTune fan loop holds; `None` = profile
     /// temp cap - 5 C.
     auto_fan_target_c: Option<f32>,
@@ -1457,9 +1461,10 @@ fn stop_chip_tuner(mut ct: ChipTuner, applied: &mut [i16; CHIP_COUNT]) -> [i16; 
     committed
 }
 
-fn chip_goal(p: Option<TuneProfile>) -> ChipGoal {
+fn chip_goal(p: Option<TuneChoice>) -> ChipGoal {
     match p {
-        Some(TuneProfile::Efficient | TuneProfile::Quiet) => ChipGoal::Efficiency,
+        Some(TuneChoice::Profile(TuneProfile::Efficient | TuneProfile::Quiet))
+        | Some(TuneChoice::Target(TuneTarget::Hashrate(_))) => ChipGoal::Efficiency,
         _ => ChipGoal::Hashrate,
     }
 }
@@ -1528,7 +1533,7 @@ fn load_tuning() -> PersistedTuning {
                 cfg.autotune_hashrate_target_ths = value.parse::<f64>().ok()
             }
             "autotune_level" => cfg.autotune_level = value.parse::<f64>().ok(),
-            "auto_tune_profile" | "owner_tune_profile" => cfg.auto_tune_profile = auto_tune::parse_directive(value).ok().flatten(),
+            "auto_tune_profile" | "owner_tune_profile" => cfg.auto_tune_profile = auto_tune::parse_choice(value).ok().flatten(),
             "auto_fan_target_c" | "owner_fan_target_c" => {
                 cfg.auto_fan_target_c =
                     value.parse::<f32>().ok().filter(|c| auto_tune::FAN_TARGET_RANGE_C.contains(c))
@@ -1567,10 +1572,7 @@ fn write_tuning_conf(cfg: &PersistedTuning) {
         out.push_str(&format!("autotune_level={l}\n"));
     }
     if let Some(p) = cfg.auto_tune_profile {
-        out.push_str(&format!(
-            "auto_tune_profile={}\n",
-            auto_tune::directive_for(Some(p)).trim_start_matches("auto_tune:")
-        ));
+        out.push_str(&format!("auto_tune_profile={}\n", auto_tune::choice_text(Some(p))));
     }
     if let Some(c) = cfg.auto_fan_target_c {
         out.push_str(&format!("auto_fan_target_c={c}\n"));
@@ -1654,7 +1656,7 @@ fn persist_auto_fan_target(c: Option<f32>) {
     write_tuning_conf(&cfg);
 }
 
-fn persist_auto_tune_profile(profile: Option<TuneProfile>) {
+fn persist_auto_tune_profile(profile: Option<TuneChoice>) {
     let mut cfg = load_tuning();
     cfg.auto_tune_profile = profile;
     write_tuning_conf(&cfg);
@@ -1679,7 +1681,7 @@ fn disable_auto_tune_for_manual(auto_tuner: &mut AutoTune, why: &str) {
 /// the choice when it consumes the directive. Shares the single-slot control
 /// file with every other writer: space calls >= 5 s.
 pub(crate) fn write_auto_tune_command(
-    profile: Option<Option<TuneProfile>>,
+    profile: Option<Option<TuneChoice>>,
     fan_target_c: Option<f32>,
     per_chip: Option<bool>,
     continuous: Option<bool>,
@@ -2593,11 +2595,13 @@ fn write_live_status(ipc_ok: bool, current_job_id: Option<u32>, shares_found: u3
 
     let cfg = load_tuning();
     let mode_str = match cfg.auto_tune_profile {
-        Some(TuneProfile::Quiet) => "Quiet",
-        Some(TuneProfile::Balanced) => "Balanced",
-        Some(TuneProfile::Efficient) => "Efficient",
-        Some(TuneProfile::MaxHash) => "Max Hash",
-        None => "Off",
+        Some(TuneChoice::Profile(TuneProfile::Quiet)) => "Quiet".to_string(),
+        Some(TuneChoice::Profile(TuneProfile::Balanced)) => "Balanced".to_string(),
+        Some(TuneChoice::Profile(TuneProfile::Efficient)) => "Efficient".to_string(),
+        Some(TuneChoice::Profile(TuneProfile::MaxHash)) => "Max Hash".to_string(),
+        Some(TuneChoice::Target(TuneTarget::Power(w))) => format!("Target {w:.0} W"),
+        Some(TuneChoice::Target(TuneTarget::Hashrate(h))) => format!("Target {h:.2} TH/s"),
+        None => "Off".to_string(),
     };
     let cont_val = if cfg.continuous { 1 } else { 0 };
 
@@ -2851,11 +2855,12 @@ fn run_worker(
     auto_tuner.set_fan_target(persisted_tuning.auto_fan_target_c);
     auto_tuner.set_continuous(persisted_tuning.continuous);
     if let Some(p) = persisted_tuning.auto_tune_profile {
-        auto_tuner.enable(p);
+        auto_tuner.enable_choice(p);
         auto_tuner.seed_fan_duty(read_fan_status().and_then(|f| f.percent));
-        eprintln!("[nano3s] auto-tune: resumed profile {p:?} from {TUNING_CONF_PATH}");
-        if let Some((mp, mem)) = persisted_tuning.auto_memory
-            && mp == p
+        eprintln!("[nano3s] auto-tune: resumed {p:?} from {TUNING_CONF_PATH}");
+        if let TuneChoice::Profile(pp) = p
+            && let Some((mp, mem)) = persisted_tuning.auto_memory
+            && mp == pp
         {
             auto_tuner.restore_memory(mem);
             eprintln!("[nano3s] auto-tune: restored search memory {mem:?}");
@@ -2864,16 +2869,16 @@ fn run_worker(
     let mut last_auto_memory = auto_tuner.profile().zip(auto_tuner.memory());
     // Per-chip tuner: runs on the AutoTune tick while the AutoTune is locked
     // and its base point hasn't moved since the last tick.
-    let new_chip_tuner = |p: Option<TuneProfile>, o: [i16; CHIP_COUNT]| {
+    let new_chip_tuner = |p: Option<TuneChoice>, o: [i16; CHIP_COUNT]| {
         let mut cfg = ChipTunerConfig::default();
-        if p == Some(TuneProfile::MaxHash) {
+        if p == Some(TuneChoice::Profile(TuneProfile::MaxHash)) {
             cfg.max_board_fail_pct = 25.0;
         }
         ChipTuner::new(cfg, chip_goal(p), o)
     };
     let mut chip_tuner = persisted_tuning
         .chip_tune
-        .then(|| new_chip_tuner(auto_tuner.profile(), chip_offset_mhz));
+        .then(|| new_chip_tuner(auto_tuner.choice(), chip_offset_mhz));
     let mut chip_base: Option<(u32, Option<i32>)> = None;
     let mut persisted_chip_offsets = chip_offset_mhz;
     auto_tuner.publish(None);
@@ -2945,7 +2950,7 @@ fn run_worker(
                         start = stop_chip_tuner(ct, &mut chip_offset_mhz);
                         persisted_chip_offsets = start;
                     }
-                    chip_tuner = on.then(|| new_chip_tuner(auto_tuner.profile(), start));
+                    chip_tuner = on.then(|| new_chip_tuner(auto_tuner.choice(), start));
                     if !on {
                         auto_tuner.set_chip_status(None);
                     }
@@ -2997,10 +3002,10 @@ fn run_worker(
                         // clock we start from (stale-ceiling bug).
                         temp_throttle_base_freq = last_applied_pll_freq;
                         psu_ceiling_freq = last_applied_pll_freq;
-                        auto_tuner.pick_profile(profile, parsed.as_ref().ok().and_then(|d| d.fan_target_c));
+                        auto_tuner.pick(profile, parsed.as_ref().ok().and_then(|d| d.fan_target_c));
                         auto_tuner.seed_fan_duty(read_fan_status().and_then(|f| f.percent));
                         auto_tuner.publish(None);
-                        eprintln!("[nano3s] auto-tune: enabled profile {profile:?} (power-target/temp-target/autotune-hashrate disabled)");
+                        eprintln!("[nano3s] auto-tune: enabled {profile:?} (power-target/temp-target/autotune-hashrate disabled)");
                     }
                     Ok(Some(None)) => {
                         if let Some(AutoTuneCmd::Fan(t)) = auto_tuner.disable() {
@@ -3334,8 +3339,10 @@ fn run_worker(
             // Only ever tightens the existing POWER_TARGET_SAFETY_W
             // trip, never loosens it.
             let (tuner_power_ceiling_w, effective_safety_w) = if let Some(override_w) = psu_override_max_w {
-                let ceiling = (override_w as f32).clamp(40.0, 140.0);
+                // Same margin as the PD path (auto_tune_power_ceiling): the
+                // tuner backs off before the safety trip at `safety` fires.
                 let safety = override_w.clamp(40.0, 140.0);
+                let ceiling = (safety as f32 - auto_tune::AUTO_TUNE_POWER_MARGIN_W).max(0.0);
                 (ceiling, safety)
             } else {
                 let pd_contract = pd_ceiling_w_for_voltage(last_bus_v);
@@ -3735,10 +3742,14 @@ fn run_worker(
                     // Auto-engage: if AutoTune is enabled (either locked or continuous dynamic tuning is active),
                     // operating thermals have settled, and chip tuning has not been explicitly disabled,
                     // automatically instantiate the per-chip tuner if absent.
-                    let chip_tune_allowed = auto_tuner.is_locked() || (auto_tuner.is_enabled() && persisted_tuning.continuous);
+                    // Not in target mode: per-chip trials move board power and
+                    // hashrate out of the target band, which makes the target
+                    // tuner step the clock and interrupt every trial.
+                    let chip_tune_allowed = auto_tuner.target().is_none()
+                        && (auto_tuner.is_locked() || (auto_tuner.is_enabled() && persisted_tuning.continuous));
                     if chip_tuner.is_none() && chip_tune_allowed && persisted_tuning.chip_tune {
                         eprintln!("[nano3s] auto-engaging per-chip tuner (locked={} continuous={})", auto_tuner.is_locked(), persisted_tuning.continuous);
-                        chip_tuner = Some(new_chip_tuner(auto_tuner.profile(), chip_offset_mhz));
+                        chip_tuner = Some(new_chip_tuner(auto_tuner.choice(), chip_offset_mhz));
                     }
 
                     if let Some(ct) = chip_tuner.as_mut() {

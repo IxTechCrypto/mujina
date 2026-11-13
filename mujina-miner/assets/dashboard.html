@@ -1153,7 +1153,22 @@
           <option value="efficient">Efficient</option>
           <option value="balanced">Balanced</option>
           <option value="max_hash">Max hash</option>
+          <option value="target">Target (power / hashrate)</option>
         </select>
+      </div>
+      <div id="ownTargetRows" style="display:none">
+        <div class="row">
+          <label>Target</label>
+          <div class="seg" id="ownTargetAxis">
+            <button type="button" class="segbtn active" data-axis="power">Power (W)</button>
+            <button type="button" class="segbtn" data-axis="hashrate">Hashrate (TH/s)</button>
+          </div>
+        </div>
+        <div class="row">
+          <label for="ownTargetVal">Value <small style="color:var(--dim)" id="ownTargetUnit">W</small></label>
+          <input type="number" id="ownTargetVal" min="20" max="200" step="1" placeholder="e.g. 115">
+        </div>
+        <div class="note" id="ownTargetNote"></div>
       </div>
       <div class="row">
         <label for="ownTemp">Chip temp target <small style="color:var(--dim)">°C, blank = unchanged</small></label>
@@ -2498,6 +2513,7 @@ async function loadPsuConfig() {
     const detected = d.detected_ceiling_w != null ? d.detected_ceiling_w + ' W' : 'none';
     const eff = d.effective_ceiling_w != null ? (typeof d.effective_ceiling_w === 'number' ? d.effective_ceiling_w.toFixed(0) : d.effective_ceiling_w) + ' W' : '112 W';
     const ov = d.override_max_w;
+    PSU_CEILING_W = typeof d.effective_ceiling_w === 'number' ? d.effective_ceiling_w : null;
 
     $('psuCurStatus').innerHTML = 'Rail: <strong>' + bus + '</strong> · Detected PD: <strong>' + detected + '</strong> · Active Ceiling: <strong>' + eff + '</strong>';
 
@@ -2621,11 +2637,49 @@ function pt(p) {
   const v = p.voltage_mv != null ? p.voltage_mv : p.core_voltage_mv;
   return { f, v, j: p.j_th != null ? p.j_th : p.efficiency_j_th };
 }
+// ---- Target mode: a power (whole-board W) or hashrate (TH/s) setpoint ----
+let TARGET_AXIS = 'power';
+// Active board power ceiling from the Power Delivery settings (PD contract or
+// Mean Well / custom override); undefined = not fetched yet.
+let PSU_CEILING_W;
+function targetLabel(t) {
+  if (!t || t.value == null) return null;
+  return t.axis === 'hashrate' ? 'target ' + (+t.value).toFixed(2) + ' TH/s' : 'target ' + (+t.value).toFixed(0) + ' W';
+}
+function modeLabel(o) { return targetLabel(o.target) || o.profile || '?'; }
+function setTargetAxis(axis) {
+  TARGET_AXIS = axis === 'hashrate' ? 'hashrate' : 'power';
+  document.querySelectorAll('#ownTargetAxis .segbtn').forEach(b => b.classList.toggle('active', b.dataset.axis === TARGET_AXIS));
+  const inp = $('ownTargetVal'), hash = TARGET_AXIS === 'hashrate';
+  $('ownTargetUnit').textContent = hash ? 'TH/s' : 'W';
+  // Same ranges the daemon accepts (TARGET_POWER_RANGE_W / TARGET_HASHRATE_RANGE_THS).
+  inp.step = hash ? '0.01' : '1';
+  inp.min = hash ? '0.5' : '20';
+  inp.max = hash ? '12' : '140';
+  inp.placeholder = hash ? 'e.g. 6.0' : 'e.g. 115';
+  $('ownTargetNote').textContent = hash
+    ? 'Reaches the hashrate, then trims core voltage for the best J/TH while holding it.'
+    : 'Climbs to the most hashrate that fits in this whole-board power, trimming voltage to make room.'
+      + (PSU_CEILING_W != null
+        ? ' Tuner power ceiling ' + PSU_CEILING_W.toFixed(0) + ' W (from Power Delivery): a target near or above it settles about '
+          + Math.max(0, PSU_CEILING_W - 3).toFixed(0) + ' W.'
+        : '');
+}
+function syncTargetMode() {
+  const isTarget = $('ownProfile').value === 'target';
+  $('ownTargetRows').style.display = isTarget ? '' : 'none';
+  if (isTarget) setTargetAxis(TARGET_AXIS);
+  if (isTarget && PSU_CEILING_W === undefined) {
+    PSU_CEILING_W = null; // fetch once
+    loadPsuConfig().then(() => setTargetAxis(TARGET_AXIS));
+  }
+}
+
 function renderOwnerTune(o) {
   LAST_OWNER_STATUS = o;
   let ownTxt = 'tuner off';
   if (o.enabled) {
-    ownTxt = (o.profile || '?') + ' / ' + (o.phase || '?');
+    ownTxt = modeLabel(o) + ' / ' + (o.phase || '?');
     if (o.per_chip && o.per_chip.phase) ownTxt += ' · per-chip ' + o.per_chip.phase;
     if (o.fan_duty_percent != null) ownTxt += ' · fan ' + o.fan_duty_percent + '%';
     if (o.continuous_ceiling_w != null) ownTxt += ' · cap ' + (+o.continuous_ceiling_w).toFixed(0) + ' W';
@@ -2634,11 +2688,18 @@ function renderOwnerTune(o) {
   }
   $('ownCur').textContent = 'Current: ' + ownTxt;
   if (!OWN_SYNCED) {
-    $('ownProfile').value = o.enabled ? (o.profile || 'off') : 'off';
+    if (o.enabled && o.target) {
+      $('ownProfile').value = 'target';
+      TARGET_AXIS = o.target.axis;
+      $('ownTargetVal').value = o.target.value;
+    } else {
+      $('ownProfile').value = o.enabled ? (o.profile || 'off') : 'off';
+    }
     $('ownContinuous').checked = !!o.continuous;
     syncContinuousUI();
     OWN_SYNCED = true;
   }
+  syncTargetMode();
   const best = $('atbest'), list = $('atlist'), st = $('at-phase-label'), pcElem = $('at-per-chip');
   if (pcElem) {
     if (o.per_chip) {
@@ -2658,7 +2719,16 @@ function renderOwnerTune(o) {
     if (pcElem) pcElem.textContent = 'Per-chip: off';
     return;
   }
-  const parts = [(o.profile || '?') + ' / ' + (o.phase || '?')];
+  const parts = [modeLabel(o) + ' / ' + (o.phase || '?')];
+  if (o.target && o.target.value != null) {
+    const hash = o.target.axis === 'hashrate';
+    // Same readings the tuner judges against: board hashrate / INA226 watts.
+    const ab = activeBoard(), cur = ab ? (hash ? ab.hashrate_ths : ab.core_w) : null;
+    if (cur != null) {
+      const d = cur - o.target.value;
+      parts.push('Δ ' + (d >= 0 ? '+' : '') + (hash ? d.toFixed(2) + ' TH/s' : d.toFixed(0) + ' W') + ' (±2%)');
+    }
+  }
   if (o.fan_duty_percent != null || o.fan_target_c != null) {
     parts.push('fan ' + (o.fan_duty_percent != null ? o.fan_duty_percent + '%' : '—') + ' → ' + (o.fan_target_c != null ? (+o.fan_target_c).toFixed(0) + '°C' : '—'));
   }
@@ -2708,7 +2778,36 @@ async function applyOwner() {
   if (!caps || !safeUrl(caps.tuner)) { setMsg('ownMsg', 'tuner not available for this board'); return; }
   if (writeBusy('ownMsg')) return;
   const sel = $('ownProfile'), v = sel.value, label = sel.options[sel.selectedIndex].textContent;
-  const curProfile = (LAST_OWNER_STATUS && LAST_OWNER_STATUS.enabled) ? (LAST_OWNER_STATUS.profile || 'off') : 'off';
+
+  if (v === 'target') {
+    const val = parseFloat($('ownTargetVal').value), inp = $('ownTargetVal');
+    if (!isFinite(val) || val < +inp.min || val > +inp.max) {
+      setMsg('ownMsg', 'Enter a target between ' + inp.min + ' and ' + inp.max);
+      return;
+    }
+    const target = { axis: TARGET_AXIS, value: val }, tl = targetLabel(target);
+    const cur = LAST_OWNER_STATUS && LAST_OWNER_STATUS.enabled && LAST_OWNER_STATUS.target;
+    const ttv = $('ownTemp').value, cont = $('ownContinuous').checked;
+    const contChanged = cont !== !!(LAST_OWNER_STATUS && LAST_OWNER_STATUS.continuous);
+    const sameTarget = !!cur && cur.axis === target.axis && +cur.value === val;
+    if (sameTarget && ttv === '' && !contChanged) { setMsg('ownMsg', 'No changes to apply'); return; }
+    // Only a new target restarts the search; temp/continuous alone are sent without it.
+    if (!sameTarget && !confirm('Switch the auto tuner to ' + tl + '? This restarts the tuning search.')) return;
+    const body = { board_name: name, continuous: cont };
+    if (!sameTarget) body.target = target;
+    if (ttv !== '') body.chip_temp_target_c = +ttv;
+    setMsg('ownMsg', 'Sending…');
+    lockWrites();
+    try {
+      await sendJson('PATCH', caps.tuner, body);
+      setMsg('ownMsg', 'Queued: ' + tl + ' (applies within ~1 s)', true);
+      setTimeout(pollOwnerTune, 2500);
+    } catch (e) { setMsg('ownMsg', 'Failed: ' + e.message); }
+    return;
+  }
+
+  const curProfile = (LAST_OWNER_STATUS && LAST_OWNER_STATUS.enabled)
+    ? (LAST_OWNER_STATUS.target ? 'target' : (LAST_OWNER_STATUS.profile || 'off')) : 'off';
   const curContinuous = !!(LAST_OWNER_STATUS && LAST_OWNER_STATUS.continuous);
   const newContinuous = $('ownContinuous').checked;
   const tt = $('ownTemp').value;
@@ -2850,6 +2949,8 @@ $('psuApplyBtn').addEventListener('click', applyPsuProfile);
 $('poolSave').addEventListener('click', savePool);
 $('poolReboot').addEventListener('click', poolApplyNow);
 $('ownApply').addEventListener('click', applyOwner);
+$('ownProfile').addEventListener('change', syncTargetMode);
+document.querySelectorAll('#ownTargetAxis .segbtn').forEach(b => b.addEventListener('click', () => setTargetAxis(b.dataset.axis)));
 $('ownContinuous').addEventListener('change', () => {
   USER_EDITING_CONTINUOUS = true;
   syncContinuousUI();

@@ -14,6 +14,7 @@ use utoipa::ToSchema;
 
 use super::nano3s_tuner_core::{
     AutoTuner, CapLimits, Metrics, SearchMemory, TuneAction, TuneEnvelope, TunePhase, TuneProfile, TuneSetpoint,
+    TuneTarget,
 };
 
 /// How often the autotuner is evaluated. The status block of `run_worker`
@@ -214,6 +215,11 @@ pub struct AutoTuneRequest {
     /// Continuous dynamic tuning: continuously probes upward when thermal/cooling headroom opens up.
     #[serde(default)]
     pub continuous: Option<bool>,
+    /// A power (whole-board W) or hashrate (TH/s) setpoint instead of a
+    /// profile, e.g. `{"axis":"power","value":115}`. Takes priority over
+    /// `profile`. The PSU ceiling and the 97 C backstop still apply.
+    #[serde(default)]
+    pub target: Option<TuneTarget>,
 }
 
 fn present_or_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<TuneProfile>>, D::Error> {
@@ -224,23 +230,31 @@ fn present_or_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Opti
 pub(crate) const FAN_TARGET_RANGE_C: std::ops::RangeInclusive<f32> = 60.0..=88.0;
 
 impl AutoTuneRequest {
-    /// `Err` (-> 400) when `chip_temp_target_c` is outside 60..88.
+    /// `Err` (-> 400) when `chip_temp_target_c` is outside 60..88 or a
+    /// target is outside [`valid_target`]'s range.
     pub(crate) fn validate(&self) -> Result<(), ()> {
+        if self.target.is_some_and(|t| !valid_target(t)) {
+            return Err(());
+        }
         match self.chip_temp_target_c {
             Some(c) if !FAN_TARGET_RANGE_C.contains(&c) => Err(()),
             _ => Ok(()),
         }
     }
 
-    /// The profile change to queue: `Some(None)` = off, `None` = keep.
-    pub(crate) fn profile_change(&self) -> Option<Option<TuneProfile>> {
+    /// The change to queue: `Some(None)` = off, `None` = keep. A target wins
+    /// over a profile.
+    pub(crate) fn profile_change(&self) -> Option<Option<TuneChoice>> {
+        if let Some(t) = self.target {
+            return Some(Some(TuneChoice::Target(t)));
+        }
         match (
             self.profile,
             self.chip_temp_target_c.is_some() || self.per_chip.is_some() || self.continuous.is_some(),
         ) {
             (None, true) => None,
             (None, false) => Some(None),
-            (p, _) => p,
+            (p, _) => p.map(|p| p.map(TuneChoice::Profile)),
         }
     }
 }
@@ -257,6 +271,9 @@ pub struct AveragingProgress {
 pub struct AutoTuneStatus {
     pub enabled: bool,
     pub profile: Option<TuneProfile>,
+    /// Set in target mode (then `profile` is `None`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<TuneTarget>,
     pub phase: Option<TunePhase>,
     pub last_event: Option<String>,
     pub setpoint: Option<TuneSetpoint>,
@@ -341,11 +358,57 @@ pub(crate) fn parse_directive(v: &str) -> Result<Option<TuneProfile>, ()> {
     }
 }
 
-/// Parsed `auto_tune:` control line: `<profile|off|keep>[;fan=<C>]`.
+/// What the owner tuner runs: a cap-based profile or a power/hashrate target.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum TuneChoice {
+    Profile(TuneProfile),
+    Target(TuneTarget),
+}
+
+/// Accepted targets: whole-board watts and board TH/s. 140 W is the board's
+/// hard maximum (the PSU override and safety trip are clamped there, even on
+/// a bigger external supply such as a 200 W Mean Well); the live PSU ceiling
+/// still applies on top.
+pub(crate) const TARGET_POWER_RANGE_W: std::ops::RangeInclusive<f32> = 20.0..=140.0;
+pub(crate) const TARGET_HASHRATE_RANGE_THS: std::ops::RangeInclusive<f32> = 0.5..=12.0;
+
+pub(crate) fn valid_target(t: TuneTarget) -> bool {
+    match t {
+        TuneTarget::Power(w) => TARGET_POWER_RANGE_W.contains(&w),
+        TuneTarget::Hashrate(h) => TARGET_HASHRATE_RANGE_THS.contains(&h),
+    }
+}
+
+/// Text form used by the control directive and `tuning.conf`:
+/// `off`, a profile name, `power:<W>` or `hashrate:<TH/s>`.
+pub(crate) fn choice_text(c: Option<TuneChoice>) -> String {
+    match c {
+        Some(TuneChoice::Target(TuneTarget::Power(w))) => format!("power:{w}"),
+        Some(TuneChoice::Target(TuneTarget::Hashrate(h))) => format!("hashrate:{h}"),
+        Some(TuneChoice::Profile(p)) => directive_for(Some(p)).trim_start_matches("auto_tune:").to_string(),
+        None => "off".to_string(),
+    }
+}
+
+/// Parses [`choice_text`]'s output. `Err` for anything unknown or a target
+/// outside [`valid_target`].
+pub(crate) fn parse_choice(v: &str) -> Result<Option<TuneChoice>, ()> {
+    let v = v.trim();
+    let target = if let Some(w) = v.strip_prefix("power:") {
+        TuneTarget::Power(w.trim().parse().map_err(|_| ())?)
+    } else if let Some(h) = v.strip_prefix("hashrate:") {
+        TuneTarget::Hashrate(h.trim().parse().map_err(|_| ())?)
+    } else {
+        return parse_directive(v).map(|p| p.map(TuneChoice::Profile));
+    };
+    valid_target(target).then_some(Some(TuneChoice::Target(target))).ok_or(())
+}
+
+/// Parsed `auto_tune:` control line: `<choice|off|keep>[;fan=<C>]`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct AutoTuneDirective {
     /// `Some(None)` = off, `None` = keep (`keep`).
-    pub profile: Option<Option<TuneProfile>>,
+    pub profile: Option<Option<TuneChoice>>,
     pub fan_target_c: Option<f32>,
     /// `chip=on|off`: per-chip tuner switch; `None` = unchanged.
     pub chip_tune: Option<bool>,
@@ -353,10 +416,10 @@ pub(crate) struct AutoTuneDirective {
     pub continuous: Option<bool>,
 }
 
-pub(crate) fn directive_for_request(profile: Option<Option<TuneProfile>>, fan_target_c: Option<f32>) -> String {
+pub(crate) fn directive_for_request(profile: Option<Option<TuneChoice>>, fan_target_c: Option<f32>) -> String {
     let head = match profile {
         None => "auto_tune:keep".to_string(),
-        Some(p) => directive_for(p),
+        Some(c) => format!("auto_tune:{}", choice_text(c)),
     };
     match fan_target_c {
         Some(c) => format!("{head};fan={c}"),
@@ -367,7 +430,7 @@ pub(crate) fn directive_for_request(profile: Option<Option<TuneProfile>>, fan_ta
 pub(crate) fn parse_auto_tune_directive(v: &str) -> Result<AutoTuneDirective, ()> {
     let mut parts = v.split(';');
     let head = parts.next().unwrap_or("").trim();
-    let profile = if head == "keep" { None } else { Some(parse_directive(head)?) };
+    let profile = if head == "keep" { None } else { Some(parse_choice(head)?) };
     let mut fan_target_c = None;
     let mut chip_tune = None;
     let mut continuous = None;
@@ -689,7 +752,7 @@ pub(crate) fn clear_other_loops(
 }
 
 /// At startup, the autotuner wins over any persisted/env loop.
-pub(crate) fn startup_loop_allowed(auto_tune_profile: Option<TuneProfile>, autotune_hashrate: Option<f64>) -> bool {
+pub(crate) fn startup_loop_allowed(auto_tune_profile: Option<TuneChoice>, autotune_hashrate: Option<f64>) -> bool {
     auto_tune_profile.is_none() && autotune_hashrate.is_none()
 }
 
@@ -697,7 +760,8 @@ pub(crate) fn startup_loop_allowed(auto_tune_profile: Option<TuneProfile>, autot
 
 pub(crate) struct AutoTune {
     tuner: AutoTuner,
-    profile: Option<TuneProfile>,
+    /// What is running: a profile or a power/hashrate target. `None` = off.
+    choice: Option<TuneChoice>,
     next_tick: Option<std::time::Instant>,
     continuous_ceiling_w: Option<f32>,
     fan: FanState,
@@ -717,7 +781,7 @@ impl AutoTune {
         tuner.set_envelope(envelope);
         Self {
             tuner,
-            profile: None,
+            choice: None,
             next_tick: None,
             continuous_ceiling_w: None,
             fan: FanState::default(),
@@ -728,9 +792,9 @@ impl AutoTune {
         }
     }
 
-    /// True once the profile search has locked onto a point.
+    /// True once the search (profile or target) has locked onto a point.
     pub(crate) fn is_locked(&self) -> bool {
-        self.profile.is_some() && self.tuner.phase() == TunePhase::Locked
+        self.choice.is_some() && self.tuner.phase() == TunePhase::Locked
     }
 
     /// Power cap (W) of the running profile, PSU ceiling included.
@@ -764,14 +828,14 @@ impl AutoTune {
         let cap = self.tuner.temp_cap_c();
         match self.fan_target_override {
             Some(c) => c.min(cap - 2.0),
-            None => default_fan_target_c(self.profile, cap).min(cap - 2.0),
+            None => default_fan_target_c(self.profile(), cap).min(cap - 2.0),
         }
     }
 
     /// One fan-loop step; at most one harness write per tick. `temp_max_c`
     /// is the raw hottest-chip reading (`None`/<=0 = missing -> 100 %).
     pub(crate) fn fan_tick(&mut self, temp_max_c: Option<f32>) -> Option<AutoTuneCmd> {
-        if self.profile.is_none() {
+        if self.choice.is_none() {
             return None;
         }
         let cap = self.tuner.temp_cap_c();
@@ -783,16 +847,17 @@ impl AutoTune {
         fan_step(&mut self.fan, temp_max_c, cap, target, force).map(AutoTuneCmd::FanManual)
     }
 
-    /// The running profile's search memory (see [`SearchMemory`]).
+    /// The running profile's search memory (see [`SearchMemory`]). Target
+    /// mode keeps none: a different setpoint is a different search.
     pub(crate) fn memory(&self) -> Option<SearchMemory> {
-        self.profile?;
+        self.profile()?;
         self.tuner.memory()
     }
 
     /// Restores a saved search for the running profile. Call right after
     /// [`Self::enable`] on a boot-time resume.
     pub(crate) fn restore_memory(&mut self, mem: SearchMemory) {
-        if self.profile.is_some() {
+        if self.profile().is_some() {
             self.tuner.restore_memory(mem);
         }
     }
@@ -800,29 +865,57 @@ impl AutoTune {
     /// Starts the fan loop from the fan's current duty instead of 100 %.
     /// Call right after [`Self::enable`].
     pub(crate) fn seed_fan_duty(&mut self, current: Option<u8>) {
-        if self.profile.is_some() && self.fan.sent.is_none() {
+        if self.choice.is_some() && self.fan.sent.is_none() {
             self.fan = FanState::starting_at(current);
         }
     }
 
+    /// The running profile; `None` when off or in target mode.
     pub(crate) fn profile(&self) -> Option<TuneProfile> {
-        self.profile
+        match self.choice {
+            Some(TuneChoice::Profile(p)) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// The running target; `None` when off or in profile mode.
+    pub(crate) fn target(&self) -> Option<TuneTarget> {
+        match self.choice {
+            Some(TuneChoice::Target(t)) => Some(t),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn choice(&self) -> Option<TuneChoice> {
+        self.choice
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
-        self.profile.is_some()
+        self.choice.is_some()
     }
 
     /// A profile picked from the API/UI: a fresh search (no remembered best)
     /// and the profile's default fan target unless this request set one.
     pub(crate) fn pick_profile(&mut self, profile: TuneProfile, fan_target_c: Option<f32>) {
-        self.enable(profile);
+        self.pick(TuneChoice::Profile(profile), fan_target_c);
+    }
+
+    /// A profile or target picked from the API/UI (see [`Self::pick_profile`]).
+    pub(crate) fn pick(&mut self, choice: TuneChoice, fan_target_c: Option<f32>) {
+        self.enable_choice(choice);
         self.set_fan_target(fan_target_c);
     }
 
     pub(crate) fn enable(&mut self, profile: TuneProfile) {
-        self.tuner.enable_profile(profile);
-        self.profile = Some(profile);
+        self.enable_choice(TuneChoice::Profile(profile));
+    }
+
+    pub(crate) fn enable_choice(&mut self, choice: TuneChoice) {
+        match choice {
+            TuneChoice::Profile(p) => self.tuner.enable_profile(p),
+            TuneChoice::Target(t) => self.tuner.enable_target(t),
+        }
+        self.choice = Some(choice);
         self.next_tick = None;
         self.fan = FanState::default();
         self.fan_force_pending = false;
@@ -837,14 +930,14 @@ impl AutoTune {
         self.fan_force_pending = false;
         self.fan_restore_pending = false;
         self.tuner.disable();
-        self.profile = None;
+        self.choice = None;
         self.next_tick = None;
         restore
     }
 
     /// True when a tick is due (and arms the next one).
     pub(crate) fn tick_due(&mut self, now: std::time::Instant) -> bool {
-        if self.profile.is_none() {
+        if self.choice.is_none() {
             return false;
         }
         match self.next_tick {
@@ -893,18 +986,19 @@ impl AutoTune {
 
     pub(crate) fn publish(&self, setpoint: Option<TuneSetpoint>) {
         publish_status(AutoTuneStatus {
-            enabled: self.profile.is_some(),
-            profile: self.profile,
+            enabled: self.choice.is_some(),
+            profile: self.profile(),
+            target: self.target(),
             phase: Some(self.tuner.phase()),
             last_event: self.tuner.last_event().map(str::to_owned),
             setpoint,
-            fan_duty_percent: self.profile.and(self.fan.sent),
-            fan_target_c: self.profile.map(|_| self.fan_target_c()),
-            averaging_progress: self.profile.map(|_| {
+            fan_duty_percent: self.choice.and(self.fan.sent),
+            fan_target_c: self.choice.map(|_| self.fan_target_c()),
+            averaging_progress: self.choice.map(|_| {
                 let (ticks, needed) = self.tuner.averaging_progress();
                 AveragingProgress { ticks, needed }
             }),
-            continuous_ceiling_w: self.profile.and(self.continuous_ceiling_w),
+            continuous_ceiling_w: self.choice.and(self.continuous_ceiling_w),
             continuous: self.tuner.continuous(),
             events: self.events(),
             best: self.tuner.best_point().map(|(sp, j)| AutoTuneBest {
@@ -992,7 +1086,7 @@ mod tests {
     #[test]
     fn startup_exclusivity_prefers_auto_tune_and_autotune_hashrate() {
         assert!(startup_loop_allowed(None, None));
-        assert!(!startup_loop_allowed(Some(TuneProfile::Efficient), None));
+        assert!(!startup_loop_allowed(Some(TuneChoice::Profile(TuneProfile::Efficient)), None));
         assert!(!startup_loop_allowed(None, Some(4.0)));
     }
 
@@ -1325,13 +1419,13 @@ mod tests {
     #[test]
     fn auto_tune_directive_round_trips_with_fan_target() {
         let d = parse_auto_tune_directive("efficient;fan=72.5").unwrap();
-        assert_eq!(d, AutoTuneDirective { profile: Some(Some(TuneProfile::Efficient)), fan_target_c: Some(72.5), chip_tune: None, continuous: None });
+        assert_eq!(d, AutoTuneDirective { profile: Some(Some(TuneChoice::Profile(TuneProfile::Efficient))), fan_target_c: Some(72.5), chip_tune: None, continuous: None });
         let d = parse_auto_tune_directive("keep;fan=75").unwrap();
         assert_eq!(d, AutoTuneDirective { profile: None, fan_target_c: Some(75.0), chip_tune: None, continuous: None });
         assert_eq!(parse_auto_tune_directive("off").unwrap().profile, Some(None));
         assert!(parse_auto_tune_directive("off;fan=95").is_err());
         assert!(parse_auto_tune_directive("off;bogus=1").is_err());
-        for (p, f) in [(None, Some(70.0)), (Some(None), None), (Some(Some(TuneProfile::Quiet)), Some(65.0))] {
+        for (p, f) in [(None, Some(70.0)), (Some(None), None), (Some(Some(TuneChoice::Profile(TuneProfile::Quiet))), Some(65.0))] {
             let line = directive_for_request(p, f);
             let d = parse_auto_tune_directive(line.strip_prefix("auto_tune:").unwrap()).unwrap();
             assert_eq!((d.profile, d.fan_target_c), (p, f));
@@ -1409,5 +1503,74 @@ mod tests {
         // Slowly rising temperature (84.5 -> 84.7 C, dt = +0.2): holds duty instead of stepping down.
         assert_eq!(fan_step(&mut st, Some(84.7), 90.0, 86.0, false), None);
         assert_eq!(st.duty_percent(), 28);
+    }
+
+    // --- target mode -------------------------------------------------------
+
+    #[test]
+    fn request_target_wins_and_is_validated() {
+        let r: AutoTuneRequest =
+            serde_json::from_str(r#"{"profile":"balanced","target":{"axis":"power","value":115}}"#).unwrap();
+        assert!(r.validate().is_ok());
+        assert_eq!(r.profile_change(), Some(Some(TuneChoice::Target(TuneTarget::Power(115.0)))));
+        let r: AutoTuneRequest = serde_json::from_str(r#"{"target":{"axis":"hashrate","value":6.0}}"#).unwrap();
+        assert_eq!(r.profile_change(), Some(Some(TuneChoice::Target(TuneTarget::Hashrate(6.0)))));
+        for bad in [
+            r#"{"axis":"power","value":5}"#,
+            r#"{"axis":"power","value":141}"#,
+            r#"{"axis":"hashrate","value":0}"#,
+            r#"{"axis":"hashrate","value":40}"#,
+        ] {
+            let r: AutoTuneRequest = serde_json::from_str(&format!(r#"{{"target":{bad}}}"#)).unwrap();
+            assert!(r.validate().is_err(), "{bad}");
+        }
+        assert!(serde_json::from_str::<AutoTuneRequest>(r#"{"target":{"axis":"volts","value":1}}"#).is_err());
+    }
+
+    #[test]
+    fn target_choice_round_trips_through_directive_and_conf_text() {
+        for c in [
+            None,
+            Some(TuneChoice::Profile(TuneProfile::MaxHash)),
+            Some(TuneChoice::Target(TuneTarget::Power(115.0))),
+            Some(TuneChoice::Target(TuneTarget::Hashrate(6.25))),
+        ] {
+            assert_eq!(parse_choice(&choice_text(c)), Ok(c));
+            let line = directive_for_request(Some(c), Some(80.0));
+            let d = parse_auto_tune_directive(line.strip_prefix("auto_tune:").unwrap()).unwrap();
+            assert_eq!((d.profile, d.fan_target_c), (Some(c), Some(80.0)));
+        }
+        // Out of range or malformed targets are rejected, not clamped.
+        for bad in ["power:5", "power:nan", "hashrate:", "hashrate:99", "power:abc"] {
+            assert!(parse_choice(bad).is_err(), "{bad}");
+        }
+        // Older firmware reading the new text: not a profile -> treated as off.
+        assert!(parse_directive("power:115").is_err());
+    }
+
+    #[test]
+    fn wrapper_runs_a_target_without_profile_memory() {
+        let mut o = AutoTune::new();
+        o.enable(TuneProfile::Balanced);
+        assert_eq!(o.profile(), Some(TuneProfile::Balanced));
+        o.pick(TuneChoice::Target(TuneTarget::Power(115.0)), None);
+        assert!(o.is_enabled());
+        assert_eq!(o.profile(), None);
+        assert_eq!(o.target(), Some(TuneTarget::Power(115.0)));
+        // Target mode drives the fan loop like a profile does.
+        assert!(o.fan_tick(Some(70.0)).is_some());
+        // A target search is never saved as profile memory.
+        for _ in 0..AUTO_TUNE_SETTLE_CYCLES {
+            o.evaluate(&fan_metrics(60.0));
+        }
+        assert_eq!(o.memory(), None);
+        assert!(o.disable().is_some());
+        assert!(!o.is_enabled());
+        assert_eq!(o.target(), None);
+    }
+
+    #[test]
+    fn startup_exclusivity_includes_targets() {
+        assert!(!startup_loop_allowed(Some(TuneChoice::Target(TuneTarget::Hashrate(6.0))), None));
     }
 }
