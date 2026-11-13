@@ -1,5 +1,12 @@
 # Changelog
 
+## v5.0.8 (2026-11-13)
+- **Streaming OTA Firmware Upload (`mujina-miner/src/api/v0.rs`)**:
+  - `POST /api/v0/firmware/bundle` and `POST /api/v0/firmware/{target}` now stream the upload to `<live_path>.new` instead of buffering the whole body in RAM, fixing the out-of-memory kill of `mujina-minerd` on 94 MB Nano 3S boards during ~21.5 MB OTA uploads.
+  - Validates `\x7fELF` and `nano3s_ipc_` incrementally (including across chunk boundaries), rejects truncated streams and trailing bytes, `fsync`s staged files and the parent directory, and only renames once every section has staged successfully.
+  - A process-wide upload lock returns `409 CONFLICT` ("firmware update already in progress") for concurrent uploads so a retry cannot swap a partial `.new` over the live binary.
+  - Stale `*.new` files are unlinked before the free-space check and at daemon startup, so an interrupted upload no longer causes a false `507 INSUFFICIENT_STORAGE`.
+
 ## v5.0.7 (2026-11-12)
 - **Unified Web UI Navigation & Layout (`dashboard.html`, `led.html`, `firmware.html`, `info.html`, `pool.html`, `tuning.html`)**:
   - Standardized all six web pages onto the unified 10-item `.menubar` (`Dashboard`, `Power`, `Tuning`, `Fan`, `Fan Curve`, `Pool`, `LED`, `Firmware`, `Display`, `Info`) and `1120px` `.wrap` container so menus never disappear or shrink when switching tabs.
