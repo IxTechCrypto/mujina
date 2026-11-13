@@ -218,6 +218,11 @@ const FAN_RELEASE_HYSTERESIS_C: f32 = 2.0;
 /// within to count as "reached" and lock. A live power/hashrate reading
 /// jitters cycle to cycle, so an exact match would never latch.
 const TARGET_TOLERANCE_FRACTION: f32 = 0.02;
+/// Power target: the window-mean power is held between 3 % and 1 % under the
+/// target (e.g. 135.8-138.6 W for 140 W), so it uses nearly all of the watts
+/// the user set without the mean sitting on the safety trip.
+const POWER_TARGET_BAND_LOW: f32 = 0.03;
+const POWER_TARGET_BAND_HIGH: f32 = 0.01;
 /// Target mode: consecutive settled cycles pinned at a frequency limit
 /// (with the setpoint still unreached) before the target is declared
 /// unreachable. Matches the two-strikes pattern `pending_reject_mhz` uses
@@ -1332,17 +1337,26 @@ impl AutoTuner {
     fn evaluate_target(&mut self, m: &Metrics, target: TuneTarget) -> Option<TuneAction> {
         let env = self.envelope;
         let caps = self.caps();
-        let (target_value, current) = match target {
-            // A power target above the PSU ceiling can never be reached: the
-            // climb would breach the cap, back off and climb again forever.
-            // Aim just under the ceiling instead.
+        // Band the window mean must sit in. A power target is a ceiling the
+        // user chose (e.g. 80 % of the supply), so the mean holds 1-3 % UNDER
+        // it, never over; a target above the PSU ceiling means the ceiling.
+        // A hashrate target is held +/-2 %.
+        let (target_value, current, lo, hi) = match target {
             TuneTarget::Power(watts) => {
-                let reachable = self
-                    .power_ceiling_w
-                    .map_or(f32::INFINITY, |c| c - env.best_point_margin_w.max(1.0));
-                (watts.min(reachable), m.power_w)
+                let w = watts.min(self.power_ceiling_w.unwrap_or(f32::INFINITY));
+                (
+                    w,
+                    m.power_w,
+                    w * (1.0 - POWER_TARGET_BAND_LOW),
+                    w * (1.0 - POWER_TARGET_BAND_HIGH),
+                )
             }
-            TuneTarget::Hashrate(ths) => (ths, m.hashrate_ths),
+            TuneTarget::Hashrate(ths) => (
+                ths,
+                m.hashrate_ths,
+                ths * (1.0 - TARGET_TOLERANCE_FRACTION),
+                ths * (1.0 + TARGET_TOLERANCE_FRACTION),
+            ),
         };
 
         // Not usefully hashing yet: hold rather than judge a target against
@@ -1352,9 +1366,8 @@ impl AutoTuner {
             return None;
         }
 
-        let error = target_value - current;
-        let tolerance = (target_value.abs() * TARGET_TOLERANCE_FRACTION).max(f32::EPSILON);
-        let in_band = error.abs() <= tolerance;
+        let below = current < lo;
+        let in_band = !below && current <= hi;
         // Before the first voltage command this is the measured vout, which
         // droops below the setpoint; never record a point below the floor.
         let commanded_v = self.commanded_voltage(m).max(env.min_voltage_mv);
@@ -1373,7 +1386,7 @@ impl AutoTuner {
             // over the fail-rate limit, or (hashrate target) dropped hashrate
             // out of the band: revert it and never trim that low again.
             let undervolted = commanded_v + VOLT_TOLERANCE_MV < best.core_voltage_mv;
-            let lost_hash = matches!(target, TuneTarget::Hashrate(_)) && error > tolerance;
+            let lost_hash = matches!(target, TuneTarget::Hashrate(_)) && below;
             if same_clock
                 && undervolted
                 && (failing || lost_hash || efficiency > best_eff * (1.0 + IMPROVEMENT_MARGIN))
@@ -1449,7 +1462,26 @@ impl AutoTuner {
                 self.log_event(format!("fail rate over limit: raising voltage to {up} mV"), m);
                 return Some(TuneAction::SetVoltage(up));
             }
-            // No voltage left: this clock is too fast. Drop it and exclude it.
+            // No voltage left: this clock may be too fast. The first window
+            // after a boot or a change still averages warm-up samples, so
+            // re-measure once (two strikes, as for hashrate) before dropping
+            // and excluding the clock.
+            let confirmed = self
+                .pending_reject_mhz
+                .is_some_and(|p| (p - m.frequency_mhz).abs() <= FREQ_TOLERANCE_MHZ);
+            if !confirmed {
+                self.pending_reject_mhz = Some(m.frequency_mhz);
+                self.phase = TunePhase::Converging;
+                self.log_event(
+                    format!(
+                        "fail rate over limit at {:.0} MHz: re-measuring before lowering",
+                        m.frequency_mhz
+                    ),
+                    m,
+                );
+                return None;
+            }
+            self.pending_reject_mhz = None;
             let down = m.frequency_mhz - env.freq_step_mhz;
             if down >= env.min_freq_mhz {
                 self.probe_ceiling_mhz = self.probe_ceiling_mhz.min(m.frequency_mhz);
@@ -1504,7 +1536,7 @@ impl AutoTuner {
         } else {
             chip_max
         };
-        let step = if error > 0.0 { freq_step } else { -freq_step };
+        let step = if below { freq_step } else { -freq_step };
         let next = (m.frequency_mhz + step).clamp(min_freq, max_freq);
 
         // Below a power target but pinned under a clock found unstable: this
@@ -1512,7 +1544,7 @@ impl AutoTuner {
         // stably in the envelope. Lock it rather than call the target
         // unreachable.
         if matches!(target, TuneTarget::Power(_))
-            && error > 0.0
+            && below
             && max_freq < chip_max
             && (next - m.frequency_mhz).abs() <= FREQ_TOLERANCE_MHZ
         {
@@ -2019,8 +2051,9 @@ mod tests {
         let a1 = step_to_action(&mut t, &m(50.0, 12.0, 1.2, 525.0, 1150));
         assert_eq!(a1, Some(TuneAction::SetFrequency(550.0)));
         assert_eq!(t.phase, TunePhase::Converging);
-        // Within 2% tolerance of 15.0 W: locks, no further action.
-        let a2 = step_to_action(&mut t, &m(50.0, 14.9, 1.3, 550.0, 1150));
+        // 1-3 % under 15.0 W at the voltage floor: nothing left to trim, so it
+        // locks.
+        let a2 = step_to_action(&mut t, &m(50.0, 14.7, 1.3, 550.0, 1150));
         assert_eq!(a2, None);
         assert_eq!(t.phase, TunePhase::Locked);
     }
@@ -2890,15 +2923,15 @@ mod tests {
     #[test]
     fn nano_power_target_climbs_then_locks_under_an_unstable_clock() {
         let mut t = nano_target(TuneTarget::Power(115.0));
-        // In band: trim.
-        let a = step_to_action(&mut t, &tm(114.0, 5.5, 400.0, 3756, Some(3.0)));
+        // In band (111.55-113.85 W for 115 W): trim.
+        let a = step_to_action(&mut t, &tm(113.0, 5.5, 400.0, 3756, Some(3.0)));
         assert_eq!(a, Some(TuneAction::SetVoltage(3730)));
         // Trim freed watts (below band): climb.
         let a = step_to_action(&mut t, &tm(110.0, 5.5, 400.0, 3730, Some(3.0)));
         assert_eq!(a, Some(TuneAction::SetFrequency(410.0)));
         // 410 MHz hashes less: re-measure once, then revert and exclude.
-        assert_eq!(step_to_action(&mut t, &tm(114.0, 5.0, 410.0, 3730, Some(3.0))), None);
-        let a = step_to_action(&mut t, &tm(114.0, 5.0, 410.0, 3730, Some(3.0)));
+        assert_eq!(step_to_action(&mut t, &tm(113.0, 5.0, 410.0, 3730, Some(3.0))), None);
+        let a = step_to_action(&mut t, &tm(113.0, 5.0, 410.0, 3730, Some(3.0)));
         assert_eq!(a, Some(TuneAction::SetFrequency(400.0)));
         // Below band at 400, 410 excluded: lock here.
         let a = step_to_action(&mut t, &tm(110.0, 5.5, 400.0, 3730, Some(3.0)));
@@ -2911,17 +2944,44 @@ mod tests {
     }
 
     #[test]
-    fn nano_target_failing_at_max_voltage_drops_the_clock() {
+    fn nano_target_failing_at_max_voltage_drops_the_clock_on_the_second_window() {
         let mut t = nano_target(TuneTarget::Hashrate(6.0));
+        // One bad window (e.g. warm-up after boot) only re-measures.
+        assert_eq!(step_to_action(&mut t, &tm(110.0, 5.0, 400.0, 3800, Some(20.0))), None);
+        assert!(t.probe_ceiling_mhz > 440.0);
         let a = step_to_action(&mut t, &tm(110.0, 5.0, 400.0, 3800, Some(20.0)));
         assert_eq!(a, Some(TuneAction::SetFrequency(390.0)));
     }
 
     #[test]
+    fn nano_warm_up_window_does_not_exclude_the_top_clock() {
+        // .52 on 2026-11-13: the first post-boot window averaged warm-up
+        // samples (high fail, low hashrate) at the max clock and voltage.
+        let mut t = nano_target(TuneTarget::Power(140.0));
+        assert_eq!(step_to_action(&mut t, &tm(118.0, 1.9, 440.0, 3800, Some(30.0))), None);
+        // Next window is healthy: still below 140 W, already at the top
+        // clock -> holds there instead of dropping it.
+        assert_eq!(step_to_action(&mut t, &tm(122.0, 5.9, 440.0, 3800, Some(3.0))), None);
+        assert!(t.probe_ceiling_mhz > 440.0);
+        assert_ne!(t.phase, TunePhase::Locked);
+    }
+
+    #[test]
+    fn nano_power_target_holds_one_to_three_percent_under_the_set_watts() {
+        let mut t = nano_target(TuneTarget::Power(140.0));
+        // 139.5 W is over 99 % of 140: step down.
+        let a = step_to_action(&mut t, &tm(139.5, 6.5, 400.0, 3756, Some(3.0)));
+        assert_eq!(a, Some(TuneAction::SetFrequency(390.0)));
+        // 137 W sits in 135.8-138.6: hold and trim.
+        let a = step_to_action(&mut t, &tm(137.0, 6.4, 390.0, 3756, Some(3.0)));
+        assert_eq!(a, Some(TuneAction::SetVoltage(3730)));
+    }
+
+    #[test]
     fn nano_power_target_above_the_psu_ceiling_settles_under_it() {
-        // 115 W asked, 112 W PSU ceiling: aim at 109 W (ceiling - 3 W margin),
-        // so 109 W is in band and the tuner trims instead of climbing into
-        // the cap and backing off forever.
+        // 115 W asked, 112 W PSU ceiling: the ceiling is the target, so
+        // 108.6-110.9 W is in band and the tuner trims instead of climbing
+        // into the cap and backing off forever.
         let mut t = AutoTuner::default();
         t.set_envelope(TuneEnvelope { best_point_margin_w: 3.0, ..nano_env() });
         t.set_power_ceiling(Some(112.0));

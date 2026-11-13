@@ -2661,8 +2661,8 @@ function setTargetAxis(axis) {
     ? 'Reaches the hashrate, then trims core voltage for the best J/TH while holding it.'
     : 'Climbs to the most hashrate that fits in this whole-board power, trimming voltage to make room.'
       + (PSU_CEILING_W != null
-        ? ' Tuner power ceiling ' + PSU_CEILING_W.toFixed(0) + ' W (from Power Delivery): a target near or above it settles about '
-          + Math.max(0, PSU_CEILING_W - 3).toFixed(0) + ' W.'
+        ? ' The 5-minute average holds 1–3 % under the value. Power ceiling ' + PSU_CEILING_W.toFixed(0)
+          + ' W (from Power Delivery); a higher target runs at the ceiling.'
         : '');
 }
 function syncTargetMode() {

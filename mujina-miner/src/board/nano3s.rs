@@ -1273,11 +1273,8 @@ pub(crate) fn read_psu_status() -> (Option<f64>, Option<bool>, Option<f64>, Opti
     let detected_ceiling_w = bus_v.map(pd_ceiling_w_for_voltage).filter(|w| w.is_finite());
     let override_max_w = load_psu_override_w();
     let effective_ceiling_w = if let Some(override_w) = override_max_w.filter(|w| w.is_finite() && *w > 0.0) {
-        // Explicit power ceiling override (e.g. 130W Aggressive, 140W Mean
-        // Well). Reported as the tuner's continuous ceiling, the same meaning
-        // as the PD branch below: the safety trip sits at the override and the
-        // tuner stays AUTO_TUNE_POWER_MARGIN_W under it.
-        override_w.clamp(40.0, 140.0) - auto_tune::AUTO_TUNE_POWER_MARGIN_W as f64
+        // Explicit continuous power ceiling override (e.g. 130W Aggressive, 140W Mean Well)
+        override_w.clamp(40.0, 140.0)
     } else {
         detected_ceiling_w
             .map(|w| (w * auto_tune::PD_CONTINUOUS_FRACTION).min(POWER_TARGET_SAFETY_W - PD_CEILING_MARGIN_W))
@@ -3339,10 +3336,10 @@ fn run_worker(
             // Only ever tightens the existing POWER_TARGET_SAFETY_W
             // trip, never loosens it.
             let (tuner_power_ceiling_w, effective_safety_w) = if let Some(override_w) = psu_override_max_w {
-                // Same margin as the PD path (auto_tune_power_ceiling): the
-                // tuner backs off before the safety trip at `safety` fires.
+                // The override is the user's chosen board ceiling: the tuner may
+                // use all of it (a power target holds its mean 1-3 % under).
+                let ceiling = (override_w as f32).clamp(40.0, 140.0);
                 let safety = override_w.clamp(40.0, 140.0);
-                let ceiling = (safety as f32 - auto_tune::AUTO_TUNE_POWER_MARGIN_W).max(0.0);
                 (ceiling, safety)
             } else {
                 let pd_contract = pd_ceiling_w_for_voltage(last_bus_v);
