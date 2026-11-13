@@ -43,6 +43,8 @@ impl Daemon {
 
     /// Run the daemon until shutdown is requested.
     pub async fn run(self) -> anyhow::Result<()> {
+        crate::api::cleanup_stale_staged_firmware();
+
         // Create channels for component communication. Each transport gets its
         // own event channel; the backplane waits for one enumeration completion
         // per channel.

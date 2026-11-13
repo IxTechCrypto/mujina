@@ -13,3 +13,4 @@ mod v0;
 
 pub use registry::BoardRegistration;
 pub use server::{ApiConfig, serve};
+pub(crate) use v0::cleanup_stale_staged_firmware;

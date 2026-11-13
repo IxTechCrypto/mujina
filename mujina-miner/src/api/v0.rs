@@ -5,10 +5,14 @@
 
 use axum::{
     Json,
-    body::Bytes,
+    body::Body,
     extract::{DefaultBodyLimit, Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header::CONTENT_LENGTH},
 };
+use bytes::{Buf, Bytes};
+use futures::StreamExt;
+use std::io::Write;
+use std::path::{Path as FsPath, PathBuf};
 use std::time::Duration;
 
 use tokio::sync::oneshot;
@@ -1178,19 +1182,52 @@ async fn post_reboot() -> StatusCode {
 
 /// Live path this binary is actually deployed to, and its holding
 /// filesystem -- used for the pre-write free-space check.
-fn firmware_target_path(target: &str) -> Option<(&'static str, &'static str)> {
+fn firmware_target_path(target: &str) -> Option<(PathBuf, PathBuf)> {
     match target {
-        "mujina-minerd" => Some(("/data/mujina-minerd", "/data")),
-        "harness" => Some(("/mntapp/release/linux/app/mujina_test_harness", "/mntapp")),
+        "mujina-minerd" => Some((PathBuf::from("/data/mujina-minerd"), PathBuf::from("/data"))),
+        "harness" => Some((
+            PathBuf::from("/mntapp/release/linux/app/mujina_test_harness"),
+            PathBuf::from("/mntapp"),
+        )),
         _ => None,
     }
+}
+
+/// Remove any orphaned `<live_path>.new` staging files left behind by an
+/// interrupted or OOM-killed OTA upload so they don't consume `/data` or
+/// `/mntapp` space on subsequent boots.
+pub(crate) fn cleanup_stale_staged_firmware() {
+    for target in ["mujina-minerd", "harness"] {
+        if let Some((live_path, _)) = firmware_target_path(target) {
+            let staged_path = staged_firmware_path(&live_path);
+            match std::fs::remove_file(&staged_path) {
+                Ok(()) => {
+                    tracing::info!(path = %staged_path.display(), "Removed stale staged firmware file");
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(
+                        path = %staged_path.display(),
+                        error = %e,
+                        "Failed to remove stale staged firmware file"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn staged_firmware_path(live_path: &FsPath) -> PathBuf {
+    let mut s = live_path.as_os_str().to_os_string();
+    s.push(".new");
+    PathBuf::from(s)
 }
 
 /// Free space on `mount_point`, in bytes, via `df -k` -- no new crate
 /// dependency, consistent with this codebase's existing pattern of
 /// shelling out to system tools (i2cset, reboot, etc.) for one-off system
 /// queries rather than linking libc/statvfs directly.
-fn free_space_bytes(mount_point: &str) -> Option<u64> {
+fn free_space_bytes(mount_point: &FsPath) -> Option<u64> {
     let out = std::process::Command::new("df").arg("-k").arg(mount_point).output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let fields: Vec<&str> = text.lines().nth(1)?.split_whitespace().collect();
@@ -1198,17 +1235,327 @@ fn free_space_bytes(mount_point: &str) -> Option<u64> {
     fields.get(3)?.parse::<u64>().ok().map(|kb| kb * 1024)
 }
 
+/// Drop guard that unlinks any staged `<live_path>.new` files if an upload
+/// aborts or returns an error before all sections are swapped into place.
+struct StagedCleanupGuard {
+    paths: Vec<PathBuf>,
+    active: bool,
+}
+
+impl StagedCleanupGuard {
+    fn new() -> Self {
+        Self {
+            paths: Vec::new(),
+            active: true,
+        }
+    }
+
+    fn track(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+
+    fn defuse(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for StagedCleanupGuard {
+    fn drop(&mut self) {
+        if self.active {
+            for path in &self.paths {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// Incremental byte stream reader over `axum::body::Body::into_data_stream()`
+/// that never buffers the entire upload in RAM.
+struct StreamReader<S> {
+    stream: S,
+    current: Bytes,
+}
+
+impl<S, E> StreamReader<S>
+where
+    S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    fn new(stream: S) -> Self {
+        Self {
+            stream,
+            current: Bytes::new(),
+        }
+    }
+
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>, (StatusCode, String)> {
+        if !self.current.is_empty() {
+            return Ok(Some(std::mem::take(&mut self.current)));
+        }
+        while let Some(res) = self.stream.next().await {
+            let chunk = res.map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("malformed upload: stream read error: {e}"),
+                )
+            })?;
+            if !chunk.is_empty() {
+                return Ok(Some(chunk));
+            }
+        }
+        Ok(None)
+    }
+
+    fn push_back(&mut self, rest: Bytes) {
+        if !rest.is_empty() {
+            debug_assert!(self.current.is_empty());
+            self.current = rest;
+        }
+    }
+
+    /// Fill `buf` completely from the stream, returning `Ok(false)` if EOF is
+    /// reached before `buf` is full.
+    async fn read_exact_or_eof(&mut self, buf: &mut [u8]) -> Result<bool, (StatusCode, String)> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            let Some(mut chunk) = self.next_chunk().await? else {
+                return Ok(false);
+            };
+            let take = (buf.len() - filled).min(chunk.len());
+            buf[filled..filled + take].copy_from_slice(&chunk[..take]);
+            chunk.advance(take);
+            if !chunk.is_empty() {
+                self.push_back(chunk);
+            }
+            filled += take;
+        }
+        Ok(true)
+    }
+}
+
+/// Streaming validator for a single firmware ELF binary: verifies `\x7fELF` on
+/// the first 4 bytes and, for `mujina-minerd`, scans for `nano3s_ipc_` across
+/// arbitrary chunk boundaries using a 10-byte rolling tail.
+struct SectionValidator<'a> {
+    target: &'a str,
+    elf_header: [u8; 4],
+    elf_len: usize,
+    check_nano3s_ipc: bool,
+    found_ipc: bool,
+    tail: [u8; 10],
+    tail_len: usize,
+}
+
+impl<'a> SectionValidator<'a> {
+    const IPC_NEEDLE: &'static [u8] = b"nano3s_ipc_";
+    const TAIL_CAP: usize = 10; // IPC_NEEDLE.len() - 1
+
+    fn new(target: &'a str) -> Self {
+        Self {
+            target,
+            elf_header: [0; 4],
+            elf_len: 0,
+            check_nano3s_ipc: target == "mujina-minerd",
+            found_ipc: false,
+            tail: [0; Self::TAIL_CAP],
+            tail_len: 0,
+        }
+    }
+
+    fn feed(&mut self, data: &[u8]) -> Result<(), (StatusCode, String)> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if self.elf_len < 4 {
+            let take = (4 - self.elf_len).min(data.len());
+            self.elf_header[self.elf_len..self.elf_len + take].copy_from_slice(&data[..take]);
+            self.elf_len += take;
+            if self.elf_len == 4 && &self.elf_header != b"\x7fELF" {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("{}: not an ELF binary (bad magic)", self.target),
+                ));
+            }
+        }
+
+        if self.check_nano3s_ipc && !self.found_ipc {
+            if self.tail_len > 0 {
+                let head_take = Self::TAIL_CAP.min(data.len());
+                let mut overlap = [0u8; Self::TAIL_CAP * 2];
+                overlap[..self.tail_len].copy_from_slice(&self.tail[..self.tail_len]);
+                overlap[self.tail_len..self.tail_len + head_take]
+                    .copy_from_slice(&data[..head_take]);
+                if overlap[..self.tail_len + head_take]
+                    .windows(Self::IPC_NEEDLE.len())
+                    .any(|w| w == Self::IPC_NEEDLE)
+                {
+                    self.found_ipc = true;
+                }
+            }
+
+            if !self.found_ipc && data.len() >= Self::IPC_NEEDLE.len() {
+                if data
+                    .windows(Self::IPC_NEEDLE.len())
+                    .any(|w| w == Self::IPC_NEEDLE)
+                {
+                    self.found_ipc = true;
+                }
+            }
+
+            if !self.found_ipc {
+                if data.len() >= Self::TAIL_CAP {
+                    self.tail.copy_from_slice(&data[data.len() - Self::TAIL_CAP..]);
+                    self.tail_len = Self::TAIL_CAP;
+                } else {
+                    let combined = self.tail_len + data.len();
+                    if combined > Self::TAIL_CAP {
+                        let drop = combined - Self::TAIL_CAP;
+                        self.tail.copy_within(drop..self.tail_len, 0);
+                        self.tail_len -= drop;
+                    }
+                    self.tail[self.tail_len..self.tail_len + data.len()].copy_from_slice(data);
+                    self.tail_len += data.len();
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), (StatusCode, String)> {
+        if self.elf_len < 4 || &self.elf_header != b"\x7fELF" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("{}: not an ELF binary (bad magic)", self.target),
+            ));
+        }
+        if self.check_nano3s_ipc && !self.found_ipc {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "{}: no nano3s_ipc_* symbols found in this binary -- it was very likely built \
+                     without the nano3s Cargo feature and would silently run with no board driver at all",
+                    self.target
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn check_free_space(
+    target: &str,
+    mount_point: &FsPath,
+    needed_upload_bytes: u64,
+    free_space: &(dyn Fn(&FsPath) -> Option<u64> + Sync),
+) -> Result<(), (StatusCode, String)> {
+    let needed = needed_upload_bytes + FIRMWARE_FREE_SPACE_MARGIN_BYTES;
+    match free_space(mount_point) {
+        Some(free) if free < needed => Err((
+            StatusCode::INSUFFICIENT_STORAGE,
+            format!(
+                "{target}: not enough free space on {}: {free} bytes free, need {needed} \
+                 (upload size + {FIRMWARE_FREE_SPACE_MARGIN_BYTES}-byte margin)",
+                mount_point.display()
+            ),
+        )),
+        Some(_) => Ok(()),
+        None => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{target}: couldn't determine free space on {}", mount_point.display()),
+        )),
+    }
+}
+
+/// Process-wide mutual exclusion for firmware uploads so concurrent requests
+/// (e.g. a user retry after client timeout, or a double-click) cannot unlink
+/// and overwrite `<live_path>.new` while another upload is staging or swapping.
+static FIRMWARE_UPLOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn finalize_staged_file(
+    target: &str,
+    mut file: std::fs::File,
+    staged_path: &FsPath,
+) -> Result<(), (StatusCode, String)> {
+    file.flush().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{target}: failed to flush {}: {e}", staged_path.display()),
+        )
+    })?;
+    file.sync_all().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{target}: failed to sync {}: {e}", staged_path.display()),
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(staged_path, std::fs::Permissions::from_mode(0o755)).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{target}: failed to chmod {}: {e}", staged_path.display()),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+async fn finalize_staged_file_async(
+    target: &'static str,
+    file: std::fs::File,
+    staged_path: PathBuf,
+) -> Result<(), (StatusCode, String)> {
+    tokio::task::spawn_blocking(move || finalize_staged_file(target, file, &staged_path))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{target}: finalize task failed: {e}"),
+            )
+        })?
+}
+
+async fn swap_staged_files_async(
+    pairs: Vec<(String, PathBuf, PathBuf)>,
+) -> Result<(), (StatusCode, String)> {
+    tokio::task::spawn_blocking(move || {
+        for (target, live_path, staged_path) in &pairs {
+            std::fs::rename(staged_path, live_path).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "{target}: staged but failed to swap in {}: {e}",
+                        live_path.display()
+                    ),
+                )
+            })?;
+            if let Some(parent) = live_path.parent()
+                && let Ok(dir) = std::fs::File::open(parent)
+            {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("swap task failed: {e}"),
+        )
+    })?
+}
+
 /// Upload and apply a new `mujina-minerd` or harness binary, then reboot.
 ///
 /// `target` is `mujina-minerd` or `harness`. Body is the raw ELF binary
-/// (`application/octet-stream`), no multipart wrapper. Validates ELF magic
-/// and, for `mujina-minerd` specifically, the presence of `nano3s_ipc_`
-/// symbol strings -- the same sanity check `build_mujina_minerd.sh` itself
-/// runs, catching a build that silently compiled out the `nano3s` Cargo
-/// feature (a real, previously-hit failure mode: the binary builds and
-/// runs, but the board driver is missing entirely). Writes to `<path>.new`
-/// first, checking free space beforehand so a swap never runs the target
-/// partition to 0 bytes free.
+/// (`application/octet-stream`), no multipart wrapper. Streams directly to
+/// `<path>.new` without buffering the upload in RAM, validating ELF magic and,
+/// for `mujina-minerd` specifically, the presence of `nano3s_ipc_` symbol
+/// strings -- the same sanity check `build_mujina_minerd.sh` itself runs,
+/// catching a build that silently compiled out the `nano3s` Cargo feature.
 ///
 /// One-step by design: on success, the binary is already swapped in when
 /// this responds, and a full device reboot is already in flight (not a
@@ -1236,88 +1583,141 @@ fn free_space_bytes(mount_point: &str) -> Option<u64> {
 )]
 async fn post_firmware_upload(
     Path(target): Path<String>,
-    body: Bytes,
+    headers: HeaderMap,
+    body: Body,
 ) -> Result<Json<FirmwareUploadResponse>, (StatusCode, String)> {
-    let live_path = validate_and_stage_firmware(&target, &body)?;
-    std::fs::rename(&format!("{live_path}.new"), &live_path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to swap in {live_path}: {e}")))?;
+    let content_length = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    handle_firmware_upload_with(
+        target,
+        content_length,
+        body,
+        &FIRMWARE_UPLOAD_LOCK,
+        &firmware_target_path,
+        &free_space_bytes,
+        schedule_reboot,
+    )
+    .await
+}
 
-    let size = body.len();
-    schedule_reboot();
+async fn handle_firmware_upload_with<F>(
+    target: String,
+    content_length: Option<u64>,
+    body: Body,
+    upload_lock: &tokio::sync::Mutex<()>,
+    resolve_target: &(dyn Fn(&str) -> Option<(PathBuf, PathBuf)> + Sync),
+    free_space: &(dyn Fn(&FsPath) -> Option<u64> + Sync),
+    on_reboot: F,
+) -> Result<Json<FirmwareUploadResponse>, (StatusCode, String)>
+where
+    F: FnOnce() + Send,
+{
+    let _upload_guard = upload_lock.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            "firmware update already in progress".to_string(),
+        )
+    })?;
+
+    let Some((live_path, mount_point)) = resolve_target(&target) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("unknown target {target:?} (want \"mujina-minerd\" or \"harness\")"),
+        ));
+    };
+
+    let staged_path = staged_firmware_path(&live_path);
+    // Unlink any stale `.new` BEFORE checking free space so a previous aborted
+    // or OOM-killed upload never causes a false 507 INSUFFICIENT_STORAGE.
+    let _ = std::fs::remove_file(&staged_path);
+
+    if let Some(len) = content_length {
+        if len < FIRMWARE_MIN_UPLOAD_BYTES as u64 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("{target}: upload too small ({len} bytes) -- looks empty or truncated"),
+            ));
+        }
+        if len > FIRMWARE_MAX_UPLOAD_BYTES as u64 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("{target}: upload too large ({len} bytes)"),
+            ));
+        }
+        check_free_space(&target, &mount_point, len, free_space)?;
+    } else {
+        check_free_space(&target, &mount_point, FIRMWARE_MIN_UPLOAD_BYTES as u64, free_space)?;
+    }
+
+    let mut guard = StagedCleanupGuard::new();
+    let mut file = std::fs::File::create(&staged_path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{target}: failed to create {}: {e}", staged_path.display()),
+        )
+    })?;
+    guard.track(staged_path.clone());
+
+    let mut reader = StreamReader::new(body.into_data_stream());
+    let mut validator = SectionValidator::new(&target);
+    let mut total_bytes: usize = 0;
+
+    while let Some(chunk) = reader.next_chunk().await? {
+        let next_total = total_bytes.saturating_add(chunk.len());
+        if next_total > FIRMWARE_MAX_UPLOAD_BYTES {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("{target}: upload too large (> {FIRMWARE_MAX_UPLOAD_BYTES} bytes)"),
+            ));
+        }
+        validator.feed(&chunk)?;
+        file.write_all(&chunk).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{target}: failed to write {}: {e}", staged_path.display()),
+            )
+        })?;
+        total_bytes = next_total;
+    }
+
+    if total_bytes < FIRMWARE_MIN_UPLOAD_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{target}: upload too small ({total_bytes} bytes) -- looks empty or truncated"),
+        ));
+    }
+    if let Some(expected) = content_length
+        && total_bytes as u64 != expected
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{target}: upload truncated ({total_bytes} of {expected} bytes)"),
+        ));
+    }
+    if content_length.is_none() {
+        check_free_space(&target, &mount_point, 0, free_space)?;
+    }
+
+    validator.finish()?;
+    let target_label: &'static str = if target == "mujina-minerd" {
+        "mujina-minerd"
+    } else {
+        "harness"
+    };
+    finalize_staged_file_async(target_label, file, staged_path.clone()).await?;
+    swap_staged_files_async(vec![(target.clone(), live_path, staged_path)]).await?;
+    guard.defuse();
+
+    on_reboot();
 
     Ok(Json(FirmwareUploadResponse {
         ok: true,
         target,
-        size,
+        size: total_bytes,
         detail: "swapped in, rebooting now".to_string(),
     }))
-}
-
-/// Validates `body` for `target` (unknown target, size bounds, ELF magic,
-/// and -- for `mujina-minerd` -- `nano3s_ipc_*` symbols) and free space on
-/// the target partition, then writes `body` to `<live_path>.new` (mode
-/// 0755). Does **not** rename it into place -- callers do that themselves
-/// once every binary in a batch has staged successfully, so a bundle
-/// upload can't apply the first binary and then fail on the second,
-/// leaving the pair mismatched. Returns the live path on success.
-fn validate_and_stage_firmware(target: &str, body: &[u8]) -> Result<String, (StatusCode, String)> {
-    let Some((live_path, mount_point)) = firmware_target_path(target) else {
-        return Err((StatusCode::BAD_REQUEST, format!("unknown target {target:?} (want \"mujina-minerd\" or \"harness\")")));
-    };
-
-    if body.len() < FIRMWARE_MIN_UPLOAD_BYTES {
-        return Err((StatusCode::BAD_REQUEST, format!("{target}: upload too small ({} bytes) -- looks empty or truncated", body.len())));
-    }
-    if body.len() > FIRMWARE_MAX_UPLOAD_BYTES {
-        return Err((StatusCode::BAD_REQUEST, format!("{target}: upload too large ({} bytes)", body.len())));
-    }
-    if body.len() < 4 || &body[0..4] != b"\x7fELF" {
-        return Err((StatusCode::BAD_REQUEST, format!("{target}: not an ELF binary (bad magic)")));
-    }
-    if target == "mujina-minerd" {
-        let has_nano3s_symbols = body.windows(b"nano3s_ipc_".len()).any(|w| w == b"nano3s_ipc_");
-        if !has_nano3s_symbols {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "{target}: no nano3s_ipc_* symbols found in this binary -- it was very likely built \
-                     without the nano3s Cargo feature and would silently run with no board driver at all"
-                ),
-            ));
-        }
-    }
-
-    let needed = body.len() as u64 + FIRMWARE_FREE_SPACE_MARGIN_BYTES;
-    match free_space_bytes(mount_point) {
-        Some(free) if free < needed => {
-            return Err((
-                StatusCode::INSUFFICIENT_STORAGE,
-                format!(
-                    "{target}: not enough free space on {mount_point}: {free} bytes free, need {needed} \
-                     (upload size + {FIRMWARE_FREE_SPACE_MARGIN_BYTES}-byte margin)"
-                ),
-            ));
-        }
-        Some(_) => {}
-        None => {
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{target}: couldn't determine free space on {mount_point}")));
-        }
-    }
-
-    let staged_path = format!("{live_path}.new");
-    std::fs::write(&staged_path, body).map_err(|e| {
-        let _ = std::fs::remove_file(&staged_path);
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("{target}: failed to write {staged_path}: {e}"))
-    })?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o755)).map_err(|e| {
-            let _ = std::fs::remove_file(&staged_path);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("{target}: failed to chmod {staged_path}: {e}"))
-        })?;
-    }
-
-    Ok(live_path.to_string())
 }
 
 fn trigger_system_reboot() {
@@ -1340,56 +1740,24 @@ fn schedule_reboot() {
     trigger_system_reboot();
 }
 
-/// Parses a `POST /firmware/bundle` body into its (up to 2) sections.
-///
-/// Format (chosen to avoid pulling in a tar/zip crate for two files):
-/// 8-byte magic `b"MJBUNDL1"`, then for each of mujina-minerd and harness
+/// Bundle format for `POST /firmware/bundle`:
+/// 8-byte magic `b"MJBUNDL1"`, then for each of `mujina-minerd` and `harness`
 /// in that fixed order: a 4-byte little-endian length followed by that
 /// many bytes (length 0 means "not included in this bundle" -- the
 /// bundle only needs to touch one binary if that's all the caller wants
 /// to change, while still going through the single-reboot bundle path).
 /// See `pack_firmware_bundle.py` for the matching packer.
-fn parse_firmware_bundle(body: &[u8]) -> Result<(Option<&[u8]>, Option<&[u8]>), (StatusCode, String)> {
-    const MAGIC: &[u8] = b"MJBUNDL1";
-    let bad = |msg: &str| (StatusCode::BAD_REQUEST, format!("malformed bundle: {msg}"));
-
-    if body.len() < MAGIC.len() || &body[..MAGIC.len()] != MAGIC {
-        return Err(bad("bad magic (expected \"MJBUNDL1\") -- build the bundle with pack_firmware_bundle.py, don't concatenate the binaries by hand"));
-    }
-    let mut cursor = MAGIC.len();
-    let mut sections = [None, None];
-    for section in sections.iter_mut() {
-        let Some(len_bytes) = body.get(cursor..cursor + 4) else {
-            return Err(bad("truncated -- missing a length field"));
-        };
-        let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
-        cursor += 4;
-        if len > 0 {
-            let Some(data) = body.get(cursor..cursor + len) else {
-                return Err(bad("truncated -- section length runs past end of file"));
-            };
-            *section = Some(data);
-            cursor += len;
-        }
-    }
-    let [mujina_minerd, harness] = sections;
-    if mujina_minerd.is_none() && harness.is_none() {
-        return Err(bad("both sections empty -- nothing to apply"));
-    }
-    Ok((mujina_minerd, harness))
-}
+const BUNDLE_MAGIC: &[u8; 8] = b"MJBUNDL1";
 
 /// Upload one file that updates mujina-minerd and/or the harness in a
 /// single reboot, instead of running the single-target endpoint twice
-/// (which would reboot twice -- once per upload). See
-/// `parse_firmware_bundle`'s doc comment for the file format and
-/// `pack_firmware_bundle.py` for the packer that builds one from your
-/// locally-built binaries.
+/// (which would reboot twice -- once per upload). See `pack_firmware_bundle.py`
+/// for the packer that builds one from locally-built binaries.
 ///
-/// Both included binaries are fully validated (same checks as the
-/// single-target endpoint) and staged to `<path>.new` *before* either is
-/// renamed into place, so a bad second binary can't leave the pair
-/// mismatched -- either both apply or neither does.
+/// Both included binaries are streamed directly to `<path>.new`, validated
+/// incrementally (same checks as the single-target endpoint), and synced
+/// *before* either is renamed into place, so a bad second binary can't leave
+/// the pair mismatched -- either both apply or neither does.
 #[utoipa::path(
     post,
     path = "/firmware/bundle",
@@ -1402,32 +1770,138 @@ fn parse_firmware_bundle(body: &[u8]) -> Result<(Option<&[u8]>, Option<&[u8]>), 
         (status = INTERNAL_SERVER_ERROR, description = "Write, chmod, or rename failed"),
     ),
 )]
-async fn post_firmware_bundle(body: Bytes) -> Result<Json<FirmwareBundleResponse>, (StatusCode, String)> {
-    let (mujina_minerd, harness) = parse_firmware_bundle(&body)?;
+async fn post_firmware_bundle(body: Body) -> Result<Json<FirmwareBundleResponse>, (StatusCode, String)> {
+    handle_firmware_bundle_with(
+        body,
+        &FIRMWARE_UPLOAD_LOCK,
+        &firmware_target_path,
+        &free_space_bytes,
+        schedule_reboot,
+    )
+    .await
+}
 
-    // Validate + stage everything first; only rename (apply) once every
-    // included section has staged successfully.
-    let mut staged: Vec<&'static str> = Vec::new();
-    if let Some(data) = mujina_minerd {
-        validate_and_stage_firmware("mujina-minerd", data)?;
-        staged.push("mujina-minerd");
-    }
-    if let Some(data) = harness {
-        validate_and_stage_firmware("harness", data)?;
-        staged.push("harness");
+async fn handle_firmware_bundle_with<F>(
+    body: Body,
+    upload_lock: &tokio::sync::Mutex<()>,
+    resolve_target: &(dyn Fn(&str) -> Option<(PathBuf, PathBuf)> + Sync),
+    free_space: &(dyn Fn(&FsPath) -> Option<u64> + Sync),
+    on_reboot: F,
+) -> Result<Json<FirmwareBundleResponse>, (StatusCode, String)>
+where
+    F: FnOnce() + Send,
+{
+    let _upload_guard = upload_lock.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            "firmware update already in progress".to_string(),
+        )
+    })?;
+
+    let bad = |msg: &str| (StatusCode::BAD_REQUEST, format!("malformed bundle: {msg}"));
+    let mut reader = StreamReader::new(body.into_data_stream());
+
+    let mut magic = [0u8; 8];
+    if !reader.read_exact_or_eof(&mut magic).await? || &magic != BUNDLE_MAGIC {
+        return Err(bad(
+            "bad magic (expected \"MJBUNDL1\") -- build the bundle with pack_firmware_bundle.py, don't concatenate the binaries by hand",
+        ));
     }
 
-    for target in &staged {
-        let (live_path, _) = firmware_target_path(target).expect("validated above");
-        std::fs::rename(&format!("{live_path}.new"), live_path)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{target}: staged but failed to swap in {live_path}: {e}")))?;
+    let mut guard = StagedCleanupGuard::new();
+    let mut staged: Vec<(&'static str, PathBuf, PathBuf)> = Vec::new();
+
+    for target in ["mujina-minerd", "harness"] {
+        let mut len_bytes = [0u8; 4];
+        if !reader.read_exact_or_eof(&mut len_bytes).await? {
+            return Err(bad("truncated -- missing a length field"));
+        }
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        if len == 0 {
+            continue;
+        }
+
+        if len < FIRMWARE_MIN_UPLOAD_BYTES {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("{target}: upload too small ({len} bytes) -- looks empty or truncated"),
+            ));
+        }
+        if len > FIRMWARE_MAX_UPLOAD_BYTES {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("{target}: upload too large ({len} bytes)"),
+            ));
+        }
+
+        let Some((live_path, mount_point)) = resolve_target(target) else {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unknown target {target:?}"),
+            ));
+        };
+        let staged_path = staged_firmware_path(&live_path);
+
+        // Unlink any stale `.new` BEFORE checking free space so a previous
+        // aborted upload doesn't cause a false 507 INSUFFICIENT_STORAGE.
+        let _ = std::fs::remove_file(&staged_path);
+        check_free_space(target, &mount_point, len as u64, free_space)?;
+
+        let mut file = std::fs::File::create(&staged_path).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{target}: failed to create {}: {e}", staged_path.display()),
+            )
+        })?;
+        guard.track(staged_path.clone());
+
+        let mut validator = SectionValidator::new(target);
+        let mut remaining = len;
+        while remaining > 0 {
+            let Some(mut chunk) = reader.next_chunk().await? else {
+                return Err(bad("truncated -- section length runs past end of file"));
+            };
+            let take = remaining.min(chunk.len());
+            let slice = &chunk[..take];
+            validator.feed(slice)?;
+            file.write_all(slice).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{target}: failed to write {}: {e}", staged_path.display()),
+                )
+            })?;
+            chunk.advance(take);
+            if !chunk.is_empty() {
+                reader.push_back(chunk);
+            }
+            remaining -= take;
+        }
+
+        validator.finish()?;
+        finalize_staged_file_async(target, file, staged_path.clone()).await?;
+        staged.push((target, live_path, staged_path));
     }
 
-    schedule_reboot();
+    if staged.is_empty() {
+        return Err(bad("both sections empty -- nothing to apply"));
+    }
+
+    if reader.next_chunk().await?.is_some() {
+        return Err(bad("trailing bytes after section 2"));
+    }
+
+    let swap_pairs = staged
+        .iter()
+        .map(|(target, live, staged_p)| ((*target).to_string(), live.clone(), staged_p.clone()))
+        .collect();
+    swap_staged_files_async(swap_pairs).await?;
+    guard.defuse();
+
+    on_reboot();
 
     Ok(Json(FirmwareBundleResponse {
         ok: true,
-        applied: staged.iter().map(|s| s.to_string()).collect(),
+        applied: staged.iter().map(|(target, _, _)| (*target).to_string()).collect(),
         detail: "swapped in, rebooting now".to_string(),
     }))
 }
@@ -1533,4 +2007,407 @@ async fn get_source(
         .cloned()
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestTempDir {
+        path: PathBuf,
+    }
+
+    impl TestTempDir {
+        fn new(label: &str) -> Self {
+            let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "mujina-v0-firmware-test-{}-{}-{id}",
+                std::process::id(),
+                label
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp test dir");
+            Self { path }
+        }
+
+        fn minerd_live(&self) -> PathBuf {
+            self.path.join("mujina-minerd")
+        }
+
+        fn harness_live(&self) -> PathBuf {
+            self.path.join("mujina_test_harness")
+        }
+
+        fn resolver(&self) -> impl Fn(&str) -> Option<(PathBuf, PathBuf)> + '_ {
+            move |target| match target {
+                "mujina-minerd" => Some((self.minerd_live(), self.path.clone())),
+                "harness" => Some((self.harness_live(), self.path.clone())),
+                _ => None,
+            }
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn make_elf(size: usize, marker: Option<(&[u8], usize)>) -> Vec<u8> {
+        assert!(size >= 4);
+        let mut buf = vec![0xAAu8; size];
+        buf[..4].copy_from_slice(b"\x7fELF");
+        if let Some((bytes, offset)) = marker {
+            buf[offset..offset + bytes.len()].copy_from_slice(bytes);
+        }
+        buf
+    }
+
+    fn make_bundle(minerd: Option<&[u8]>, harness: Option<&[u8]>) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(BUNDLE_MAGIC);
+        for sec in [minerd, harness] {
+            match sec {
+                Some(data) => {
+                    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                    out.extend_from_slice(data);
+                }
+                None => {
+                    out.extend_from_slice(&0u32.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    fn chunked_body(data: Vec<u8>, chunk_size: usize) -> Body {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = data
+            .chunks(chunk_size)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        Body::from_stream(futures::stream::iter(chunks))
+    }
+
+    fn split_at_offsets_body(data: &[u8], split_offsets: &[usize]) -> Body {
+        let mut chunks = Vec::new();
+        let mut prev = 0;
+        for &off in split_offsets {
+            if off > prev && off <= data.len() {
+                chunks.push(Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(
+                    &data[prev..off],
+                )));
+                prev = off;
+            }
+        }
+        if prev < data.len() {
+            chunks.push(Ok(Bytes::copy_from_slice(&data[prev..])));
+        }
+        Body::from_stream(futures::stream::iter(chunks))
+    }
+
+    #[tokio::test]
+    async fn valid_streaming_bundle_stages_and_swaps() {
+        let dir = TestTempDir::new("valid_bundle");
+        let minerd = make_elf(FIRMWARE_MIN_UPLOAD_BYTES, Some((b"nano3s_ipc_send", 1024)));
+        let harness = make_elf(FIRMWARE_MIN_UPLOAD_BYTES + 123, None);
+        let bundle = make_bundle(Some(&minerd), Some(&harness));
+
+        let rebooted = AtomicBool::new(false);
+        let res = handle_firmware_bundle_with(
+            chunked_body(bundle, 1024),
+            &tokio::sync::Mutex::new(()),
+            &dir.resolver(),
+            &|_| Some(256 * 1024 * 1024),
+            || rebooted.store(true, Ordering::SeqCst),
+        )
+        .await
+        .expect("valid bundle should succeed");
+
+        assert!(res.0.ok);
+        assert_eq!(res.0.applied, vec!["mujina-minerd", "harness"]);
+        assert!(rebooted.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read(dir.minerd_live()).unwrap(), minerd);
+        assert_eq!(std::fs::read(dir.harness_live()).unwrap(), harness);
+        assert!(!staged_firmware_path(&dir.minerd_live()).exists());
+        assert!(!staged_firmware_path(&dir.harness_live()).exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.minerd_live())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o755);
+        }
+    }
+
+    #[tokio::test]
+    async fn bundle_bad_magic_rejected() {
+        let dir = TestTempDir::new("bad_magic");
+        let mut bundle = make_bundle(None, Some(&make_elf(FIRMWARE_MIN_UPLOAD_BYTES, None)));
+        bundle[..8].copy_from_slice(b"BADMAGIC");
+
+        let rebooted = AtomicBool::new(false);
+        let (status, msg) = handle_firmware_bundle_with(
+            chunked_body(bundle, 512),
+            &tokio::sync::Mutex::new(()),
+            &dir.resolver(),
+            &|_| Some(256 * 1024 * 1024),
+            || rebooted.store(true, Ordering::SeqCst),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("bad magic"), "unexpected msg: {msg}");
+        assert!(!rebooted.load(Ordering::SeqCst));
+        assert!(!dir.harness_live().exists());
+    }
+
+    #[tokio::test]
+    async fn bundle_truncated_stream_cleans_up_all_staged_files() {
+        let dir = TestTempDir::new("truncated");
+        let minerd = make_elf(FIRMWARE_MIN_UPLOAD_BYTES, Some((b"nano3s_ipc_send", 512)));
+        let harness = make_elf(FIRMWARE_MIN_UPLOAD_BYTES + 1000, None);
+        let mut bundle = make_bundle(Some(&minerd), Some(&harness));
+        // Truncate inside section 2 after section 1 has already been staged.
+        bundle.truncate(bundle.len() - 500);
+
+        let rebooted = AtomicBool::new(false);
+        let (status, msg) = handle_firmware_bundle_with(
+            chunked_body(bundle, 4096),
+            &tokio::sync::Mutex::new(()),
+            &dir.resolver(),
+            &|_| Some(256 * 1024 * 1024),
+            || rebooted.store(true, Ordering::SeqCst),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("truncated"), "unexpected msg: {msg}");
+        assert!(!rebooted.load(Ordering::SeqCst));
+        assert!(!dir.minerd_live().exists());
+        assert!(!dir.harness_live().exists());
+        assert!(!staged_firmware_path(&dir.minerd_live()).exists());
+        assert!(!staged_firmware_path(&dir.harness_live()).exists());
+    }
+
+    #[tokio::test]
+    async fn bundle_trailing_bytes_rejected_and_cleaned_up() {
+        let dir = TestTempDir::new("trailing");
+        let minerd = make_elf(FIRMWARE_MIN_UPLOAD_BYTES, Some((b"nano3s_ipc_send", 512)));
+        let harness = make_elf(FIRMWARE_MIN_UPLOAD_BYTES, None);
+        let mut bundle = make_bundle(Some(&minerd), Some(&harness));
+        bundle.extend_from_slice(b"EXTRA_TRAILING_BYTES");
+
+        let rebooted = AtomicBool::new(false);
+        let (status, msg) = handle_firmware_bundle_with(
+            chunked_body(bundle, 4096),
+            &tokio::sync::Mutex::new(()),
+            &dir.resolver(),
+            &|_| Some(256 * 1024 * 1024),
+            || rebooted.store(true, Ordering::SeqCst),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("trailing bytes"), "unexpected msg: {msg}");
+        assert!(!rebooted.load(Ordering::SeqCst));
+        assert!(!dir.minerd_live().exists());
+        assert!(!dir.harness_live().exists());
+        assert!(!staged_firmware_path(&dir.minerd_live()).exists());
+        assert!(!staged_firmware_path(&dir.harness_live()).exists());
+    }
+
+    #[tokio::test]
+    async fn bundle_missing_nano3s_ipc_rejected() {
+        let dir = TestTempDir::new("missing_ipc");
+        let minerd = make_elf(FIRMWARE_MIN_UPLOAD_BYTES, None);
+        let bundle = make_bundle(Some(&minerd), None);
+
+        let rebooted = AtomicBool::new(false);
+        let (status, msg) = handle_firmware_bundle_with(
+            chunked_body(bundle, 4096),
+            &tokio::sync::Mutex::new(()),
+            &dir.resolver(),
+            &|_| Some(256 * 1024 * 1024),
+            || rebooted.store(true, Ordering::SeqCst),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("nano3s_ipc_"), "unexpected msg: {msg}");
+        assert!(!rebooted.load(Ordering::SeqCst));
+        assert!(!staged_firmware_path(&dir.minerd_live()).exists());
+    }
+
+    #[tokio::test]
+    async fn bundle_nano3s_ipc_split_across_chunk_boundaries() {
+        let dir = TestTempDir::new("split_ipc");
+        // Place "nano3s_ipc_" near the middle and split right inside it,
+        // plus test 1-byte / 3-byte splits around the symbol.
+        let sym_offset = 1000;
+        let minerd = make_elf(FIRMWARE_MIN_UPLOAD_BYTES, Some((b"nano3s_ipc_init", sym_offset)));
+        let bundle = make_bundle(Some(&minerd), None);
+        // Bundle header is 8 (magic) + 4 (len) = 12 bytes before section 1.
+        let abs_sym = 12 + sym_offset;
+        let body = split_at_offsets_body(
+            &bundle,
+            &[
+                3,
+                10,
+                abs_sym - 2,
+                abs_sym + 4, // splits "nano" | "3s_ipc_init"
+                abs_sym + 7, // splits "3s_" | "ipc_init"
+                abs_sym + 9, // splits "ip" | "c_init"
+            ],
+        );
+
+        let rebooted = AtomicBool::new(false);
+        let res = handle_firmware_bundle_with(
+            body,
+            &tokio::sync::Mutex::new(()),
+            &dir.resolver(),
+            &|_| Some(256 * 1024 * 1024),
+            || rebooted.store(true, Ordering::SeqCst),
+        )
+        .await
+        .expect("split nano3s_ipc_ across chunks should still be detected");
+
+        assert!(res.0.ok);
+        assert_eq!(res.0.applied, vec!["mujina-minerd"]);
+        assert!(rebooted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn bundle_unlinks_stale_new_before_free_space_check() {
+        let dir = TestTempDir::new("stale_new");
+        let stale_path = staged_firmware_path(&dir.minerd_live());
+        std::fs::write(&stale_path, vec![0u8; 1024]).unwrap();
+        assert!(stale_path.exists());
+
+        let minerd = make_elf(FIRMWARE_MIN_UPLOAD_BYTES, Some((b"nano3s_ipc_send", 512)));
+        let bundle = make_bundle(Some(&minerd), None);
+
+        let rebooted = AtomicBool::new(false);
+        let res = handle_firmware_bundle_with(
+            chunked_body(bundle, 4096),
+            &tokio::sync::Mutex::new(()),
+            &dir.resolver(),
+            &|_| {
+                if stale_path.exists() {
+                    // Simulate /data being too full until the orphaned .new is unlinked.
+                    Some(1024)
+                } else {
+                    Some(FIRMWARE_MIN_UPLOAD_BYTES as u64 + FIRMWARE_FREE_SPACE_MARGIN_BYTES)
+                }
+            },
+            || rebooted.store(true, Ordering::SeqCst),
+        )
+        .await
+        .expect("stale .new should be unlinked before free_space check");
+
+        assert!(res.0.ok);
+        assert!(rebooted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn single_upload_streams_and_rejects_bad_elf_early() {
+        let dir = TestTempDir::new("single_upload");
+        let minerd = make_elf(FIRMWARE_MIN_UPLOAD_BYTES, Some((b"nano3s_ipc_send", 512)));
+
+        let rebooted = AtomicBool::new(false);
+        let res = handle_firmware_upload_with(
+            "mujina-minerd".to_string(),
+            None, // chunked upload without Content-Length
+            chunked_body(minerd.clone(), 1024),
+            &tokio::sync::Mutex::new(()),
+            &dir.resolver(),
+            &|_| Some(256 * 1024 * 1024),
+            || rebooted.store(true, Ordering::SeqCst),
+        )
+        .await
+        .expect("single upload without Content-Length should succeed");
+
+        assert!(res.0.ok);
+        assert_eq!(res.0.size, minerd.len());
+        assert!(rebooted.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read(dir.minerd_live()).unwrap(), minerd);
+
+        // Bad ELF magic should fail and clean up .new.
+        let mut bad = make_elf(FIRMWARE_MIN_UPLOAD_BYTES, Some((b"nano3s_ipc_send", 512)));
+        bad[..4].copy_from_slice(b"NOPE");
+        let (status, msg) = handle_firmware_upload_with(
+            "mujina-minerd".to_string(),
+            Some(bad.len() as u64),
+            chunked_body(bad, 1024),
+            &tokio::sync::Mutex::new(()),
+            &dir.resolver(),
+            &|_| Some(256 * 1024 * 1024),
+            || {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("not an ELF binary"), "unexpected msg: {msg}");
+        assert!(!staged_firmware_path(&dir.minerd_live()).exists());
+    }
+
+    #[tokio::test]
+    async fn concurrent_uploads_return_409_conflict() {
+        let dir = TestTempDir::new("conflict_409");
+        let lock = tokio::sync::Mutex::new(());
+        let minerd = make_elf(FIRMWARE_MIN_UPLOAD_BYTES, Some((b"nano3s_ipc_send", 512)));
+        let bundle = make_bundle(Some(&minerd), None);
+
+        {
+            let _held = lock.try_lock().expect("lock should start unlocked");
+
+            let (status, msg) = handle_firmware_bundle_with(
+                chunked_body(bundle.clone(), 1024),
+                &lock,
+                &dir.resolver(),
+                &|_| Some(256 * 1024 * 1024),
+                || {},
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert!(msg.contains("already in progress"), "unexpected msg: {msg}");
+
+            let (status2, msg2) = handle_firmware_upload_with(
+                "mujina-minerd".to_string(),
+                Some(minerd.len() as u64),
+                chunked_body(minerd.clone(), 1024),
+                &lock,
+                &dir.resolver(),
+                &|_| Some(256 * 1024 * 1024),
+                || {},
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(status2, StatusCode::CONFLICT);
+            assert!(msg2.contains("already in progress"), "unexpected msg: {msg2}");
+        }
+
+        // Once the first upload finishes and drops the guard, the next upload succeeds.
+        let res = handle_firmware_bundle_with(
+            chunked_body(bundle, 1024),
+            &lock,
+            &dir.resolver(),
+            &|_| Some(256 * 1024 * 1024),
+            || {},
+        )
+        .await
+        .expect("upload after lock release should succeed");
+        assert!(res.0.ok);
+    }
 }
