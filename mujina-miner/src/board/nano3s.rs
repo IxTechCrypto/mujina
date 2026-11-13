@@ -3747,16 +3747,11 @@ fn run_worker(
                     // Auto-engage: if AutoTune is enabled (either locked or continuous dynamic tuning is active),
                     // operating thermals have settled, and chip tuning has not been explicitly disabled,
                     // automatically instantiate the per-chip tuner if absent.
-                    // Target mode: only while the target tuner is locked. Its
-                    // own steps (trim, climb) would otherwise move the base
-                    // point under every per-chip trial; any such step unlocks
-                    // it and interrupts the trial (chip_base check below).
-                    // Profile mode: locked, or continuous tuning on.
-                    let chip_tune_allowed = if auto_tuner.target().is_some() {
-                        auto_tuner.is_locked()
-                    } else {
-                        auto_tuner.is_locked() || (auto_tuner.is_enabled() && persisted_tuning.continuous)
-                    };
+                    // Profiles and targets alike: once the tuner has locked, or
+                    // all the time with continuous tuning on (Grant: continuous
+                    // means "find the best per chip"). A tuner step that moves
+                    // the base point interrupts the trial (chip_base below).
+                    let chip_tune_allowed = auto_tuner.is_locked() || (auto_tuner.is_enabled() && persisted_tuning.continuous);
                     if chip_tuner.is_none() && chip_tune_allowed && persisted_tuning.chip_tune {
                         eprintln!("[nano3s] auto-engaging per-chip tuner (locked={} continuous={})", auto_tuner.is_locked(), persisted_tuning.continuous);
                         chip_tuner = Some(new_chip_tuner(auto_tuner.choice(), chip_offset_mhz));
