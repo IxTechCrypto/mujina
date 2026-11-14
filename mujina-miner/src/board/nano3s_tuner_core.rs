@@ -342,7 +342,9 @@ impl TuneMode {
                 seek_hash: false,
                 seek_efficiency: false,
                 continuous: false,
-                max_fail_rate_pct: env.max_fail_rate_pct,
+                // Like MaxHash, an aggressive hashrate target pushes chips to their
+                // frequency edge; allow up to 25% fail rate before stepping down.
+                max_fail_rate_pct: env.max_fail_rate_pct.map(|m| m.max(25.0)),
             },
         }
     }
@@ -2923,7 +2925,8 @@ mod tests {
         let mut t = nano_target(TuneTarget::Hashrate(6.0));
         step_to_action(&mut t, &tm(110.0, 6.0, 400.0, 3756, Some(3.0))); // -> 3730
         // Same hashrate and watts, but 15 % fails: unstable, revert.
-        let a = step_to_action(&mut t, &tm(108.0, 6.0, 400.0, 3730, Some(15.0)));
+                // Over 25% fail limit (e.g. 28%): unstable, revert.
+        let a = step_to_action(&mut t, &tm(108.0, 6.0, 400.0, 3730, Some(28.0)));
         assert_eq!(a, Some(TuneAction::SetVoltage(3756)));
     }
 
@@ -2954,9 +2957,10 @@ mod tests {
     fn nano_target_failing_at_max_voltage_drops_the_clock_on_the_second_window() {
         let mut t = nano_target(TuneTarget::Hashrate(6.0));
         // One bad window (e.g. warm-up after boot) only re-measures.
-        assert_eq!(step_to_action(&mut t, &tm(110.0, 5.0, 400.0, 3800, Some(20.0))), None);
+        // Over 25% fail rate (e.g. 28%): drops clock.
+        assert_eq!(step_to_action(&mut t, &tm(110.0, 5.0, 400.0, 3800, Some(28.0))), None);
         assert!(t.probe_ceiling_mhz > 440.0);
-        let a = step_to_action(&mut t, &tm(110.0, 5.0, 400.0, 3800, Some(20.0)));
+        let a = step_to_action(&mut t, &tm(110.0, 5.0, 400.0, 3800, Some(28.0)));
         assert_eq!(a, Some(TuneAction::SetFrequency(390.0)));
     }
 
