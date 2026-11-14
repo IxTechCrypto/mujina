@@ -2776,15 +2776,14 @@ async function applyOwner() {
     }
     const target = { axis: TARGET_AXIS, value: val }, tl = targetLabel(target);
     const cur = LAST_OWNER_STATUS && LAST_OWNER_STATUS.enabled && LAST_OWNER_STATUS.target;
-    const ttv = $('ownTemp').value, cont = $('ownContinuous').checked;
+    const cont = $('ownContinuous').checked;
     const contChanged = cont !== !!(LAST_OWNER_STATUS && LAST_OWNER_STATUS.continuous);
     const sameTarget = !!cur && cur.axis === target.axis && +cur.value === val;
-    if (sameTarget && ttv === '' && !contChanged) { setMsg('ownMsg', 'No changes to apply'); return; }
+    if (sameTarget && !contChanged) { setMsg('ownMsg', 'No changes to apply'); return; }
     // Only a new target restarts the search; temp/continuous alone are sent without it.
     if (!sameTarget && !confirm('Switch the auto tuner to ' + tl + '? This restarts the tuning search.')) return;
     const body = { board_name: name, continuous: cont };
     if (!sameTarget) body.target = target;
-    if (ttv !== '') body.chip_temp_target_c = +ttv;
     setMsg('ownMsg', 'Sending…');
     lockWrites();
     try {
