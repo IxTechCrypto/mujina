@@ -857,14 +857,23 @@ impl AutoTuner {
         None
     }
 
-    /// Target-mode convergence: step frequency toward the setpoint and hold
-    /// once within tolerance. Unlike the profile hill-climb this never
-    /// records a "best" to climb past -- it always compares the live
-    /// measurement directly against the fixed target value, matching the
-    /// same principle the profile search uses (judge against reality, not
-    /// an extrapolated table): the target itself is the only reference
-    /// point, and convergence is driven purely by live `m.power_w` /
-    /// `m.hashrate_ths`.
+    /// Target-mode convergence plus efficiency optimization.
+    ///
+    /// The clock is stepped toward the setpoint, judged against live
+    /// `m.power_w` / `m.hashrate_ths` (never an extrapolated table). Once
+    /// inside the tolerance band the tuner does not just hold: it trims core
+    /// voltage one step per settle window, keeping each trim only if J/TH did
+    /// not get worse (and, for a hashrate target, the hashrate stayed in the
+    /// band). A trim that hurts is reverted and recorded in `probe_floor_mv`
+    /// so the walk never retries it.
+    ///
+    /// - Hashrate target: the clock holds the target hashrate and the
+    ///   undervolt minimizes watts, i.e. best J/TH at that hashrate.
+    /// - Power target: each successful trim frees watts, which drops power
+    ///   below the band and lets the clock climb again, i.e. the most
+    ///   hashrate that fits inside the power envelope. A clock that loses
+    ///   hashrate on the way up (unstable at the trimmed voltage) is reverted
+    ///   and capped via `probe_ceiling_mhz`.
     fn evaluate_target(&mut self, m: &Metrics, target: TuneTarget) -> Option<TuneAction> {
         let (target_value, current) = match target {
             TuneTarget::Power(watts) => (watts, m.power_w),
@@ -880,29 +889,158 @@ impl AutoTuner {
 
         let error = target_value - current;
         let tolerance = (target_value.abs() * TARGET_TOLERANCE_FRACTION).max(f32::EPSILON);
+        let in_band = error.abs() <= tolerance;
+        let min_v = self.chip.map_or(MIN_VOLT_MV, |c| c.min_voltage_mv);
+        // Before the first voltage command this is the measured vout, which
+        // droops below the setpoint; never record a point below a known
+        // chip's floor.
+        let commanded_v = match self.chip {
+            Some(c) => self.commanded_voltage(m).max(c.min_voltage_mv),
+            None => self.commanded_voltage(m),
+        };
+        let efficiency = efficiency_j_th(m.power_w, m.hashrate_ths).unwrap_or(f32::INFINITY);
 
-        if error.abs() <= tolerance {
+        if let Some((best, best_hash, best_eff)) = self.best {
+            let same_clock = (m.frequency_mhz - best.frequency_mhz).abs() <= FREQ_TOLERANCE_MHZ;
+
+            // An undervolt below the recorded best that cost efficiency, or
+            // (hashrate target) dropped hashrate out of the band: revert it
+            // and never trim that low again.
+            let undervolted = commanded_v + VOLT_TOLERANCE_MV < best.core_voltage_mv;
+            let lost_hash = matches!(target, TuneTarget::Hashrate(_)) && error > tolerance;
+            if same_clock
+                && undervolted
+                && (efficiency > best_eff * (1.0 + IMPROVEMENT_MARGIN) || lost_hash)
+            {
+                self.probe_floor_mv = self.probe_floor_mv.max(commanded_v);
+                self.last_commanded_voltage_mv = Some(best.core_voltage_mv);
+                self.phase = TunePhase::Converging;
+                self.log_event(
+                    format!(
+                        "undervolt to {commanded_v} mV hurt: reverting to {} mV",
+                        best.core_voltage_mv
+                    ),
+                    m,
+                );
+                return Some(TuneAction::SetVoltage(best.core_voltage_mv));
+            }
+
+            // Power target: a higher clock that delivers less hashrate than
+            // the best point is unstable at this voltage. The windowed
+            // hashrate is noisy, so re-measure once (the same two-strike rule
+            // the profile climb uses) before going back and excluding it.
+            if matches!(target, TuneTarget::Power(_))
+                && m.frequency_mhz > best.frequency_mhz + FREQ_TOLERANCE_MHZ
+                && m.hashrate_ths < best_hash * (1.0 - IMPROVEMENT_MARGIN)
+            {
+                let confirmed = self
+                    .pending_reject_mhz
+                    .is_some_and(|p| (p - m.frequency_mhz).abs() <= FREQ_TOLERANCE_MHZ);
+                if !confirmed {
+                    self.pending_reject_mhz = Some(m.frequency_mhz);
+                    self.phase = TunePhase::Converging;
+                    self.log_event(
+                        format!(
+                            "{:.0} MHz hashing below best: re-measuring before excluding",
+                            m.frequency_mhz
+                        ),
+                        m,
+                    );
+                    return None;
+                }
+                self.pending_reject_mhz = None;
+                self.probe_ceiling_mhz = self.probe_ceiling_mhz.min(m.frequency_mhz);
+                self.phase = TunePhase::Converging;
+                self.log_event(
+                    format!(
+                        "{:.0} MHz lost hashrate: reverting to {:.0} MHz",
+                        m.frequency_mhz, best.frequency_mhz
+                    ),
+                    m,
+                );
+                return Some(TuneAction::SetFrequency(best.frequency_mhz));
+            }
+        }
+
+        let current_point = (
+            TuneSetpoint {
+                frequency_mhz: m.frequency_mhz,
+                core_voltage_mv: commanded_v,
+            },
+            m.hashrate_ths,
+            efficiency,
+        );
+
+        if in_band {
             self.stuck_at_limit_cycles = 0;
+            self.pending_reject_mhz = None;
+            // This point survived the checks above: it is the new reference.
+            self.best = Some(current_point);
+            let trimmed = commanded_v.saturating_sub(VOLT_STEP_MV);
+            if trimmed >= min_v && trimmed > self.probe_floor_mv {
+                self.last_commanded_voltage_mv = Some(trimmed);
+                self.phase = TunePhase::Seeking;
+                self.log_event(
+                    format!(
+                        "target held at {:.0} MHz: trimming voltage to {trimmed} mV",
+                        m.frequency_mhz
+                    ),
+                    m,
+                );
+                return Some(TuneAction::SetVoltage(trimmed));
+            }
             if self.phase != TunePhase::Locked {
                 self.phase = TunePhase::Locked;
                 self.log_event(
-                    format!("target reached: holding at {:.0} MHz", m.frequency_mhz),
+                    format!(
+                        "target reached: holding at {:.0} MHz, {commanded_v} mV",
+                        m.frequency_mhz
+                    ),
                     m,
                 );
             }
             return None;
         }
 
-        let (min_freq, max_freq) = self
+        let (min_freq, chip_max) = self
             .chip
             .map(|c| (c.min_freq_mhz, c.max_freq_mhz))
             .unwrap_or((MIN_FREQ_MHZ, MAX_FREQ_MHZ));
+        // A clock found unstable (power target) is excluded from the climb.
+        let max_freq = if self.probe_ceiling_mhz <= chip_max {
+            (self.probe_ceiling_mhz - FREQ_STEP_MHZ).max(min_freq)
+        } else {
+            chip_max
+        };
         let step = if error > 0.0 {
             FREQ_STEP_MHZ
         } else {
             -FREQ_STEP_MHZ
         };
         let next = (m.frequency_mhz + step).clamp(min_freq, max_freq);
+
+        // Below a power target but pinned under a clock found unstable: this
+        // point passed the efficiency check above, so it is the most hashrate
+        // that runs stably in the envelope. Lock (and persist) it rather than
+        // reporting the target as unreachable.
+        if error > 0.0
+            && max_freq < chip_max
+            && (next - m.frequency_mhz).abs() <= FREQ_TOLERANCE_MHZ
+        {
+            self.stuck_at_limit_cycles = 0;
+            self.best = Some(current_point);
+            if self.phase != TunePhase::Locked {
+                self.phase = TunePhase::Locked;
+                self.log_event(
+                    format!(
+                        "holding at {:.0} MHz, {commanded_v} mV: higher clocks unstable",
+                        m.frequency_mhz
+                    ),
+                    m,
+                );
+            }
+            return None;
+        }
 
         // Pinned at a limit (the clamp landed back where we started) with
         // the setpoint still unreached: this is what "unreachable" means.
@@ -1337,6 +1475,9 @@ fn tune_one_board(
     };
     if book.last_persisted != Some((enabled_now, mode_now)) {
         book.last_persisted = Some((enabled_now, mode_now));
+        // A new mode must persist its own lock, even if it lands on the same
+        // setpoint the previous mode locked at.
+        book.saved_best = None;
         let setpoint = best_now.unwrap_or(TuneSetpoint {
             frequency_mhz: metrics.frequency_mhz,
             core_voltage_mv: metrics.core_voltage_mv,
@@ -1851,10 +1992,129 @@ mod tests {
         let a1 = step_to_action(&mut t, &m(50.0, 12.0, 1.2, 525.0, 1150));
         assert_eq!(a1, Some(TuneAction::SetFrequency(550.0)));
         assert_eq!(t.phase, TunePhase::Converging);
-        // Within 2% tolerance of 15.0 W: locks, no further action.
+        // Within 2% tolerance of 15.0 W at the voltage floor: nothing left
+        // to trim, so it locks.
         let a2 = step_to_action(&mut t, &m(50.0, 14.9, 1.3, 550.0, 1150));
         assert_eq!(a2, None);
         assert_eq!(t.phase, TunePhase::Locked);
+    }
+
+    #[test]
+    fn hashrate_target_undervolts_then_reverts_when_hash_drops() {
+        let mut t = AutoTuner::default();
+        t.enable_target(TuneTarget::Hashrate(1.2));
+        // In band: trim voltage instead of just holding.
+        let a = step_to_action(&mut t, &m(50.0, 14.0, 1.2, 525.0, 1200));
+        assert_eq!(a, Some(TuneAction::SetVoltage(1190)));
+        assert_eq!(t.phase, TunePhase::Seeking);
+        // Still in band and fewer watts: keep trimming.
+        let a = step_to_action(&mut t, &m(50.0, 13.5, 1.2, 525.0, 1190));
+        assert_eq!(a, Some(TuneAction::SetVoltage(1180)));
+        // Hashrate fell out of the band: revert to the last good voltage.
+        let a = step_to_action(&mut t, &m(50.0, 13.0, 1.1, 525.0, 1180));
+        assert_eq!(a, Some(TuneAction::SetVoltage(1190)));
+        // Back in band at 1190: 1180 is now the floor, so lock there.
+        let a = step_to_action(&mut t, &m(50.0, 13.5, 1.2, 525.0, 1190));
+        assert_eq!(a, None);
+        assert_eq!(t.phase, TunePhase::Locked);
+        assert_eq!(t.best.map(|(s, ..)| s.core_voltage_mv), Some(1190));
+    }
+
+    #[test]
+    fn hashrate_target_reverts_undervolt_that_worsens_efficiency() {
+        let mut t = AutoTuner::default();
+        t.enable_target(TuneTarget::Hashrate(1.2));
+        let a = step_to_action(&mut t, &m(50.0, 14.0, 1.2, 525.0, 1200));
+        assert_eq!(a, Some(TuneAction::SetVoltage(1190)));
+        // Hashrate still in band but J/TH worse by more than the margin
+        // (e.g. error-driven power rise): revert.
+        let a = step_to_action(&mut t, &m(50.0, 14.6, 1.19, 525.0, 1190));
+        assert_eq!(a, Some(TuneAction::SetVoltage(1200)));
+    }
+
+    #[test]
+    fn power_target_trims_voltage_then_climbs_into_freed_watts() {
+        let mut t = AutoTuner::default();
+        t.enable_target(TuneTarget::Power(15.0));
+        // In band at 1200 mV: trim.
+        let a = step_to_action(&mut t, &m(50.0, 14.9, 1.3, 550.0, 1200));
+        assert_eq!(a, Some(TuneAction::SetVoltage(1190)));
+        // Trim freed watts (below band) with better J/TH: climb the clock.
+        let a = step_to_action(&mut t, &m(50.0, 14.0, 1.3, 550.0, 1190));
+        assert_eq!(a, Some(TuneAction::SetFrequency(575.0)));
+        assert_eq!(t.phase, TunePhase::Converging);
+    }
+
+    #[test]
+    fn power_target_reverts_a_clock_that_loses_hashrate() {
+        let mut t = AutoTuner::default();
+        t.enable_target(TuneTarget::Power(15.0));
+        step_to_action(&mut t, &m(50.0, 14.9, 1.3, 550.0, 1200)); // best @550
+        step_to_action(&mut t, &m(50.0, 14.0, 1.3, 550.0, 1190)); // -> 575
+        // 575 MHz is in the power band but hashes less: one window could be
+        // noise, so re-measure first.
+        let a = step_to_action(&mut t, &m(50.0, 14.8, 1.1, 575.0, 1190));
+        assert_eq!(a, None);
+        // Second bad window: unstable here, go back.
+        let a = step_to_action(&mut t, &m(50.0, 14.8, 1.1, 575.0, 1190));
+        assert_eq!(a, Some(TuneAction::SetFrequency(550.0)));
+        // Below band again at 550, but 575 is excluded: lock and record it
+        // instead of calling the target unreachable.
+        let a = step_to_action(&mut t, &m(50.0, 14.0, 1.3, 550.0, 1190));
+        assert_eq!(a, None);
+        assert_eq!(t.phase, TunePhase::Locked);
+        assert_eq!(
+            t.best.map(|(s, ..)| (s.frequency_mhz, s.core_voltage_mv)),
+            Some((550.0, 1190))
+        );
+    }
+
+    #[test]
+    fn one_noisy_window_does_not_cap_a_power_target_climb() {
+        let mut t = AutoTuner::default();
+        t.enable_target(TuneTarget::Power(15.0));
+        step_to_action(&mut t, &m(50.0, 14.9, 1.3, 550.0, 1200)); // best @550
+        step_to_action(&mut t, &m(50.0, 14.0, 1.3, 550.0, 1190)); // -> 575
+        // One low window, then a normal one: 575 is kept, no ceiling.
+        assert_eq!(step_to_action(&mut t, &m(50.0, 14.8, 1.1, 575.0, 1190)), None);
+        let a = step_to_action(&mut t, &m(50.0, 14.8, 1.4, 575.0, 1190));
+        assert_eq!(a, Some(TuneAction::SetVoltage(1180)));
+        assert!(t.probe_ceiling_mhz > MAX_FREQ_MHZ);
+    }
+
+    #[test]
+    fn measured_droop_is_not_recorded_below_the_chip_floor() {
+        let mut t = AutoTuner::default();
+        t.set_chip(Some(chip_profile::BM1370));
+        t.enable_target(TuneTarget::Hashrate(1.2));
+        // Commanded 1150 reads 1145 under droop: lock at 1150, not 1145.
+        assert_eq!(step_to_action(&mut t, &m(50.0, 14.0, 1.2, 525.0, 1145)), None);
+        assert_eq!(t.phase, TunePhase::Locked);
+        assert_eq!(t.best.map(|(s, ..)| s.core_voltage_mv), Some(1150));
+    }
+
+    #[test]
+    fn high_wattage_power_target_does_not_trip_breach() {
+        // 1,300 W rig: cap is the target plus 5%, not a per-chip profile cap.
+        let mut t = AutoTuner::default();
+        t.set_chip(Some(chip_profile::BM1362));
+        t.set_chip_count(126);
+        t.enable_target(TuneTarget::Power(1300.0));
+        let a = step_to_action(&mut t, &m(60.0, 1200.0, 90.0, 325.0, 340));
+        assert_eq!(a, Some(TuneAction::SetFrequency(350.0)));
+        assert_eq!(t.phase, TunePhase::Converging);
+    }
+
+    #[test]
+    fn multi_chip_hashrate_target_power_cap_scales_with_chip_count() {
+        // 4-chip board at 65 W chasing 6 TH/s: the outer power guard is
+        // 22 W x 4 = 88 W, so no false breach.
+        let mut t = AutoTuner::default();
+        t.set_chip_count(4);
+        t.enable_target(TuneTarget::Hashrate(6.0));
+        let a = step_to_action(&mut t, &m(60.0, 65.0, 4.8, 525.0, 1150));
+        assert_eq!(a, Some(TuneAction::SetFrequency(550.0)));
+        assert_eq!(t.phase, TunePhase::Converging);
     }
 
     #[test]

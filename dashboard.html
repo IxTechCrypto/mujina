@@ -1047,9 +1047,24 @@
           <option value="efficient">Efficient</option>
           <option value="balanced">Balanced</option>
           <option value="max_hash">Max hash</option>
+          <option value="target" id="ownTargetOpt" hidden disabled>Target (power / hashrate)</option>
         </select>
       </div>
-      <div class="row">
+      <div id="ownTargetRows" style="display:none">
+        <div class="row">
+          <label>Target</label>
+          <div class="seg" id="ownTargetAxis">
+            <button type="button" class="segbtn active" data-axis="power">Power (W)</button>
+            <button type="button" class="segbtn" data-axis="hashrate">Hashrate (TH/s)</button>
+          </div>
+        </div>
+        <div class="row">
+          <label for="ownTargetVal">Value <small style="color:var(--dim)" id="ownTargetUnit">W</small></label>
+          <input type="number" id="ownTargetVal" min="0" step="1" placeholder="e.g. 15">
+        </div>
+        <div class="note" id="ownTargetNote">The tuner reaches the target, then trims core voltage for the best J/TH while holding it.</div>
+      </div>
+      <div class="row" id="ownTempRow">
         <label for="ownTemp">Chip temp target <small style="color:var(--dim)">°C, blank = unchanged</small></label>
         <input type="number" id="ownTemp" min="30" max="95" step="1" placeholder="unchanged">
       </div>
@@ -2493,11 +2508,43 @@ function pt(p) {
   const v = p.voltage_mv != null ? p.voltage_mv : p.core_voltage_mv;
   return { f, v, j: p.j_th != null ? p.j_th : p.efficiency_j_th };
 }
+// ---- Target mode (host daemon only: the Nano 3S owner tuner has no target API) ----
+let TARGET_AXIS = 'power';
+function targetLabel(t) {
+  if (!t || t.value == null) return null;
+  return t.axis === 'hashrate' ? 'target ' + (+t.value).toFixed(2) + ' TH/s' : 'target ' + (+t.value).toFixed(0) + ' W';
+}
+function modeLabel(o) { return targetLabel(o.target) || o.profile || '?'; }
+function setTargetAxis(axis) {
+  TARGET_AXIS = axis === 'hashrate' ? 'hashrate' : 'power';
+  document.querySelectorAll('#ownTargetAxis .segbtn').forEach(b => b.classList.toggle('active', b.dataset.axis === TARGET_AXIS));
+  const inp = $('ownTargetVal'), hash = TARGET_AXIS === 'hashrate';
+  $('ownTargetUnit').textContent = hash ? 'TH/s' : 'W';
+  inp.step = hash ? '0.01' : '1';
+  const r = LAST_OWNER_STATUS && LAST_OWNER_STATUS.hashrate_target_range;
+  inp.placeholder = hash ? (r ? 'e.g. ' + (+r.default).toFixed(2) : 'e.g. 1.2') : 'e.g. 15';
+  $('ownTargetNote').textContent = (hash && r)
+    ? 'Nominal range ' + (+r.min).toFixed(2) + '–' + (+r.max).toFixed(2) + ' TH/s, default ' + (+r.default).toFixed(2) + '. The tuner reaches the target, then trims voltage for the best J/TH.'
+    : hash ? 'The tuner reaches the target, then trims voltage for the best J/TH.'
+           : 'The tuner climbs to the most hashrate that fits in this power, trimming voltage to make room.';
+}
+function syncTargetMode() {
+  const host = !!(SYS && SYS.mode === 'host'), opt = $('ownTargetOpt');
+  opt.hidden = !host; opt.disabled = !host;
+  // Only drop a target selection once SYS confirms a non-host device; before
+  // SYS loads, keep what the tuner reported.
+  if (SYS && !host && $('ownProfile').value === 'target') $('ownProfile').value = 'off';
+  const isTarget = $('ownProfile').value === 'target';
+  $('ownTargetRows').style.display = isTarget ? '' : 'none';
+  $('ownTempRow').style.display = isTarget ? 'none' : '';
+  if (isTarget) setTargetAxis(TARGET_AXIS);
+}
+
 function renderOwnerTune(o) {
   LAST_OWNER_STATUS = o;
   let ownTxt = 'tuner off';
   if (o.enabled) {
-    ownTxt = (o.profile || '?') + ' / ' + (o.phase || '?');
+    ownTxt = modeLabel(o) + ' / ' + (o.phase || '?');
     if (o.per_chip && o.per_chip.phase) ownTxt += ' · per-chip ' + o.per_chip.phase;
     if (o.fan_duty_percent != null) ownTxt += ' · fan ' + o.fan_duty_percent + '%';
     if (o.continuous_ceiling_w != null) ownTxt += ' · cap ' + (+o.continuous_ceiling_w).toFixed(0) + ' W';
@@ -2506,10 +2553,17 @@ function renderOwnerTune(o) {
   }
   $('ownCur').textContent = 'Current: ' + ownTxt;
   if (!OWN_SYNCED) {
-    $('ownProfile').value = o.enabled ? (o.profile || 'off') : 'off';
+    if (o.enabled && o.target) {
+      $('ownProfile').value = 'target';
+      TARGET_AXIS = o.target.axis;
+      $('ownTargetVal').value = o.target.value;
+    } else {
+      $('ownProfile').value = o.enabled ? (o.profile || 'off') : 'off';
+    }
     $('ownContinuous').checked = !!o.continuous;
     OWN_SYNCED = true;
   }
+  syncTargetMode();
   const best = $('atbest'), list = $('atlist'), st = $('at-phase-label'), pcElem = $('at-per-chip');
   if (pcElem) {
     if (o.per_chip) {
@@ -2529,7 +2583,16 @@ function renderOwnerTune(o) {
     if (pcElem) pcElem.textContent = 'Per-chip: off';
     return;
   }
-  const parts = [(o.profile || '?') + ' / ' + (o.phase || '?')];
+  const parts = [modeLabel(o) + ' / ' + (o.phase || '?')];
+  if (o.target && o.target.value != null) {
+    const hash = o.target.axis === 'hashrate';
+    // Same reading the tuner judges against: board hashrate / core rail watts.
+    const ab = activeBoard(), cur = ab ? (hash ? ab.hashrate_ths : ab.core_w) : null;
+    if (cur != null) {
+      const d = cur - o.target.value;
+      parts.push('Δ ' + (d >= 0 ? '+' : '') + (hash ? d.toFixed(2) + ' TH/s' : d.toFixed(0) + ' W') + ' (±2%)');
+    }
+  }
   if (o.fan_duty_percent != null || o.fan_target_c != null) {
     parts.push('fan ' + (o.fan_duty_percent != null ? o.fan_duty_percent + '%' : '—') + ' → ' + (o.fan_target_c != null ? (+o.fan_target_c).toFixed(0) + '°C' : '—'));
   }
@@ -2579,7 +2642,26 @@ async function applyOwner() {
   if (!caps || !safeUrl(caps.tuner)) { setMsg('ownMsg', 'tuner not available for this board'); return; }
   if (writeBusy('ownMsg')) return;
   const sel = $('ownProfile'), v = sel.value, label = sel.options[sel.selectedIndex].textContent;
-  const curProfile = (LAST_OWNER_STATUS && LAST_OWNER_STATUS.enabled) ? (LAST_OWNER_STATUS.profile || 'off') : 'off';
+
+  if (v === 'target') {
+    const val = parseFloat($('ownTargetVal').value);
+    if (!isFinite(val) || val <= 0) { setMsg('ownMsg', 'Enter a target above 0'); return; }
+    const target = { axis: TARGET_AXIS, value: val }, tl = targetLabel(target);
+    const cur = LAST_OWNER_STATUS && LAST_OWNER_STATUS.enabled && LAST_OWNER_STATUS.target;
+    if (cur && cur.axis === target.axis && +cur.value === val) { setMsg('ownMsg', 'No changes to apply'); return; }
+    if (!confirm('Switch the auto tuner to ' + tl + '? This restarts the tuning search.')) return;
+    setMsg('ownMsg', 'Sending…');
+    lockWrites();
+    try {
+      await sendJson('PATCH', caps.tuner, { enabled: true, target: target, board_name: name });
+      setMsg('ownMsg', 'Queued: ' + tl, true);
+      setTimeout(pollOwnerTune, 2500);
+    } catch (e) { setMsg('ownMsg', 'Failed: ' + e.message); }
+    return;
+  }
+
+  const curProfile = (LAST_OWNER_STATUS && LAST_OWNER_STATUS.enabled)
+    ? (LAST_OWNER_STATUS.target ? 'target' : (LAST_OWNER_STATUS.profile || 'off')) : 'off';
   const curContinuous = !!(LAST_OWNER_STATUS && LAST_OWNER_STATUS.continuous);
   const newContinuous = $('ownContinuous').checked;
   const tt = $('ownTemp').value;
@@ -2695,6 +2777,8 @@ $('psuApplyBtn').addEventListener('click', applyPsuProfile);
 $('poolSave').addEventListener('click', savePool);
 $('poolReboot').addEventListener('click', poolApplyNow);
 $('ownApply').addEventListener('click', applyOwner);
+$('ownProfile').addEventListener('change', syncTargetMode);
+document.querySelectorAll('#ownTargetAxis .segbtn').forEach(b => b.addEventListener('click', () => setTargetAxis(b.dataset.axis)));
 $('ownContinuous').addEventListener('change', () => { USER_EDITING_CONTINUOUS = true; });
 $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(b => {
   b.addEventListener('click', () => {

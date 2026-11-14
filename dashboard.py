@@ -7,7 +7,7 @@ daemon reports) plus per-board tabs with full telemetry.
     python dashboard.py
     -> open http://127.0.0.1:8088
 """
-import json, urllib.request, urllib.parse, urllib.error, http.server, socketserver, threading, time, os, subprocess, tempfile
+import json, math, urllib.request, urllib.parse, urllib.error, http.server, socketserver, threading, time, os, subprocess, tempfile
 
 API_ROOT = "http://127.0.0.1:7785/api/v0"
 API = API_ROOT + "/miner"
@@ -142,6 +142,19 @@ def fetch_autotune(board):
         return store.get(board)
 
 
+def clean_target(target):
+    """Return a sanitized {axis, value} target, or None if it is invalid."""
+    if not isinstance(target, dict) or target.get("axis") not in ("power", "hashrate"):
+        return None
+    value = target.get("value")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return {"axis": target["axis"], "value": value}
+
+
 def patch_autotune(board, payload):
     """Enable/disable auto-tuning and set the profile/target. `payload` is
     {enabled, profile?, target?}."""
@@ -149,18 +162,26 @@ def patch_autotune(board, payload):
         return False, "no board connected"
     url = f"{API_ROOT}/boards/{urllib.parse.quote(board)}/autotune"
 
+    target = payload.get("target")
+    if target is not None:
+        target = clean_target(target)
+        if target is None:
+            return False, "target must be {axis: 'power'|'hashrate', value: number > 0}"
+
     # Ensure required enabled flag for Rust API contract
     enabled = payload.get("enabled")
     if enabled is None:
         prof = payload.get("profile")
-        enabled = (prof is not None and prof != "off")
+        enabled = target is not None or (prof is not None and prof != "off")
 
     clean_body = {"enabled": bool(enabled)}
     prof = payload.get("profile")
-    if enabled and prof and prof != "off":
+    # A target and a profile are mutually exclusive; the target wins (the
+    # daemon applies the same rule).
+    if enabled and target is not None:
+        clean_body["target"] = target
+    elif enabled and prof and prof != "off":
         clean_body["profile"] = prof
-    if payload.get("target"):
-        clean_body["target"] = payload["target"]
 
     req = urllib.request.Request(
         url, data=json.dumps(clean_body).encode(), method="PATCH",
@@ -173,8 +194,10 @@ def patch_autotune(board, payload):
             bstore["enabled"] = bool(clean_body["enabled"])
             if clean_body.get("profile"):
                 bstore["profile"] = clean_body["profile"]
+                bstore.pop("target", None)
             if clean_body.get("target"):
                 bstore["target"] = clean_body["target"]
+                bstore.pop("profile", None)
             bstore["updated_at"] = time.time()
             save_autotune_store(store)
             return True, r.status
