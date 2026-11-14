@@ -764,7 +764,14 @@ impl AutoTuner {
             caps.power_w *= self.chip_count as f32;
         }
         if let Some(ceiling) = self.power_ceiling_w {
-            caps.power_w = caps.power_w.min(ceiling);
+            if matches!(self.mode, TuneMode::Target(TuneTarget::Hashrate(_))) {
+                // In hashrate target mode, the target's power draw is not known in advance:
+                // adopt the PSU supply ceiling directly (honoring user overrides like 140 W)
+                // rather than clamping down to factory calibration (133 W).
+                caps.power_w = ceiling;
+            } else {
+                caps.power_w = caps.power_w.min(ceiling);
+            }
         }
         caps
     }
@@ -2997,5 +3004,25 @@ mod tests {
         let a = safety_step(&mut t, &tm(125.0, 6.0, 400.0, 3756, Some(3.0)));
         assert_eq!(a, Some(TuneAction::SetFrequency(390.0)));
         assert_eq!(t.phase, TunePhase::BackedOff);
+    }
+
+    #[test]
+    fn nano_hashrate_target_uses_psu_ceiling_above_cali_power() {
+        // Factory cali mode 2 reports 133 W. User sets PSU ceiling to 140 W.
+        // A power reading of 135 W must NOT trigger a safety breach / backoff.
+        let mut env = nano_env();
+        env.target_hashrate_power_w = 133.0;
+        let mut t = AutoTuner::default();
+        t.set_envelope(env);
+        t.set_power_ceiling(Some(140.0));
+        t.enable_target(TuneTarget::Hashrate(7.0));
+
+        let caps = t.caps();
+        assert_eq!(caps.power_w, 140.0);
+
+        // 135 W is above 133 W cali limit, but under 140 W PSU ceiling.
+        let a = safety_step(&mut t, &tm(135.0, 6.5, 490.0, 3912, Some(3.0)));
+        assert_eq!(a, None);
+        assert_ne!(t.phase, TunePhase::BackedOff);
     }
 }
