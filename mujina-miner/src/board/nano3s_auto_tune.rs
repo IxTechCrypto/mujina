@@ -91,9 +91,9 @@ pub(crate) const NANO3S_ENVELOPE: TuneEnvelope = TuneEnvelope {
     power_settle_cycles: AUTO_TUNE_POWER_SETTLE_CYCLES,
     quiet: CapLimits { temp_c: 70.0, power_w: 60.0 },
     efficient: CapLimits { temp_c: 80.0, power_w: 90.0 },
-    balanced: CapLimits { temp_c: 88.0, power_w: 90.0 },
-    max_hash: CapLimits { temp_c: 88.0, power_w: 137.0 },
-    target_temp_c: 88.0,
+    balanced: CapLimits { temp_c: 90.0, power_w: 90.0 },
+    max_hash: CapLimits { temp_c: 92.0, power_w: 137.0 },
+    target_temp_c: 92.0,
     target_hashrate_power_w: 137.0,
     target_power_headroom: 1.05,
     max_fail_rate_pct: Some(10.0),
@@ -233,7 +233,7 @@ fn present_or_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Opti
 }
 
 /// Fan-target range accepted by the API.
-pub(crate) const FAN_TARGET_RANGE_C: std::ops::RangeInclusive<f32> = 60.0..=88.0;
+pub(crate) const FAN_TARGET_RANGE_C: std::ops::RangeInclusive<f32> = 60.0..=92.0;
 
 impl AutoTuneRequest {
     /// `Err` (-> 400) when `chip_temp_target_c` is outside 60..88 or a
@@ -1124,7 +1124,7 @@ mod tests {
         let r: AutoTuneRequest = serde_json::from_str(r#"{"chip_temp_target_c":75}"#).unwrap();
         assert_eq!(r.profile_change(), None);
         assert!(r.validate().is_ok());
-        for bad in ["59.9", "88.1", "0", "200"] {
+        for bad in ["59.9", "92.1", "0", "200"] {
             let r: AutoTuneRequest =
                 serde_json::from_str(&format!(r#"{{"chip_temp_target_c":{bad}}}"#)).unwrap();
             assert!(r.validate().is_err(), "{bad}");
@@ -1384,8 +1384,8 @@ mod tests {
         assert_eq!(o.fan_target_c(), 68.0);
         for (p, want) in [
             (TuneProfile::Quiet, 65.0),
-            (TuneProfile::Balanced, 83.0), // cap 88 - 5 (MaxHash's cap, Medium power)
-            (TuneProfile::MaxHash, 83.0),  // cap 88 - 5
+            (TuneProfile::Balanced, 85.0), // cap 90 - 5 (MaxHash's cap, Medium power)
+            (TuneProfile::MaxHash, 87.0),  // cap 92 - 5
         ] {
             let mut o = AutoTune::new();
             o.enable(p);

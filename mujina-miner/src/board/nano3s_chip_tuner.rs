@@ -79,7 +79,7 @@ impl Default for ChipTunerConfig {
             settle_ticks: 6,
             discard_ticks: 2,
             step_mhz: 10,
-            min_offset_mhz: -60,
+            min_offset_mhz: -100,
             max_offset_mhz: 40,
             chip_margin: 0.015,
             board_guard: 0.01,
