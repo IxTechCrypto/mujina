@@ -489,7 +489,7 @@ pub(crate) fn default_fan_target_c(profile: Option<TuneProfile>, cap: f32) -> f3
     match profile {
         Some(TuneProfile::Efficient) => 68.0,
         Some(TuneProfile::Quiet) => 65.0,
-        _ => cap - FAN_TARGET_BELOW_CAP_C,
+        _ => 90.0f32.min(cap - 2.0),
     }
 }
 
@@ -1384,8 +1384,8 @@ mod tests {
         assert_eq!(o.fan_target_c(), 68.0);
         for (p, want) in [
             (TuneProfile::Quiet, 65.0),
-            (TuneProfile::Balanced, 85.0), // cap 90 - 5 (MaxHash's cap, Medium power)
-            (TuneProfile::MaxHash, 87.0),  // cap 92 - 5
+            (TuneProfile::Balanced, 88.0), // cap 90.0 - 2.0 = 88.0 (optimal 90C clamped by Balanced cap)
+            (TuneProfile::MaxHash, 90.0),  // optimal 90.0C (cap 92 - 2 = 90.0)
         ] {
             let mut o = AutoTune::new();
             o.enable(p);
@@ -1474,9 +1474,9 @@ mod tests {
         });
         assert!(o.memory().is_some());
 
-        // pick_profile with None resets fan target to Balanced default (cap 90 - 5 = 85.0) and clears memory
+        // pick_profile with None resets fan target to Balanced default (88.0) and clears memory
         o.pick_profile(TuneProfile::Balanced, None);
-        assert_eq!(o.fan_target_c(), 85.0);
+        assert_eq!(o.fan_target_c(), 88.0);
         assert!(o.memory().is_none());
 
         // pick_profile with Some(78.0) sets fan target to 78.0
@@ -1492,10 +1492,10 @@ mod tests {
         o.pick_profile(TuneProfile::Efficient, None);
         assert_eq!(o.fan_target_c(), 68.0);
 
-        // Switch Efficient -> Balanced with None fan target: must land on Balanced's default (85.0 C),
+        // Switch Efficient -> Balanced with None fan target: must land on Balanced's default (88.0 C),
         // not keep the old profile's 68.0 C
         o.pick_profile(TuneProfile::Balanced, None);
-        assert_eq!(o.fan_target_c(), 85.0);
+        assert_eq!(o.fan_target_c(), 88.0);
     }
 
     #[test]

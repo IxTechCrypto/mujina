@@ -1049,10 +1049,6 @@
           <option value="max_hash">Max hash</option>
         </select>
       </div>
-      <div class="row">
-        <label for="ownTemp">Chip temp target <small style="color:var(--dim)">°C, blank = unchanged</small></label>
-        <input type="number" id="ownTemp" min="30" max="95" step="1" placeholder="unchanged">
-      </div>
       <div class="row" style="margin-top:10px;flex-wrap:wrap">
         <label for="ownContinuous" style="cursor:pointer">Continuous Tuning</label>
         <input type="checkbox" id="ownContinuous">
@@ -1095,10 +1091,6 @@
     <div class="row" id="tunePowerRow">
       <label for="tunePowerTarget">Power Target <small style="color:var(--dim)">W (power-target loop, blank = leave unchanged)</small></label>
       <input type="number" id="tunePowerTarget" min="20" max="130" step="0.1" value="95">
-    </div>
-    <div class="row" id="tuneTempRow">
-      <label for="tuneTempTarget">Temp Target <small style="color:var(--dim)">°C (PLL auto-throttle, blank = leave unchanged — steps frequency down if the hottest chip runs over)</small></label>
-      <input type="number" id="tuneTempTarget" min="30" max="95" step="1" value="85">
     </div>
     <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:4px">
       <button class="btn pri wbtn" id="tuneApply">Apply Mode</button>
@@ -1706,7 +1698,7 @@ function applyBoardCaps() {
   show('manualSection', manual);
   show('tuningNone', !!SYS && !tuner && !manual);
   const nano = hasCeiling();
-  show('tunePresetRow', nano); show('tunePowerRow', nano); show('tuneTempRow', nano);
+  show('tunePresetRow', nano); show('tunePowerRow', nano);
   $('tuneFreq').min = nano ? 100 : 50; $('tuneFreq').max = nano ? 500 : 1200;
   $('tuneVolt').min = nano ? 3300 : 500; $('tuneVolt').max = nano ? 3800 : 1600;
   const fan = caps ? caps.fan : 'none';
@@ -2195,7 +2187,6 @@ function syncTunePreset() {
   $('tuneFreq').value = p.freq[0];
   $('tuneVolt').value = p.volt;
   $('tunePowerTarget').value = p.power_target;
-  $('tuneTempTarget').value = p.temp_target;
 }
 async function applyTuning() {
   const name = activeName(), caps = activeCaps();
@@ -2208,9 +2199,8 @@ async function applyTuning() {
     const preset = $('tunePreset').value;
     const freq = (preset !== 'custom') ? TUNE_PRESETS[preset].freq : (() => { const b = +$('tuneFreq').value; return [b, b + 20, b + 40, b + 60]; })();
     body = { pll_freq_mhz: freq, voltage_mv: volt };
-    const pt = $('tunePowerTarget').value, tt = $('tuneTempTarget').value;
+    const pt = $('tunePowerTarget').value;
     if (pt !== '') body.power_target_w = +pt;
-    if (tt !== '') body.temp_target_c = +tt;
     label = freq.join('/') + 'MHz @ ' + volt + 'mV';
   } else {
     const f = +$('tuneFreq').value;
@@ -2585,19 +2575,16 @@ async function applyOwner() {
   const curProfile = (LAST_OWNER_STATUS && LAST_OWNER_STATUS.enabled) ? (LAST_OWNER_STATUS.profile || 'off') : 'off';
   const curContinuous = !!(LAST_OWNER_STATUS && LAST_OWNER_STATUS.continuous);
   const newContinuous = $('ownContinuous').checked;
-  const tt = $('ownTemp').value;
+    const profileChanged = (v !== curProfile);
+    const continuousChanged = (newContinuous !== curContinuous);
 
-  const profileChanged = (v !== curProfile);
-  const tempChanged = (tt !== '');
-  const continuousChanged = (newContinuous !== curContinuous);
-
-  if (!profileChanged && !tempChanged && !continuousChanged) {
+  if (!profileChanged && !continuousChanged) {
     setMsg('ownMsg', 'No changes to apply');
     return;
   }
 
   // If ONLY continuous toggle changed and a profile is active, send ONLY continuous to avoid resetting the profile search or fan target
-  if (!profileChanged && !tempChanged && continuousChanged) {
+  if (!profileChanged && continuousChanged) {
     if (!LAST_OWNER_STATUS || !LAST_OWNER_STATUS.enabled) {
       setMsg('ownMsg', 'turn on a profile first');
       return;
@@ -2627,8 +2614,7 @@ async function applyOwner() {
     profile: enabled ? v : null,
     board_name: name
   };
-  if (tt !== '') body.chip_temp_target_c = +tt;
-  if (enabled) {
+    if (enabled) {
     body.per_chip = true; // Profiles inherently include per-chip tuning
     body.continuous = newContinuous;
   }
