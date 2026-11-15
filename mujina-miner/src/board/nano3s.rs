@@ -1924,8 +1924,14 @@ pub(crate) fn write_pause_command(pause: bool) -> std::io::Result<()> {
 /// process's control channel, separate from MUJINA_CONTROL_FILE which
 /// run_worker() reads). `fan:` commands only touch PWM/fan state on the
 /// harness side, never `power_en_set()`/`harness_apply_idle()`.
+static MANUAL_FAN_DUTY: std::sync::Mutex<Option<u8>> = std::sync::Mutex::new(None);
+
 pub(crate) fn write_fan_control_command(cmd: &str) -> std::io::Result<()> {
-    std::fs::write(HARNESS_CONTROL_FILE, cmd)
+    std::fs::write(HARNESS_CONTROL_FILE, cmd)?;
+    if let Some(ov) = auto_tune::parse_fan_control_override(cmd) {
+        *MANUAL_FAN_DUTY.lock().unwrap_or_else(|e| e.into_inner()) = ov;
+    }
+    Ok(())
 }
 
 /// Path the C harness persists the fan curve to (`fan_curve_save()` in
@@ -2998,6 +3004,9 @@ fn run_worker(
         .then(|| new_chip_tuner(auto_tuner.choice(), chip_offset_mhz));
     let mut chip_base: Option<(u32, Option<i32>)> = None;
     let mut persisted_chip_offsets = chip_offset_mhz;
+    if let Some(d) = *MANUAL_FAN_DUTY.lock().unwrap_or_else(|e| e.into_inner()) {
+        auto_tuner.set_manual_fan(Some(d));
+    }
     auto_tuner.publish(None);
 
     loop {
@@ -3082,6 +3091,8 @@ fn run_worker(
                 if let Ok(d) = &parsed
                     && let Some(c) = d.fan_target_c
                 {
+                    *MANUAL_FAN_DUTY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    auto_tuner.set_manual_fan(None);
                     auto_tuner.set_fan_target(Some(c));
                     persist_auto_fan_target(Some(c));
                     auto_tuner.publish(None);
@@ -3378,6 +3389,22 @@ fn run_worker(
                 }
             }
             _ => {}
+        }
+
+        let cur_manual_fan = *MANUAL_FAN_DUTY.lock().unwrap_or_else(|e| e.into_inner());
+        if cur_manual_fan != auto_tuner.manual_fan() {
+            auto_tuner.set_manual_fan(cur_manual_fan);
+            if cur_manual_fan.is_none() {
+                auto_tuner.seed_fan_duty(read_fan_status().and_then(|f| f.percent));
+            }
+            auto_tuner.publish(None);
+            eprintln!(
+                "[nano3s] auto-tune: manual fan override {}",
+                match cur_manual_fan {
+                    Some(d) => format!("on ({d}%) -- pausing auto-tune fan loop"),
+                    None => "off -- resuming auto-tune fan loop".to_string(),
+                }
+            );
         }
 
         // Drain pending commands (non-blocking).

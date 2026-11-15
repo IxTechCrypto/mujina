@@ -656,6 +656,30 @@ pub(crate) fn fan_step(st: &mut FanState, temp: Option<f32>, cap: f32, target: f
     })
 }
 
+/// Parses a `/tmp/harness_control` fan command to determine whether manual
+/// fan override state changed:
+/// - `Some(Some(duty))` when `fan:manual,<duty>` sets manual fan mode (`0..=100`)
+/// - `Some(None)` when `fan:auto,` or `fan_chip_temp_target:<C>` returns fan ownership to automatic
+/// - `None` for any other command or malformed input
+pub(crate) fn parse_fan_control_override(cmd: &str) -> Option<Option<u8>> {
+    let cmd = cmd.trim();
+    if let Some(rest) = cmd.strip_prefix("fan:") {
+        let (mode, duty) = rest.split_once(',')?;
+        match mode.trim() {
+            "manual" => {
+                let pct: u8 = duty.trim().parse().ok()?;
+                (pct <= 100).then_some(Some(pct))
+            }
+            "auto" => Some(None),
+            _ => None,
+        }
+    } else if cmd.starts_with("fan_chip_temp_target:") {
+        Some(None)
+    } else {
+        None
+    }
+}
+
 // --- pure helpers ----------------------------------------------------------
 
 /// Snaps a requested core voltage to the DC/DC's 26 mV grid (anchored at
@@ -873,6 +897,7 @@ pub(crate) struct AutoTune {
     fan_target_override: Option<f32>,
     fan_force_pending: bool,
     fan_restore_pending: bool,
+    manual_fan_duty: Option<u8>,
     chip_status: Option<ChipTuneStatus>,
 }
 
@@ -899,6 +924,7 @@ impl AutoTune {
             fan_target_override: None,
             fan_force_pending: false,
             fan_restore_pending: false,
+            manual_fan_duty: None,
             chip_status: None,
         }
     }
@@ -928,9 +954,42 @@ impl AutoTune {
         self.chip_status = s;
     }
 
+    /// Sets or clears a manual fan duty override (`PATCH /boards/{name}/fan`).
+    /// While `Some(duty)` is active, the auto-tuner's chip-temp fan loop is
+    /// paused so it never overwrites the user's manual fan setting on
+    /// `/tmp/harness_control`. Clearing (`None`) hands fan control back to
+    /// the auto-tuner's fan loop on the next tick.
+    pub(crate) fn set_manual_fan(&mut self, duty: Option<u8>) {
+        match duty {
+            Some(d) => {
+                let d = d.min(100);
+                self.manual_fan_duty = Some(d);
+                self.fan.duty = d as f32;
+                self.fan.sent = Some(d);
+                self.fan.hold_full = false;
+                self.fan.pre_full_duty = None;
+                self.fan_force_pending = false;
+                self.fan_restore_pending = false;
+            }
+            None => {
+                if self.manual_fan_duty.take().is_some() {
+                    self.fan.sent = None;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn manual_fan(&self) -> Option<u8> {
+        self.manual_fan_duty
+    }
+
     /// `None` restores the default (profile temp cap - 5 C).
     pub(crate) fn set_fan_target(&mut self, c: Option<f32>) {
-        self.fan_target_override = c.filter(|c| FAN_TARGET_RANGE_C.contains(c));
+        let valid = c.filter(|c| FAN_TARGET_RANGE_C.contains(c));
+        if valid.is_some() && self.manual_fan_duty.take().is_some() {
+            self.fan.sent = None;
+        }
+        self.fan_target_override = valid;
     }
 
     /// Effective fan target: the override (never within 2 C of the cap) or
@@ -947,6 +1006,16 @@ impl AutoTune {
     /// is the raw hottest-chip reading (`None`/<=0 = missing -> 100 %).
     pub(crate) fn fan_tick(&mut self, temp_max_c: Option<f32>) -> Option<AutoTuneCmd> {
         if self.choice.is_none() {
+            return None;
+        }
+        if let Some(d) = self.manual_fan_duty {
+            self.fan_force_pending = false;
+            self.fan_restore_pending = false;
+            self.fan.hold_full = false;
+            self.fan.pre_full_duty = None;
+            self.fan.prev_temp = plausible(temp_max_c);
+            self.fan.duty = d as f32;
+            self.fan.sent = Some(d);
             return None;
         }
         let cap = self.tuner.temp_cap_c();
@@ -975,7 +1044,7 @@ impl AutoTune {
     /// Starts the fan loop from the fan's current duty instead of 100 %.
     /// Call right after [`Self::enable`].
     pub(crate) fn seed_fan_duty(&mut self, current: Option<u8>) {
-        if self.choice.is_some() && self.fan.sent.is_none() {
+        if self.choice.is_some() && self.manual_fan_duty.is_none() && self.fan.sent.is_none() {
             self.fan = FanState::starting_at(current);
         }
     }
@@ -1032,7 +1101,10 @@ impl AutoTune {
         ));
         self.choice = Some(choice);
         self.next_tick = None;
-        self.fan = FanState::default();
+        self.fan = match self.manual_fan_duty {
+            Some(d) => FanState { duty: d as f32, sent: Some(d), ..FanState::default() },
+            None => FanState::default(),
+        };
         self.fan_force_pending = false;
         self.fan_restore_pending = false;
     }
@@ -1040,8 +1112,13 @@ impl AutoTune {
     /// Disables the tuner. Returns the harness command that hands the fan
     /// back to auto if this tuner ever took it over.
     pub(crate) fn disable(&mut self) -> Option<AutoTuneCmd> {
-        let restore = (self.fan.sent.is_some() || self.tuner.fan_forced()).then_some(AutoTuneCmd::Fan("fan:auto,"));
-        self.fan = FanState::default();
+        let restore = (self.manual_fan_duty.is_none()
+            && (self.fan.sent.is_some() || self.tuner.fan_forced()))
+            .then_some(AutoTuneCmd::Fan("fan:auto,"));
+        self.fan = match self.manual_fan_duty {
+            Some(d) => FanState { duty: d as f32, sent: Some(d), ..FanState::default() },
+            None => FanState::default(),
+        };
         self.fan_force_pending = false;
         self.fan_restore_pending = false;
         self.tuner.disable();
@@ -1079,10 +1156,12 @@ impl AutoTune {
 
     pub(crate) fn evaluate(&mut self, m: &Metrics) -> Vec<AutoTuneCmd> {
         let action = self.tuner.evaluate(m);
-        match action {
-            Some(TuneAction::SetFanFull) => self.fan_force_pending = true,
-            Some(TuneAction::RestoreFanAuto) => self.fan_restore_pending = true,
-            _ => {}
+        if self.manual_fan_duty.is_none() {
+            match action {
+                Some(TuneAction::SetFanFull) => self.fan_force_pending = true,
+                Some(TuneAction::RestoreFanAuto) => self.fan_restore_pending = true,
+                _ => {}
+            }
         }
         action.map(action_to_cmds).unwrap_or_default()
     }
@@ -1533,6 +1612,51 @@ mod tests {
         // 60 C: released, PI ramps down from 100 (target 68).
         o.fan_tick(Some(60.0));
         assert!(o.fan.duty_percent() < 100);
+    }
+
+    #[test]
+    fn manual_fan_override_pauses_auto_tune_fan_loop_and_auto_resumes() {
+        assert_eq!(parse_fan_control_override("fan:manual,100"), Some(Some(100)));
+        assert_eq!(parse_fan_control_override("fan:manual,0"), Some(Some(0)));
+        assert_eq!(parse_fan_control_override("fan:manual,101"), None);
+        assert_eq!(parse_fan_control_override("fan:auto,"), Some(None));
+        assert_eq!(parse_fan_control_override("fan_chip_temp_target:80"), Some(None));
+        assert_eq!(parse_fan_control_override("pause"), None);
+
+        let mut o = AutoTune::new();
+        o.enable(TuneProfile::Balanced);
+        assert!(matches!(o.fan_tick(Some(75.0)), Some(AutoTuneCmd::FanManual(d)) if d < 100));
+
+        // Manual override pauses the auto-tune fan loop across cool ticks
+        // and thermal SetFanFull triggers.
+        o.set_manual_fan(Some(100));
+        assert_eq!(o.manual_fan(), Some(100));
+        for _ in 0..5 {
+            assert_eq!(o.fan_tick(Some(60.0)), None);
+        }
+        assert_eq!(o.fan.duty_percent(), 100);
+
+        let _ = o.evaluate(&fan_metrics(91.0));
+        assert_eq!(o.fan_tick(Some(91.0)), None);
+        assert_eq!(o.fan.duty_percent(), 100);
+
+        // Disabling AutoTune while manual mode is active must not send fan:auto,.
+        assert_eq!(o.disable(), None);
+
+        // Selecting auto clears the manual override and lets AutoTune reclaim fan control.
+        o.enable(TuneProfile::Balanced);
+        assert_eq!(o.fan_tick(Some(60.0)), None);
+        o.set_manual_fan(None);
+        assert_eq!(o.manual_fan(), None);
+        assert!(matches!(o.fan_tick(Some(60.0)), Some(AutoTuneCmd::FanManual(_))));
+        assert_eq!(o.disable(), Some(AutoTuneCmd::Fan("fan:auto,")));
+
+        // Setting a chip-temp fan target also clears manual mode.
+        o.enable(TuneProfile::Balanced);
+        o.set_manual_fan(Some(80));
+        o.set_fan_target(Some(75.0));
+        assert_eq!(o.manual_fan(), None);
+        assert!(matches!(o.fan_tick(Some(60.0)), Some(AutoTuneCmd::FanManual(_))));
     }
 
     #[test]
