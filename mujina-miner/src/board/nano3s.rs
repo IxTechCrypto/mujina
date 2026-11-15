@@ -3338,8 +3338,10 @@ fn run_worker(
             let (tuner_power_ceiling_w, effective_safety_w) = if let Some(override_w) = psu_override_max_w {
                 // The override is the user's chosen board ceiling: the tuner may
                 // use all of it (a power target holds its mean 1-3 % under).
+                // Hard safety trip sits 3 % above the user setting (144.2 W at 140 W)
+                // so normal instantaneous switching ripples don't trip an emergency backoff.
                 let ceiling = (override_w as f32).clamp(40.0, 140.0);
-                let safety = override_w.clamp(40.0, 140.0);
+                let safety = (override_w * 1.03).clamp(40.0, 150.0);
                 (ceiling, safety)
             } else {
                 let pd_contract = pd_ceiling_w_for_voltage(last_bus_v);

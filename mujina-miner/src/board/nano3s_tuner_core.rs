@@ -766,9 +766,13 @@ impl AutoTuner {
             caps.power_w *= self.chip_count as f32;
         }
         if let Some(ceiling) = self.power_ceiling_w {
-            if matches!(self.mode, TuneMode::Target(TuneTarget::Hashrate(_))) {
-                // In hashrate target mode, the target's power draw is not known in advance:
-                // adopt the PSU supply ceiling directly (honoring user overrides like 140 W)
+            if matches!(
+                self.mode,
+                TuneMode::Target(TuneTarget::Hashrate(_)) | TuneMode::Profile(TuneProfile::MaxHash)
+            ) {
+                // In hashrate target mode or MaxHash, the power draw is not bounded
+                // by modest profile limits: adopt the PSU supply ceiling directly
+                // (honoring user overrides like 140 W or PD derating like 112 W)
                 // rather than clamping down to factory calibration (133 W).
                 caps.power_w = ceiling;
             } else {
@@ -3024,9 +3028,51 @@ mod tests {
         let caps = t.caps();
         assert_eq!(caps.power_w, 140.0);
 
-        // 135 W is above 133 W cali limit, but under 140 W PSU ceiling.
-        let a = safety_step(&mut t, &tm(135.0, 6.5, 490.0, 3912, Some(3.0)));
+        // 139.5 W is above 133 W cali limit, but under 140 W PSU ceiling -> no breach.
+        let a = safety_step(&mut t, &tm(139.5, 6.7, 510.0, 3912, Some(3.0)));
         assert_eq!(a, None);
         assert_ne!(t.phase, TunePhase::BackedOff);
+
+        // 145 W instantaneous power exceeds 140 W ceiling -> safety breach trips backoff.
+        let mut a = None;
+        for _ in 0..t.envelope.safety_settle_cycles {
+            if let Some(act) = t.evaluate(&tm(145.0, 6.9, 510.0, 3912, Some(3.0))) {
+                a = Some(act);
+                break;
+            }
+        }
+        assert_eq!(a, Some(TuneAction::SetFrequency(500.0)));
+        assert_eq!(t.phase, TunePhase::BackedOff);
+    }
+
+    #[test]
+    fn nano_maxhash_uses_psu_ceiling_above_cali_power() {
+        // Factory cali mode 2 reports 133 W. User sets PSU ceiling to 140 W.
+        // In MaxHash, a power reading of 135 W must NOT trigger a safety breach / backoff.
+        let mut env = nano_env();
+        env.max_hash.power_w = 133.0;
+        let mut t = AutoTuner::default();
+        t.set_envelope(env);
+        t.set_power_ceiling(Some(140.0));
+        t.enable_profile(TuneProfile::MaxHash);
+
+        let caps = t.caps();
+        assert_eq!(caps.power_w, 140.0);
+
+        // 139.5 W is above 133 W cali limit, but under 140 W PSU ceiling -> no breach.
+        let a = safety_step(&mut t, &tm(139.5, 6.7, 510.0, 3912, Some(3.0)));
+        assert_eq!(a, None);
+        assert_ne!(t.phase, TunePhase::BackedOff);
+
+        // 145 W instantaneous power exceeds 140 W ceiling -> safety breach trips backoff.
+        let mut a = None;
+        for _ in 0..t.envelope.safety_settle_cycles {
+            if let Some(act) = t.evaluate(&tm(145.0, 6.9, 510.0, 3912, Some(3.0))) {
+                a = Some(act);
+                break;
+            }
+        }
+        assert_eq!(a, Some(TuneAction::SetFrequency(500.0)));
+        assert_eq!(t.phase, TunePhase::BackedOff);
     }
 }
