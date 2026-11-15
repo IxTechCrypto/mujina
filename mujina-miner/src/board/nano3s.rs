@@ -1707,7 +1707,69 @@ fn disable_auto_tune_for_manual(auto_tuner: &mut AutoTune, why: &str) {
 }
 
 /// Queues an `auto_tune:<profile|off|keep>[;fan=<C>]` directive for the run
-/// loop (`profile`: `Some(None)` = off, `None` = keep). The worker persists
+/// Format an `auto_tune:` control-file directive and choose whether per-chip
+/// tuning should be updated (`false` by default whenever switching/disabling a
+/// profile or target).
+fn build_auto_tune_directive(
+    profile: Option<Option<TuneChoice>>,
+    fan_target_c: Option<f32>,
+    per_chip: Option<bool>,
+    continuous: Option<bool>,
+) -> String {
+    let mut line = auto_tune::directive_for_request(profile, fan_target_c);
+    let chip_flag = match per_chip {
+        Some(on) => Some(on),
+        None => profile.map(|_| false),
+    };
+    if let Some(on) = chip_flag {
+        line.push_str(if on { ";chip=on" } else { ";chip=off" });
+    }
+    if let Some(on) = continuous {
+        line.push_str(if on { ";continuous=on" } else { ";continuous=off" });
+    }
+    line
+}
+
+/// Apply a parsed `auto_tune:` directive to persisted tuning config: switching
+/// profiles/targets clears any previous per-chip offsets and defaults
+/// `chip_tune` off unless explicitly enabled in the same directive.
+fn apply_auto_tune_directive_to_conf(cfg: &mut PersistedTuning, d: &auto_tune::AutoTuneDirective) {
+    match d.profile {
+        Some(Some(choice)) => {
+            cfg.power_target_w = None;
+            cfg.temp_target_c = None;
+            cfg.autotune_hashrate_target_ths = None;
+            cfg.auto_tune_profile = Some(choice);
+            if d.fan_target_c.is_none() {
+                cfg.auto_fan_target_c = None;
+            }
+            if matches!(choice, TuneChoice::Profile(_)) {
+                cfg.auto_memory = None;
+            }
+            cfg.chip_offset_mhz = None;
+            cfg.chip_tune = d.chip_tune.unwrap_or(false);
+        }
+        Some(None) => {
+            cfg.auto_tune_profile = None;
+            cfg.chip_tune = false;
+        }
+        None => {}
+    }
+    if let Some(c) = d.fan_target_c {
+        cfg.auto_fan_target_c = Some(c);
+    }
+    if d.profile.is_none()
+        && let Some(on) = d.chip_tune
+    {
+        cfg.chip_tune = on;
+    }
+    if let Some(on) = d.continuous {
+        cfg.continuous = on;
+    }
+}
+
+/// Persists and queues an `auto_tune:<choice|off|keep>[;fan=<C>][;chip=on|off]`
+/// loop (`profile`: `Some(None)` = off, `None` = keep). The worker applies
 /// the choice when it consumes the directive. Shares the single-slot control
 /// file with every other writer: space calls >= 5 s.
 pub(crate) fn write_auto_tune_command(
@@ -1716,55 +1778,11 @@ pub(crate) fn write_auto_tune_command(
     per_chip: Option<bool>,
     continuous: Option<bool>,
 ) -> std::io::Result<()> {
-    let mut line = auto_tune::directive_for_request(profile, fan_target_c);
-    let chip_flag = match per_chip {
-        Some(true) => Some(true),
-        Some(false) => Some(false),
-        None => match profile {
-            Some(Some(_)) => Some(true),
-            Some(None) => Some(false),
-            None => None,
-        },
-    };
-    if let Some(on) = chip_flag {
-        line.push_str(if on { ";chip=on" } else { ";chip=off" });
-    }
-    if let Some(on) = continuous {
-        line.push_str(if on { ";continuous=on" } else { ";continuous=off" });
-    }
+    let line = build_auto_tune_directive(profile, fan_target_c, per_chip, continuous);
     if let Some(body) = line.strip_prefix("auto_tune:")
         && let Ok(d) = auto_tune::parse_auto_tune_directive(body)
     {
-        update_tuning_conf(|cfg| {
-            match d.profile {
-                Some(Some(choice)) => {
-                    cfg.power_target_w = None;
-                    cfg.temp_target_c = None;
-                    cfg.autotune_hashrate_target_ths = None;
-                    cfg.auto_tune_profile = Some(choice);
-                    if d.fan_target_c.is_none() {
-                        cfg.auto_fan_target_c = None;
-                    }
-                    if matches!(choice, TuneChoice::Profile(_)) {
-                        cfg.auto_memory = None;
-                    }
-                }
-                Some(None) => {
-                    cfg.auto_tune_profile = None;
-                    cfg.chip_tune = false;
-                }
-                None => {}
-            }
-            if let Some(c) = d.fan_target_c {
-                cfg.auto_fan_target_c = Some(c);
-            }
-            if let Some(on) = d.chip_tune {
-                cfg.chip_tune = on;
-            }
-            if let Some(on) = d.continuous {
-                cfg.continuous = on;
-            }
-        });
+        update_tuning_conf(|cfg| apply_auto_tune_directive_to_conf(cfg, &d));
     }
     std::fs::write(MUJINA_CONTROL_FILE, line)
 }
@@ -3037,7 +3055,10 @@ fn run_worker(
                 let body = s.strip_prefix("auto_tune:").or_else(|| s.strip_prefix("owner_tune:")).unwrap_or("");
                 let parsed = auto_tune::parse_auto_tune_directive(body);
                 let fan_given = parsed.as_ref().is_ok_and(|d| d.fan_target_c.is_some());
-                if let Ok(Some(on)) = parsed.as_ref().map(|d| d.chip_tune) {
+                let is_profile_switch = parsed.as_ref().is_ok_and(|d| matches!(d.profile, Some(Some(_))));
+                if !is_profile_switch
+                    && let Ok(Some(on)) = parsed.as_ref().map(|d| d.chip_tune)
+                {
                     persist_chip_tune(on);
                     persisted_tuning.chip_tune = on;
                     let mut start = chip_offset_mhz;
@@ -3090,11 +3111,29 @@ fn run_worker(
                         if !fan_given {
                             persist_auto_fan_target(None);
                         }
-                        if let Some(ct) = chip_tuner.take() {
-                            let start = stop_chip_tuner(ct, &mut chip_offset_mhz);
-                            persisted_chip_offsets = start;
-                            chip_tuner = Some(new_chip_tuner(Some(profile), start));
+                        // Profile/target switches clear all 12 per-chip offsets
+                        // and turn per-chip tuning off unless explicitly opted in.
+                        if let Some(mut ct) = chip_tuner.take() {
+                            ct.interrupt();
                         }
+                        let zeros = [0i16; CHIP_COUNT];
+                        send_chip_offsets(zeros, &mut chip_offset_mhz, "profile switched");
+                        persisted_chip_offsets = zeros;
+                        let chip_on = parsed.as_ref().ok().and_then(|d| d.chip_tune).unwrap_or(false);
+                        persisted_tuning.chip_tune = chip_on;
+                        update_tuning_conf(|cfg| {
+                            cfg.chip_offset_mhz = None;
+                            cfg.chip_tune = chip_on;
+                        });
+                        if chip_on {
+                            chip_tuner = Some(new_chip_tuner(Some(profile), zeros));
+                        } else {
+                            auto_tuner.set_chip_status(None);
+                        }
+                        eprintln!(
+                            "[nano3s] auto-tune switch: chip offsets zeroed, per-chip tuner {}",
+                            if chip_on { "on" } else { "off" }
+                        );
                         // Keep the throttle/PSU ceilings in step with the
                         // clock we start from (stale-ceiling bug).
                         temp_throttle_base_freq = last_applied_pll_freq;
@@ -3145,6 +3184,7 @@ fn run_worker(
                             persisted_chip_offsets = start;
                         }
                         persist_chip_tune(false);
+                        persisted_tuning.chip_tune = false;
                         auto_tuner.set_chip_status(None);
                         persist_auto_tune_profile(None);
                         auto_tuner.publish(None);
@@ -3967,6 +4007,15 @@ fn run_worker(
                             last_event: ct.last_event().to_owned(),
                             offsets_mhz: ct.offsets().to_vec(),
                         }));
+                    } else if !persisted_tuning.chip_tune
+                        && persisted_chip_offsets == [0i16; CHIP_COUNT]
+                        && chip_offset_mhz != [0i16; CHIP_COUNT]
+                    {
+                        send_chip_offsets(
+                            [0i16; CHIP_COUNT],
+                            &mut chip_offset_mhz,
+                            "retry zeroed chip offsets",
+                        );
                     }
                     auto_tuner.publish(Some(TuneSetpoint {
                         frequency_mhz: last_applied_pll_freq[0] as f32,
@@ -4467,5 +4516,58 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[test]
+    fn profile_switch_clears_chip_offsets_and_turns_chip_tune_off() {
+        let mut cfg = PersistedTuning {
+            auto_tune_profile: Some(TuneChoice::Profile(TuneProfile::Balanced)),
+            chip_tune: true,
+            chip_offset_mhz: Some([-60; CHIP_COUNT]),
+            ..Default::default()
+        };
+
+        // Switching to MaxHash without explicit per_chip defaults to chip=off
+        // and clears persisted chip offsets.
+        let line = build_auto_tune_directive(
+            Some(Some(TuneChoice::Profile(TuneProfile::MaxHash))),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(line, "auto_tune:max_hash;chip=off");
+        let parsed = auto_tune::parse_auto_tune_directive(line.strip_prefix("auto_tune:").unwrap())
+            .expect("valid directive");
+        apply_auto_tune_directive_to_conf(&mut cfg, &parsed);
+        assert_eq!(cfg.auto_tune_profile, Some(TuneChoice::Profile(TuneProfile::MaxHash)));
+        assert!(!cfg.chip_tune);
+        assert_eq!(cfg.chip_offset_mhz, None);
+
+        // Standalone per-chip toggle (`profile: None`) enables chip tuning
+        // without changing the active profile.
+        let keep_on = build_auto_tune_directive(None, None, Some(true), None);
+        assert_eq!(keep_on, "auto_tune:keep;chip=on");
+        let parsed_keep =
+            auto_tune::parse_auto_tune_directive(keep_on.strip_prefix("auto_tune:").unwrap())
+                .expect("valid keep directive");
+        apply_auto_tune_directive_to_conf(&mut cfg, &parsed_keep);
+        assert!(cfg.chip_tune);
+
+        // Switching to a Target also clears offsets and disables chip tuning.
+        cfg.chip_offset_mhz = Some([-40; CHIP_COUNT]);
+        let target_line = build_auto_tune_directive(
+            Some(Some(TuneChoice::Target(TuneTarget::Power(140.0)))),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(target_line, "auto_tune:power:140;chip=off");
+        let parsed_target =
+            auto_tune::parse_auto_tune_directive(target_line.strip_prefix("auto_tune:").unwrap())
+                .expect("valid target directive");
+        apply_auto_tune_directive_to_conf(&mut cfg, &parsed_target);
+        assert_eq!(cfg.auto_tune_profile, Some(TuneChoice::Target(TuneTarget::Power(140.0))));
+        assert!(!cfg.chip_tune);
+        assert_eq!(cfg.chip_offset_mhz, None);
     }
 }

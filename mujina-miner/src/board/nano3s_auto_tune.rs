@@ -236,7 +236,9 @@ pub struct AutoTuneRequest {
     #[serde(default)]
     pub chip_temp_target_c: Option<f32>,
     /// Per-chip clock tuner on/off while the autotuner is on (it runs only
-    /// once the autotuner has locked). Absent leaves it unchanged. Persisted.
+    /// once the autotuner has locked). Defaults to false when switching
+    /// profile/target (`profile` / `target` present); absent without a switch
+    /// leaves it unchanged. Persisted.
     #[serde(default)]
     pub per_chip: Option<bool>,
     /// Continuous dynamic tuning: continuously probes upward when thermal/cooling headroom opens up.

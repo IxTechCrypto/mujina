@@ -423,6 +423,7 @@ enum StallStage {
     None,
     RevertedWaiting,
     ReinitRequested,
+    GaveUp,
 }
 
 /// Where the tuner is in its search.
@@ -842,7 +843,12 @@ impl AutoTuner {
                 caps.power_w = caps.power_w.min(ceiling);
             }
         }
-        caps.safety_power_w = self.power_safety_w.unwrap_or(caps.power_w);
+        // Keep PSU-override safety scaling per mode (e.g. Balanced stays at ~95*1.03 W
+        // instead of adopting MaxHash's 144.2 W instantaneous trip ceiling).
+        caps.safety_power_w = self
+            .power_safety_w
+            .map(|s| s.min(caps.power_w * 1.03))
+            .unwrap_or(caps.power_w);
         caps
     }
 
@@ -1577,17 +1583,25 @@ impl AutoTuner {
                 Some(None)
             }
             StallStage::ReinitRequested => {
-                if self.stall_ticks >= WARMUP_STALL_TIMEOUT_TICKS && self.reinit_attempts < 2 {
-                    self.stall_ticks = 0;
-                    self.cycles_since_change = 0;
-                    self.acc = Accum::default();
-                    self.reinit_attempts += 1;
-                    self.log_event(
-                        "warmup stall persisted after re-init: retrying chain re-init",
-                        m,
-                    );
-                    return Some(Some(TuneAction::ReinitChain));
+                if self.stall_ticks >= WARMUP_STALL_TIMEOUT_TICKS {
+                    if self.reinit_attempts < 2 {
+                        self.stall_ticks = 0;
+                        self.cycles_since_change = 0;
+                        self.acc = Accum::default();
+                        self.reinit_attempts += 1;
+                        self.log_event(
+                            "warmup stall persisted after re-init: retrying chain re-init",
+                            m,
+                        );
+                        return Some(Some(TuneAction::ReinitChain));
+                    }
+                    self.stall_stage = StallStage::GaveUp;
+                    self.log_event("warmup stall unresolved after 2 re-inits", m);
                 }
+                self.phase = TunePhase::Warmup;
+                Some(None)
+            }
+            StallStage::GaveUp => {
                 self.phase = TunePhase::Warmup;
                 Some(None)
             }
@@ -3480,5 +3494,82 @@ mod tests {
             assert_eq!(t.evaluate(&m(55.0, 10.0, 0.0, 420.0, 1150)), None);
             assert_eq!(t.phase(), TunePhase::Warmup);
         }
+    }
+
+    #[test]
+    fn psu_override_safety_margin_scales_per_mode() {
+        let mut t = AutoTuner::default();
+        let mut env = TuneEnvelope::default();
+        env.balanced.power_w = 95.0 / 6.0;
+        env.quiet.power_w = 62.0 / 6.0;
+        env.max_hash.power_w = 133.0 / 6.0;
+        env.min_freq_mhz = 210.0;
+        env.max_freq_mhz = 600.0;
+        env.freq_step_mhz = 10.0;
+        env.power_settle_cycles = 2;
+        env.settle_cycles = 4;
+        t.set_envelope(env);
+        t.set_chip_count(6);
+        t.set_power_ceiling(Some(140.0));
+        t.set_power_safety(Some(140.0 * 1.03));
+
+        // MaxHash still gets 140.0 * 1.03 = 144.2 W.
+        t.enable_profile(TuneProfile::MaxHash);
+        assert!((t.caps().safety_power_w - 144.2).abs() < 0.01);
+
+        // Balanced scales off its 95 W cap (97.85 W), NOT 144.2 W.
+        t.enable_profile(TuneProfile::Balanced);
+        assert!((t.caps().safety_power_w - 95.0 * 1.03).abs() < 0.01);
+        let mut backed_off = false;
+        for _ in 0..=env.power_settle_cycles {
+            if let Some(TuneAction::SetFrequency(f)) = t.evaluate(&tm(99.0, 4.7, 340.0, 3548, Some(0.5))) {
+                assert!(f < 340.0);
+                backed_off = true;
+                break;
+            }
+        }
+        assert!(backed_off, "Balanced must trip above 97.85 W rather than waiting for 144.2 W");
+
+        // Quiet scales off its 62 W cap (~63.86 W).
+        t.enable_profile(TuneProfile::Quiet);
+        assert!((t.caps().safety_power_w - 62.0 * 1.03).abs() < 0.01);
+    }
+
+    #[test]
+    fn warmup_stall_logs_unresolved_after_two_reinits_once() {
+        let mut t = AutoTuner::default();
+        t.enable_target(TuneTarget::Power(120.0));
+        t.set_recovery_point(Some(TuneSetpoint { frequency_mhz: 420.0, core_voltage_mv: 1150 }));
+        let _ = step_to_action(&mut t, &tm(90.0, 4.0, 420.0, 1150, Some(0.5)));
+
+        // Trigger initial revert.
+        for _ in 0..WARMUP_STALL_TIMEOUT_TICKS {
+            let _ = t.evaluate(&tm(40.0, 0.0, 450.0, 1150, Some(0.0)));
+        }
+        // Attempt 1 re-init.
+        let mut reinit_1 = None;
+        for _ in 0..t.envelope.settle_cycles.clamp(1, WARMUP_STALL_TIMEOUT_TICKS) {
+            reinit_1 = t.evaluate(&tm(40.0, 0.0, 420.0, 1150, Some(0.0)));
+        }
+        assert_eq!(reinit_1, Some(TuneAction::ReinitChain));
+
+        // Attempt 2 re-init.
+        let mut reinit_2 = None;
+        for _ in 0..WARMUP_STALL_TIMEOUT_TICKS {
+            reinit_2 = t.evaluate(&tm(40.0, 0.0, 420.0, 1150, Some(0.0)));
+        }
+        assert_eq!(reinit_2, Some(TuneAction::ReinitChain));
+
+        // After 2 failed re-inits expire, tuner logs once and holds Warmup quietly.
+        for _ in 0..(WARMUP_STALL_TIMEOUT_TICKS + 5) {
+            assert_eq!(t.evaluate(&tm(40.0, 0.0, 420.0, 1150, Some(0.0))), None);
+            assert_eq!(t.phase(), TunePhase::Warmup);
+        }
+        let gave_up_count = t
+            .log
+            .iter()
+            .filter(|e| e.message == "warmup stall unresolved after 2 re-inits")
+            .count();
+        assert_eq!(gave_up_count, 1);
     }
 }
