@@ -23,6 +23,7 @@ use crate::board::nano3s_auto_tune::{AutoTuneRequest, AutoTuneStatus, MAX_DOMAIN
 use super::server::SharedState;
 use crate::api_client::types::{
     AutotuneHashrateRequest, AutotuneHashrateResponse, BoardFanRequest, BoardLedRequest,
+    DisplayPatchRequest, DisplayState,
     BoardChipClocksRequest, BoardLedState, BoardPauseRequest, BoardPowerTargetRequest, BoardTelemetry,
     BoardTempTargetRequest, BoardTuningRequest, FanCurvePoint, FanCurveRequest, FanCurveResponse,
     FirmwareBundleResponse, FirmwareUploadResponse, MinerPatchRequest, MinerTelemetry,
@@ -61,6 +62,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_board_fan_curve, patch_board_fan_curve))
         .routes(routes!(patch_board_pause))
         .routes(routes!(get_board_led, patch_board_led))
+        .routes(routes!(get_display, patch_display))
         .routes(routes!(post_reboot))
         .routes(routes!(get_pool, patch_pool))
         .routes(routes!(post_firmware_upload))
@@ -1976,6 +1978,65 @@ async fn patch_pool(Json(req): Json<PoolConfigRequest>) -> Result<Json<PoolConfi
         user: cfg.user,
         password_set: cfg.pass.is_some(),
     }))
+}
+
+/// Return the current LCD visual theme and page state.
+#[utoipa::path(
+    get,
+    path = "/display",
+    tag = "miner",
+    responses(
+        (status = OK, description = "Current display state", body = DisplayState),
+        (status = NOT_IMPLEMENTED, description = "Display controller unavailable in this build"),
+    ),
+)]
+async fn get_display() -> Result<Json<DisplayState>, StatusCode> {
+    #[cfg(feature = "nano3s")]
+    {
+        Ok(Json(crate::board::nano3s::get_display_state()))
+    }
+    #[cfg(not(feature = "nano3s"))]
+    {
+        Err(StatusCode::NOT_IMPLEMENTED)
+    }
+}
+
+/// Update the LCD visual theme (and optionally active page), synced live with the unit.
+#[utoipa::path(
+    patch,
+    path = "/display",
+    tag = "miner",
+    request_body = DisplayPatchRequest,
+    responses(
+        (status = OK, description = "Display state updated", body = DisplayState),
+        (status = BAD_REQUEST, description = "Invalid theme or page name"),
+        (status = INTERNAL_SERVER_ERROR, description = "Failed to persist display state"),
+        (status = NOT_IMPLEMENTED, description = "Display controller unavailable in this build"),
+    ),
+)]
+async fn patch_display(
+    Json(req): Json<DisplayPatchRequest>,
+) -> Result<Json<DisplayState>, StatusCode> {
+    #[cfg(feature = "nano3s")]
+    {
+        crate::board::nano3s::write_display_command(req.theme, req.page)
+            .map(Json)
+            .map_err(|e| match e {
+                crate::board::nano3s::DisplayError::BadRequest(msg) => {
+                    eprintln!("[api/display] bad request: {msg}");
+                    StatusCode::BAD_REQUEST
+                }
+                crate::board::nano3s::DisplayError::Io(msg) => {
+                    eprintln!("[api/display] I/O error: {msg}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            })
+    }
+    #[cfg(not(feature = "nano3s"))]
+    {
+        let _ = req;
+        Err(StatusCode::NOT_IMPLEMENTED)
+    }
 }
 
 /// Return all registered job sources.

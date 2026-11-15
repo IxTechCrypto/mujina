@@ -1,6 +1,8 @@
 #include "driver.h"
 #include "lvgl.h"
 #include "btc_mask.h"
+#include "ui_assets.h"
+#include "ui_fonts.h"
 
 #include <ctype.h>
 #include <fcntl.h>
@@ -19,75 +21,68 @@
 
 #define PAGE_FILE "/mntapp/release/linux/app/fb_page"
 #define PIZZA_FILE "/mntapp/release/linux/app/pizza.rgb565"
-/* Written by rtos_core/tools/mujina.c -- plain key=value lines. */
 #define NANO3S_LIVE_FILE "/tmp/nano3s_live.txt"
-/* Written by ble_setup.rs (2026-08-24) -- same key=value format. Since
- * the real Avalon Life app's own success/failure indicator turned out
- * unreliable (see ble_setup.rs's doc comments), this page is the
- * source of truth for WiFi-setup progress instead. */
 #define BLE_WIFI_STATUS_FILE "/tmp/ble_wifi_status.txt"
+#define UI_THEME_TMP_FILE "/tmp/ui_theme"
+#define UI_THEME_CONF_FILE "/data/userconfig/theme.conf"
 
 #define REFRESH_INTERVAL_MS 2000
 #define POLL_INTERVAL_MS 100
+#define ANIM_INTERVAL_MS 40
 
-/* Hashrate gauge scale is in deci-TH/s (0.1 TH/s per unit) so the needle
- * can move smoothly instead of snapping between whole TH/s ticks. 7.0 TH/s
- * headroom comfortably covers this chip's real observed range (~3.4-3.6
- * TH/s at production settings, up to ~6.7-6.8 TH/s in the fastest tested
- * PLL sweep configs) without the needle sitting pinned near max. */
-#define HASHRATE_GAUGE_MAX 70
+#define RGB565(r, g, b) ((uint16_t)((((r) >> 3) << 11) | (((g) >> 2) << 5) | ((b) >> 3)))
 
-/* Power ring: 140W headroom sits just above this project's own hard safety
- * ceiling (never let ina_power_w exceed 133W -- see feedback memory), so
- * the ring fill also doubles as an at-a-glance "how close to the limit"
- * indicator. Temp ring: 90C headroom covers the highest max-temp values
- * ever observed during this project's PLL/voltage sweeps (~85C). */
-#define POWER_GAUGE_MAX 140
-#define TEMP_GAUGE_MAX 90
+/* Brand & Theme RGB565 Colors */
+#define COL_BLACK        0x0000
+#define COL_WHITE        RGB565(255, 255, 255)
+#define COL_CYAN         RGB565(0, 240, 255)
+#define COL_MAG          RGB565(255, 46, 151)
+#define COL_CYBER_GREEN  RGB565(27, 255, 156)
+#define COL_AMBER        RGB565(255, 176, 0)
+#define COL_YELLOW       RGB565(255, 230, 0)
+#define COL_LIME         RGB565(200, 255, 0)
+#define COL_HOT_RED      RGB565(255, 46, 85)
+#define COL_CYBER_DIM    RGB565(122, 148, 180)
+#define COL_CYBER_TRACK  RGB565(14, 26, 44)
+#define COL_CYBER_LIGHT  RGB565(214, 247, 255)
+#define COL_CYBER_PILL   RGB565(10, 28, 24)
+#define COL_CYBER_WARN   RGB565(35, 10, 18)
 
-/* All three rings share this width -- uniform thickness per user
- * preference (previously hashrate was thicker at 18px than the other
- * two at 13px). The three rings' r_mod values (-2, -18, -34, see
- * build_screens()) are evenly spaced 16 apart to match: each ring's
- * outer edge sits exactly RING_WIDTH+2 inside the next ring's outer
- * edge, giving the same small 2px gap between every adjacent pair
- * instead of the uneven gap an earlier revision had between the
- * hashrate ring and the other two. */
-#define RING_WIDTH 14
+#define COL_MIN_ROYAL    RGB565(0, 102, 204)
+#define COL_MIN_SKY      RGB565(2, 132, 199)
+#define COL_MIN_SKY_BRT  RGB565(56, 189, 248)
+#define COL_MIN_MINT     RGB565(16, 185, 129)
+#define COL_MIN_MINT_BRT RGB565(52, 211, 153)
+#define COL_MIN_BLUE     RGB565(59, 130, 246)
+#define COL_MIN_WARM     RGB565(217, 119, 6)
+#define COL_MIN_HOT      RGB565(220, 38, 38)
+#define COL_MIN_INK      RGB565(45, 62, 80)
+#define COL_MIN_SUB      RGB565(78, 95, 118)
 
-/* ── Mujina brand tokens (256foundation/mujina-website .dark block) ──────── */
-#define C_BG lv_color_make(0x0e, 0x0f, 0x12)
+#define COL_PARA_DIM     RGB565(165, 165, 165)
+#define COL_PARA_COOL    RGB565(130, 130, 130)
+#define COL_PARA_DARK    RGB565(64, 64, 64)
+#define COL_PARA_RED     RGB565(255, 51, 51)
+
+/* Legacy LVGL colors for scr_waiting and scr_wifi_setup */
+#define C_BG     lv_color_make(0x0e, 0x0f, 0x12)
 #define C_TEXT_1 lv_color_make(0xe7, 0xe8, 0xec)
 #define C_TEXT_2 lv_color_make(0xb5, 0xb7, 0xbf)
 #define C_TEXT_3 lv_color_make(0x99, 0x9b, 0xa4)
-#define C_DIVIDER lv_color_make(0x27, 0x29, 0x31)
-#define C_ACCENT lv_color_make(0xd0, 0x55, 0x55)
-#define C_GREEN lv_color_make(0x39, 0xd3, 0x53)
+#define C_GREEN  lv_color_make(0x39, 0xd3, 0x53)
 #define C_YELLOW lv_color_make(0xff, 0xff, 0x00)
-#define C_ORANGE lv_color_make(0xff, 0x9f, 0x1c)
-#define C_RED lv_color_make(0xff, 0x55, 0x55)
-#define C_IP_BG lv_color_make(0x00, 0x15, 0x10)
-#define C_IP_BLUE lv_color_make(0x7f, 0xbc, 0xff)
-/* Same 0x7fbcff as C_IP_BLUE above, as a literal hex string for LVGL's
- * "#RRGGBB text#" inline label recolor syntax (which needs the digits
- * literally in the format string, not an lv_color_t) -- keep in sync if
- * C_IP_BLUE ever changes. */
-#define C_IP_BLUE_HEX "7fbcff"
-#define C_WHITE lv_color_make(0xff, 0xff, 0xff)
-#define C_CYAN lv_color_make(0x00, 0xf0, 0xff)
-#define C_MAG lv_color_make(0xff, 0x2e, 0x97)
-#define C_AMBER lv_color_make(0xff, 0xb0, 0x00)
+#define C_RED    lv_color_make(0xff, 0x55, 0x55)
 
-static lv_color_t temp_to_color(double t) {
-    if (t < 50.0) return C_CYAN;     /* t-cool */
-    if (t < 70.0) return C_GREEN;    /* t-normal */
-    if (t < 85.0) return C_AMBER;    /* t-warm */
-    return C_MAG;                    /* t-hot */
-}
+typedef enum {
+    THEME_CYBERPUNK = 0,
+    THEME_MINIMAL = 1,
+    THEME_PARASITE = 2
+} ui_theme_t;
 
 /* ── Display flush ────────────────────────────────────────────────────── */
 
 static lv_color_t draw_buf1[HOR_RES * 10];
+static uint16_t ui_fb[HOR_RES * VER_RES];
 
 static void fb_flush_cb(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p) {
     int fd = open(FB_DEV, O_WRONLY);
@@ -119,14 +114,32 @@ static void fb_flush_cb(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color
     lv_disp_flush_ready(disp_drv);
 }
 
+static void blit_ui_fb(const uint16_t *fb) {
+    int fd = open(FB_DEV, O_WRONLY);
+    if (fd < 0) {
+        return;
+    }
+    lseek(fd, 0, SEEK_SET);
+    size_t written = 0;
+    size_t total = HOR_RES * VER_RES * sizeof(uint16_t);
+    const uint8_t *ptr = (const uint8_t *)fb;
+    while (written < total) {
+        ssize_t wn = write(fd, ptr + written, total - written);
+        if (wn <= 0) {
+            break;
+        }
+        written += (size_t)wn;
+    }
+    close(fd);
+}
+
 static uint32_t now_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (uint32_t)((uint64_t)tv.tv_sec * 1000u + (uint64_t)tv.tv_usec / 1000u);
 }
 
-/* ── key=value telemetry file (NANO3S_LIVE_FILE) ─────────────────────────
- * Parsed in place into a fixed static buffer -- no heap allocation. */
+/* ── key=value telemetry parsing ──────────────────────────────────────── */
 
 #define KV_MAX_ENTRIES 32
 #define KV_BUF_SIZE 4096
@@ -140,11 +153,6 @@ static char kv_buf[KV_BUF_SIZE];
 static kv_entry_t kv_entries[KV_MAX_ENTRIES];
 static int kv_count;
 
-/* Reads `path` and parses "key=value" lines into kv_entries. Returns 0
- * if the file couldn't be read (callers fall back to a waiting/default
- * state). Shared by both NANO3S_LIVE_FILE and BLE_WIFI_STATUS_FILE --
- * only one is ever needed per refresh call, so reusing one static
- * buffer is fine. */
 static int read_kv_file(const char *path) {
     kv_count = 0;
     FILE *f = fopen(path, "r");
@@ -187,28 +195,20 @@ static const char *kv_str(const char *key) {
 
 static int kv_f64(const char *key, double *out) {
     const char *s = kv_str(key);
-    if (!s || *s == '\0') {
-        return 0;
-    }
+    if (!s || *s == '\0') return 0;
     char *end;
     double v = strtod(s, &end);
-    if (end == s) {
-        return 0;
-    }
+    if (end == s) return 0;
     *out = v;
     return 1;
 }
 
 static int kv_u32(const char *key, uint32_t *out) {
     const char *s = kv_str(key);
-    if (!s || *s == '\0') {
-        return 0;
-    }
+    if (!s || *s == '\0') return 0;
     char *end;
     unsigned long v = strtoul(s, &end, 10);
-    if (end == s) {
-        return 0;
-    }
+    if (end == s) return 0;
     *out = (uint32_t)v;
     return 1;
 }
@@ -218,21 +218,48 @@ static int kv_bool(const char *key) {
     return s && strcmp(s, "1") == 0;
 }
 
-/* Same thermal thresholds as fb_draw.rs's temp_color_c(). */
-static lv_color_t temp_color_c(double t) {
-    if (t < 38.0) return C_GREEN;
-    if (t < 44.0) return C_YELLOW;
-    if (t < 50.0) return C_ORANGE;
-    return C_RED;
+static ui_theme_t parse_theme_str(const char *s) {
+    if (!s) return THEME_CYBERPUNK;
+    while (*s && isspace((unsigned char)*s)) s++;
+    if (strncmp(s, "minimal", 7) == 0 || strncmp(s, "apple", 5) == 0) return THEME_MINIMAL;
+    if (strncmp(s, "parasite", 8) == 0) return THEME_PARASITE;
+    return THEME_CYBERPUNK;
 }
 
-/* ── wlan0 IP lookup (mirrors fb_draw.rs's wlan_ip()) ────────────────────
- * Same `ifconfig wlan0` + "inet addr:" scrape as the original. */
+static ui_theme_t read_ui_theme(void) {
+    char buf[64];
+    FILE *f = fopen(UI_THEME_TMP_FILE, "r");
+    if (f) {
+        if (fgets(buf, sizeof(buf), f)) {
+            fclose(f);
+            return parse_theme_str(buf);
+        }
+        fclose(f);
+    }
+    f = fopen(UI_THEME_CONF_FILE, "r");
+    if (f) {
+        while (fgets(buf, sizeof(buf), f)) {
+            char *eq = strchr(buf, '=');
+            if (eq) {
+                if (strncmp(buf, "theme", 5) == 0) {
+                    fclose(f);
+                    return parse_theme_str(eq + 1);
+                }
+            } else {
+                fclose(f);
+                return parse_theme_str(buf);
+            }
+        }
+        fclose(f);
+    }
+    return THEME_CYBERPUNK;
+}
+
+/* ── Network lookups ──────────────────────────────────────────────────── */
+
 static int wlan_ip(char *out, size_t out_size) {
     FILE *p = popen("ifconfig wlan0 2>/dev/null", "r");
-    if (!p) {
-        return 0;
-    }
+    if (!p) return 0;
     char buf[2048];
     size_t n = fread(buf, 1, sizeof(buf) - 1, p);
     pclose(p);
@@ -240,42 +267,47 @@ static int wlan_ip(char *out, size_t out_size) {
 
     const char *needle = "inet addr:";
     char *start = strstr(buf, needle);
-    if (!start) {
-        return 0;
-    }
+    if (!start) return 0;
     start += strlen(needle);
     char *end = start;
     while (*end && !isspace((unsigned char)*end)) {
         end++;
     }
     size_t len = (size_t)(end - start);
-    if (len == 0 || len >= out_size) {
-        return 0;
-    }
+    if (len == 0 || len >= out_size) return 0;
     memcpy(out, start, len);
     out[len] = '\0';
     return 1;
 }
 
-/* Defense-in-depth for the doom page hand-off: the beeper
- * (/dev/input/event1, same device fb_button.rs's click-feedback beep
- * uses) is a stateful hardware device -- it keeps sounding whatever tone
- * it was last told to play regardless of whether the writing process is
- * still alive. nano3s_doom has its own SIGTERM-triggered cleanup, but if
- * it ever dies uncleanly (hard kill, crash) the buzzer would otherwise
- * stay stuck making noise until *something* else writes a new tone to
- * the same device. Silence it unconditionally whenever we take control
- * back from the doom page, regardless of why nano3s_doom stopped. */
+static int wlan_rssi_dbm(int *out_dbm) {
+    FILE *f = fopen("/proc/net/wireless", "r");
+    if (!f) return 0;
+    char line[256];
+    int ok = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *p = strstr(line, "wlan0:");
+        if (p) {
+            int status = 0;
+            float link = 0, level = 0;
+            if (sscanf(p + 6, "%d %f %f", &status, &link, &level) == 3) {
+                *out_dbm = (int)roundf(level);
+                ok = 1;
+            }
+            break;
+        }
+    }
+    fclose(f);
+    return ok;
+}
+
 static void silence_buzzer(void) {
     int fd = open("/dev/input/event1", O_WRONLY);
-    if (fd < 0) {
-        return;
-    }
+    if (fd < 0) return;
     uint8_t event[24];
     memset(event, 0, sizeof(event));
     event[16] = 0x12; /* EV_SND */
     event[18] = 0x02; /* SND_TONE */
-    /* value (bytes 20..24) already zeroed -- frequency 0 == silence */
     ssize_t ignore = write(fd, event, sizeof(event));
     (void)ignore;
     event[16] = 0x00; /* EV_SYN */
@@ -285,630 +317,573 @@ static void silence_buzzer(void) {
     close(fd);
 }
 
-/* ── Widget helpers ───────────────────────────────────────────────────── */
+/* ── Fast Polar Annulus LUT & Direct RGB565 Primitives ────────────────── */
 
-static lv_obj_t *make_label(lv_obj_t *parent, const lv_font_t *font, lv_color_t color, lv_coord_t y,
-                             const char *text) {
-    lv_obj_t *l = lv_label_create(parent);
-    lv_obj_set_style_text_font(l, font, LV_PART_MAIN);
-    lv_obj_set_style_text_color(l, color, LV_PART_MAIN);
-    lv_obj_align(l, LV_ALIGN_TOP_MID, 0, y);
-    if (text) {
-        lv_label_set_text(l, text);
-    }
-    return l;
-}
+#define RING_LUT_MAX 22000
 
-static lv_obj_t *make_divider(lv_obj_t *parent, lv_coord_t y) {
-    lv_obj_t *d = lv_obj_create(parent);
-    lv_obj_remove_style_all(d);
-    lv_obj_set_size(d, 136, 1);
-    lv_obj_set_style_bg_color(d, C_DIVIDER, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(d, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_align(d, LV_ALIGN_TOP_MID, 0, y);
-    return d;
-}
+typedef struct {
+    uint16_t idx;
+    float r;
+    float deg; /* [0, 360) clockwise from 3 o'clock (0=+X, 90=+Y) */
+} ring_lut_px_t;
 
-static void style_bg(lv_obj_t *scr, lv_color_t bg) {
-    lv_obj_set_style_bg_color(scr, bg, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
-}
+static ring_lut_px_t ring_lut[RING_LUT_MAX];
+static int ring_lut_len = 0;
 
-/* ── Screens ──────────────────────────────────────────────────────────── */
-
-static lv_obj_t *scr_waiting, *waiting_label;
-
-static lv_obj_t *scr_live, *live_meter, *live_status, *live_hashrate_big, *live_sub, *live_temp_small, *live_pool_small;
-static lv_meter_scale_t *live_scale, *live_scale_power, *live_scale_temp;
-static lv_meter_indicator_t *live_arc, *live_arc_power, *live_arc_temp;
-
-static lv_obj_t *scr_diag, *diag_chips_meter, *diag_chips_label, *diag_pll, *diag_voltage, *diag_err;
-static lv_meter_scale_t *diag_chips_scale;
-static lv_meter_indicator_t *diag_chips_arc;
-
-/* Screen 3: Auto Tuner Profile & 12-Chip Thermal Focus */
-static lv_obj_t *scr_tuner;
-static lv_obj_t *chip_arcs[12];
-static lv_obj_t *tuner_title;
-static lv_obj_t *tuner_mode_card, *tuner_mode_bar, *tuner_mode_sub, *tuner_mode_val;
-static lv_obj_t *tuner_cont_pill, *tuner_cont_lbl;
-static lv_obj_t *tuner_cool_card, *tuner_cool_title, *tuner_cool_val;
-static lv_obj_t *tuner_hot_card, *tuner_hot_title, *tuner_hot_val;
-static lv_obj_t *tuner_avg_lbl;
-
-static lv_obj_t *scr_ip, *ip_caption, *ip_value, *ip_no_wifi;
-
-static lv_obj_t *scr_wifi_setup, *wifi_setup_status, *wifi_setup_detail, *wifi_setup_meter;
-static lv_meter_scale_t *wifi_setup_scale;
-static lv_meter_indicator_t *wifi_setup_arc;
-
-static void build_screens(void) {
-    const lv_font_t *f14 = &lv_font_montserrat_14;
-    const lv_font_t *f24 = &lv_font_montserrat_24;
-
-    /* waiting / startup splash */
-    scr_waiting = lv_obj_create(NULL);
-    style_bg(scr_waiting, C_BG);
-    waiting_label = make_label(scr_waiting, f24, C_TEXT_1, 112, NULL);
-
-    /* live-nano3s telemetry -- a speedometer-style radial gauge as the
-     * centerpiece (fitting the display's own round physical shape), with
-     * the rest of the telemetry living in its empty center like a car's
-     * trip computer, instead of a plain stacked text list. */
-    scr_live = lv_obj_create(NULL);
-    style_bg(scr_live, C_BG);
-
-    live_meter = lv_meter_create(scr_live);
-    lv_obj_remove_style_all(live_meter);
-    lv_obj_set_size(live_meter, 220, 220);
-    lv_obj_center(live_meter);
-
-    /* Three concentric rings, like a fitness-tracker activity dial:
-     * outer = hashrate (status-colored), middle = chain temp
-     * (thermal-threshold colored), inner = power draw (fixed accent) --
-     * temp and power swapped from their original outer-to-inner order per
-     * user preference. All three now share RING_WIDTH (uniform thickness
-     * per user preference; hashrate used to be thicker than the other
-     * two). No tick marks on any ring (the outer ring's were removed per
-     * user preference) -- all three are legible from fill position +
-     * color alone, backed by the numeric center readout. */
-    live_scale = lv_meter_add_scale(live_meter);
-    lv_meter_set_scale_range(live_meter, live_scale, 0, HASHRATE_GAUGE_MAX, 270, 135);
-
-    live_arc = lv_meter_add_arc(live_meter, live_scale, RING_WIDTH, C_GREEN, -2);
-    lv_meter_set_indicator_start_value(live_meter, live_arc, 0);
-    lv_meter_set_indicator_end_value(live_meter, live_arc, 0);
-
-    live_scale_power = lv_meter_add_scale(live_meter);
-    lv_meter_set_scale_range(live_meter, live_scale_power, 0, POWER_GAUGE_MAX, 270, 135);
-    live_arc_power = lv_meter_add_arc(live_meter, live_scale_power, RING_WIDTH, C_IP_BLUE, -34);
-    lv_meter_set_indicator_start_value(live_meter, live_arc_power, 0);
-    lv_meter_set_indicator_end_value(live_meter, live_arc_power, 0);
-
-    live_scale_temp = lv_meter_add_scale(live_meter);
-    lv_meter_set_scale_range(live_meter, live_scale_temp, 0, TEMP_GAUGE_MAX, 270, 135);
-    live_arc_temp = lv_meter_add_arc(live_meter, live_scale_temp, RING_WIDTH, C_GREEN, -18);
-    lv_meter_set_indicator_start_value(live_meter, live_arc_temp, 0);
-    lv_meter_set_indicator_end_value(live_meter, live_arc_temp, 0);
-
-    live_status = lv_label_create(scr_live);
-    lv_obj_set_style_text_font(live_status, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(live_status, C_GREEN, LV_PART_MAIN);
-    lv_obj_align(live_status, LV_ALIGN_CENTER, 0, -34);
-
-    live_hashrate_big = lv_label_create(scr_live);
-    lv_obj_set_style_text_font(live_hashrate_big, f24, LV_PART_MAIN);
-    lv_obj_set_style_text_color(live_hashrate_big, C_TEXT_1, LV_PART_MAIN);
-    lv_obj_align(live_hashrate_big, LV_ALIGN_CENTER, 0, -8);
-
-    live_sub = lv_label_create(scr_live);
-    lv_obj_set_style_text_font(live_sub, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(live_sub, C_TEXT_2, LV_PART_MAIN);
-    lv_label_set_text(live_sub, "TH/S");
-    lv_obj_align(live_sub, LV_ALIGN_CENTER, 0, 16);
-
-    /* Compact "temp * power" readout -- the rings carry the at-a-glance
-     * signal, this is just the precise numbers. */
-    live_temp_small = lv_label_create(scr_live);
-    lv_obj_set_style_text_font(live_temp_small, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(live_temp_small, C_TEXT_3, LV_PART_MAIN);
-    lv_obj_align(live_temp_small, LV_ALIGN_CENTER, 0, 36);
-    /* The watt figure gets its own inline color (matching the power ring's
-     * C_IP_BLUE) via LVGL's built-in "#RRGGBB text#" recolor syntax, so it
-     * reads as "that's the power ring's number" at a glance -- the temp
-     * figure alongside it keeps using the label's own style color, which
-     * refresh_live() still sets to the thermal-threshold color each frame. */
-    lv_label_set_recolor(live_temp_small, true);
-
-    live_pool_small = lv_label_create(scr_live);
-    lv_obj_set_style_text_font(live_pool_small, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(live_pool_small, C_TEXT_3, LV_PART_MAIN);
-    lv_obj_align(live_pool_small, LV_ALIGN_CENTER, 0, 54);
-
-    /* nano3s-diag */
-    scr_diag = lv_obj_create(NULL);
-    style_bg(scr_diag, C_BG);
-    make_label(scr_diag, f14, C_ACCENT, 16, "DIAGNOSTICS");
-
-    /* Chips-online gauge -- small radial fraction-of-12 dial instead of
-     * plain "N / 12" text, echoing the main hashrate gauge's language. */
-    diag_chips_meter = lv_meter_create(scr_diag);
-    lv_obj_remove_style_all(diag_chips_meter);
-    lv_obj_set_size(diag_chips_meter, 92, 92);
-    lv_obj_align(diag_chips_meter, LV_ALIGN_TOP_MID, 0, 36);
-
-    diag_chips_scale = lv_meter_add_scale(diag_chips_meter);
-    /* Same 270/135 sweep as the main hashrate gauge (bottom gap) for a
-     * consistent visual language across pages. */
-    lv_meter_set_scale_range(diag_chips_meter, diag_chips_scale, 0, 12, 270, 135);
-    lv_meter_set_scale_ticks(diag_chips_meter, diag_chips_scale, 13, 1, 4, C_DIVIDER);
-
-    diag_chips_arc = lv_meter_add_arc(diag_chips_meter, diag_chips_scale, 6, C_GREEN, -6);
-    lv_meter_set_indicator_start_value(diag_chips_meter, diag_chips_arc, 0);
-    lv_meter_set_indicator_end_value(diag_chips_meter, diag_chips_arc, 0);
-
-    diag_chips_label = lv_label_create(scr_diag);
-    lv_obj_set_style_text_font(diag_chips_label, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(diag_chips_label, C_TEXT_1, LV_PART_MAIN);
-    lv_obj_align(diag_chips_label, LV_ALIGN_TOP_MID, 0, 78);
-
-    make_divider(scr_diag, 134);
-    make_label(scr_diag, f14, C_TEXT_2, 142, "PLL LOW MODE (MHZ)");
-    diag_pll = make_label(scr_diag, f14, C_TEXT_1, 160, NULL);
-    make_divider(scr_diag, 182);
-    make_label(scr_diag, f14, C_TEXT_2, 190, "CORE VOLTAGE");
-    diag_voltage = make_label(scr_diag, f14, C_TEXT_1, 206, NULL);
-    diag_err = make_label(scr_diag, f14, C_TEXT_3, 224, NULL);
-
-    /* nano3s-tuner (Screen 3): Auto Tuner Profile & Per-Chip Thermal Notches */
-    scr_tuner = lv_obj_create(NULL);
-    style_bg(scr_tuner, C_BG);
-
-    /* 12 Perimeter Chips brought comfortably inset from bezel edge (size 222x222, 9px inset from glass edge)
-     * with prominent 8-degree gaps (22 deg notch, 8 deg gap) */
-    for (int i = 0; i < 12; i++) {
-        chip_arcs[i] = lv_arc_create(scr_tuner);
-        lv_obj_remove_style(chip_arcs[i], NULL, LV_PART_KNOB);
-        lv_obj_clear_flag(chip_arcs[i], LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_set_size(chip_arcs[i], 222, 222);
-        lv_obj_center(chip_arcs[i]);
-        lv_obj_set_style_pad_all(chip_arcs[i], 0, LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(chip_arcs[i], LV_OPA_TRANSP, LV_PART_MAIN);
-        lv_obj_set_style_border_width(chip_arcs[i], 0, LV_PART_MAIN);
-
-        uint16_t a1 = (uint16_t)(((270 + i * 30) % 360) + 4);
-        uint16_t a2 = (uint16_t)(a1 + 22);
-
-        lv_arc_set_rotation(chip_arcs[i], 0);
-        lv_arc_set_bg_angles(chip_arcs[i], a1, a2);
-        lv_arc_set_angles(chip_arcs[i], a1, a2);
-        lv_obj_set_style_arc_width(chip_arcs[i], 4, LV_PART_MAIN);
-        lv_obj_set_style_arc_width(chip_arcs[i], 4, LV_PART_INDICATOR);
-        lv_obj_set_style_arc_color(chip_arcs[i], lv_color_make(20, 25, 34), LV_PART_MAIN);
-        lv_obj_set_style_arc_color(chip_arcs[i], C_GREEN, LV_PART_INDICATOR);
-    }
-
-    /* Top Title Header */
-    tuner_title = lv_label_create(scr_tuner);
-    lv_obj_set_style_text_font(tuner_title, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(tuner_title, C_CYAN, LV_PART_MAIN);
-    lv_obj_set_width(tuner_title, 240);
-    lv_obj_set_style_text_align(tuner_title, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_label_set_text(tuner_title, "// AUTO TUNER \\\\");
-    lv_obj_align(tuner_title, LV_ALIGN_TOP_MID, 0, 38);
-
-    /* Central Chamfered Workmode Card (132x38, centered, generous clearance) */
-    tuner_mode_card = lv_obj_create(scr_tuner);
-    lv_obj_remove_style_all(tuner_mode_card);
-    lv_obj_set_size(tuner_mode_card, 132, 38);
-    lv_obj_set_style_pad_all(tuner_mode_card, 0, LV_PART_MAIN);
-    lv_obj_align(tuner_mode_card, LV_ALIGN_TOP_MID, 0, 58);
-    lv_obj_set_style_bg_color(tuner_mode_card, lv_color_make(14, 20, 32), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(tuner_mode_card, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_color(tuner_mode_card, C_CYAN, LV_PART_MAIN);
-    lv_obj_set_style_border_width(tuner_mode_card, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(tuner_mode_card, 4, LV_PART_MAIN);
-
-    /* Left Neon Vertical Accent Strip */
-    tuner_mode_bar = lv_obj_create(tuner_mode_card);
-    lv_obj_remove_style_all(tuner_mode_bar);
-    lv_obj_set_size(tuner_mode_bar, 3, 38);
-    lv_obj_align(tuner_mode_bar, LV_ALIGN_LEFT_MID, 0, 0);
-    lv_obj_set_style_bg_color(tuner_mode_bar, C_CYAN, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(tuner_mode_bar, LV_OPA_COVER, LV_PART_MAIN);
-
-    tuner_mode_sub = lv_label_create(tuner_mode_card);
-    lv_obj_set_style_text_font(tuner_mode_sub, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(tuner_mode_sub, C_TEXT_3, LV_PART_MAIN);
-    lv_obj_set_width(tuner_mode_sub, 126);
-    lv_obj_set_style_text_align(tuner_mode_sub, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(tuner_mode_sub, LV_ALIGN_TOP_MID, 2, 2);
-    lv_label_set_text(tuner_mode_sub, "TARGET PROFILE");
-
-    tuner_mode_val = lv_label_create(tuner_mode_card);
-    lv_obj_set_style_text_font(tuner_mode_val, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(tuner_mode_val, C_AMBER, LV_PART_MAIN);
-    lv_obj_set_width(tuner_mode_val, 126);
-    lv_obj_set_style_text_align(tuner_mode_val, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(tuner_mode_val, LV_ALIGN_BOTTOM_MID, 2, -2);
-    lv_label_set_text(tuner_mode_val, "MAX HASH");
-
-    /* Continuous Tuning Pill (136x24, single line no-wrap) */
-    tuner_cont_pill = lv_obj_create(scr_tuner);
-    lv_obj_remove_style_all(tuner_cont_pill);
-    lv_obj_set_size(tuner_cont_pill, 136, 24);
-    lv_obj_set_style_pad_all(tuner_cont_pill, 0, LV_PART_MAIN);
-    lv_obj_align(tuner_cont_pill, LV_ALIGN_TOP_MID, 0, 102);
-    lv_obj_set_style_bg_color(tuner_cont_pill, lv_color_make(12, 38, 24), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(tuner_cont_pill, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_color(tuner_cont_pill, C_GREEN, LV_PART_MAIN);
-    lv_obj_set_style_border_width(tuner_cont_pill, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(tuner_cont_pill, 12, LV_PART_MAIN);
-
-    tuner_cont_lbl = lv_label_create(tuner_cont_pill);
-    lv_obj_set_style_text_font(tuner_cont_lbl, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(tuner_cont_lbl, C_GREEN, LV_PART_MAIN);
-    lv_label_set_long_mode(tuner_cont_lbl, LV_LABEL_LONG_CLIP);
-    lv_obj_set_width(tuner_cont_lbl, 136);
-    lv_obj_set_style_text_align(tuner_cont_lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(tuner_cont_lbl, LV_ALIGN_CENTER, 0, 0);
-    lv_label_set_text(tuner_cont_lbl, "CONTINUOUS: ON");
-
-    /* Dedicated Lower Thermal Extremity Cards (Coolest vs Hottest) */
-    tuner_cool_card = lv_obj_create(scr_tuner);
-    lv_obj_remove_style_all(tuner_cool_card);
-    lv_obj_set_size(tuner_cool_card, 58, 36);
-    lv_obj_set_style_pad_all(tuner_cool_card, 0, LV_PART_MAIN);
-    lv_obj_align(tuner_cool_card, LV_ALIGN_TOP_MID, -33, 132);
-    lv_obj_set_style_bg_color(tuner_cool_card, lv_color_make(14, 20, 32), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(tuner_cool_card, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_color(tuner_cool_card, C_DIVIDER, LV_PART_MAIN);
-    lv_obj_set_style_border_width(tuner_cool_card, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(tuner_cool_card, 4, LV_PART_MAIN);
-
-    tuner_cool_title = lv_label_create(tuner_cool_card);
-    lv_obj_set_style_text_font(tuner_cool_title, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(tuner_cool_title, C_TEXT_3, LV_PART_MAIN);
-    lv_obj_set_width(tuner_cool_title, 58);
-    lv_obj_set_style_text_align(tuner_cool_title, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(tuner_cool_title, LV_ALIGN_TOP_MID, 0, 2);
-    lv_label_set_text(tuner_cool_title, "C11");
-
-    tuner_cool_val = lv_label_create(tuner_cool_card);
-    lv_obj_set_style_text_font(tuner_cool_val, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(tuner_cool_val, C_GREEN, LV_PART_MAIN);
-    lv_obj_set_width(tuner_cool_val, 58);
-    lv_obj_set_style_text_align(tuner_cool_val, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(tuner_cool_val, LV_ALIGN_BOTTOM_MID, 0, -2);
-    lv_label_set_text(tuner_cool_val, "59.0C");
-
-    tuner_hot_card = lv_obj_create(scr_tuner);
-    lv_obj_remove_style_all(tuner_hot_card);
-    lv_obj_set_size(tuner_hot_card, 58, 36);
-    lv_obj_set_style_pad_all(tuner_hot_card, 0, LV_PART_MAIN);
-    lv_obj_align(tuner_hot_card, LV_ALIGN_TOP_MID, 33, 132);
-    lv_obj_set_style_bg_color(tuner_hot_card, lv_color_make(14, 20, 32), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(tuner_hot_card, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_color(tuner_hot_card, C_DIVIDER, LV_PART_MAIN);
-    lv_obj_set_style_border_width(tuner_hot_card, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(tuner_hot_card, 4, LV_PART_MAIN);
-
-    tuner_hot_title = lv_label_create(tuner_hot_card);
-    lv_obj_set_style_text_font(tuner_hot_title, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(tuner_hot_title, C_TEXT_3, LV_PART_MAIN);
-    lv_obj_set_width(tuner_hot_title, 58);
-    lv_obj_set_style_text_align(tuner_hot_title, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(tuner_hot_title, LV_ALIGN_TOP_MID, 0, 2);
-    lv_label_set_text(tuner_hot_title, "C05");
-
-    tuner_hot_val = lv_label_create(tuner_hot_card);
-    lv_obj_set_style_text_font(tuner_hot_val, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(tuner_hot_val, C_MAG, LV_PART_MAIN);
-    lv_obj_set_width(tuner_hot_val, 58);
-    lv_obj_set_style_text_align(tuner_hot_val, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(tuner_hot_val, LV_ALIGN_BOTTOM_MID, 0, -2);
-    lv_label_set_text(tuner_hot_val, "85.9C");
-
-    /* Bottom Summary Label */
-    tuner_avg_lbl = lv_label_create(scr_tuner);
-    lv_obj_set_style_text_font(tuner_avg_lbl, f14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(tuner_avg_lbl, C_TEXT_1, LV_PART_MAIN);
-    lv_obj_set_width(tuner_avg_lbl, 240);
-    lv_obj_set_style_text_align(tuner_avg_lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_label_set_text(tuner_avg_lbl, "AVG CHIP: -- C");
-    lv_obj_align(tuner_avg_lbl, LV_ALIGN_TOP_MID, 0, 176);
-
-    /* ip / network */
-    scr_ip = lv_obj_create(NULL);
-    style_bg(scr_ip, C_IP_BG);
-    make_label(scr_ip, f24, C_GREEN, 48, "NETWORK");
-    ip_caption = make_label(scr_ip, f14, C_IP_BLUE, 90, "IP ADDRESS");
-    ip_value = make_label(scr_ip, f24, C_WHITE, 112, NULL);
-    ip_no_wifi = make_label(scr_ip, f24, C_RED, 104, "NO WIFI");
-
-    /* wifi-setup -- BLE provisioning progress. Source of truth for
-     * setup outcome, since the vendor phone app's own success/failure
-     * indicator was found unreliable (see ble_setup.rs). A single
-     * progress ring (same visual language as the main hashrate gauge)
-     * instead of plain stacked text -- fill fraction + color together
-     * read as "how far along" at a glance, refresh_wifi_setup() picks
-     * both per state. */
-    scr_wifi_setup = lv_obj_create(NULL);
-    style_bg(scr_wifi_setup, C_BG);
-
-    wifi_setup_meter = lv_meter_create(scr_wifi_setup);
-    lv_obj_remove_style_all(wifi_setup_meter);
-    lv_obj_set_size(wifi_setup_meter, 150, 150);
-    lv_obj_align(wifi_setup_meter, LV_ALIGN_TOP_MID, 0, 14);
-
-    wifi_setup_scale = lv_meter_add_scale(wifi_setup_meter);
-    lv_meter_set_scale_range(wifi_setup_meter, wifi_setup_scale, 0, 100, 360, 0);
-    wifi_setup_arc = lv_meter_add_arc(wifi_setup_meter, wifi_setup_scale, RING_WIDTH, C_YELLOW, 0);
-    lv_meter_set_indicator_start_value(wifi_setup_meter, wifi_setup_arc, 0);
-    lv_meter_set_indicator_end_value(wifi_setup_meter, wifi_setup_arc, 0);
-
-    /* Short state word inside the ring (e.g. "BLE", "LINKED", "OK") --
-     * the full sentence lives below, this is just the at-a-glance core. */
-    wifi_setup_status = lv_label_create(scr_wifi_setup);
-    lv_obj_set_style_text_font(wifi_setup_status, f24, LV_PART_MAIN);
-    lv_obj_set_style_text_color(wifi_setup_status, C_TEXT_1, LV_PART_MAIN);
-    lv_obj_align(wifi_setup_status, LV_ALIGN_TOP_MID, 0, 78);
-
-    /* Full status sentence + detail (device name / SSID / IP), below
-     * the ring. make_label() aligns based on the label's width AT THAT
-     * MOMENT (near-zero for an empty/NULL-text label); widening it
-     * afterward does not retroactively recompute that position, so
-     * re-align explicitly after setting width/wrap. */
-    wifi_setup_detail = make_label(scr_wifi_setup, f14, C_TEXT_2, 176, NULL);
-    lv_label_set_long_mode(wifi_setup_detail, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(wifi_setup_detail, 210);
-    lv_obj_set_style_text_align(wifi_setup_detail, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(wifi_setup_detail, LV_ALIGN_TOP_MID, 0, 176);
-}
-
-/* ── Per-page refresh ─────────────────────────────────────────────────── */
-
-static void refresh_waiting(const char *msg) {
-    lv_label_set_text(waiting_label, msg);
-    lv_scr_load(scr_waiting);
-}
-
-static void refresh_live(void) {
-    int pool_connected = kv_bool("pool_connected");
-    int ipc_connected = kv_bool("ipc_connected");
-    int have_hashrate = kv_str("hashrate_ghs") != NULL;
-    int paused = kv_bool("paused");
-
-    const char *status_text;
-    lv_color_t status_color;
-    if (paused) {
-        status_text = "PAUSED";
-        status_color = C_YELLOW;
-    } else if (pool_connected && ipc_connected && have_hashrate) {
-        status_text = "MINING";
-        status_color = C_GREEN;
-    } else if (pool_connected || ipc_connected) {
-        status_text = "CONNECTING";
-        status_color = C_YELLOW;
-    } else {
-        status_text = "OFFLINE";
-        status_color = C_RED;
-    }
-    lv_label_set_text(live_status, status_text);
-    lv_obj_set_style_text_color(live_status, status_color, LV_PART_MAIN);
-
-    /* lv_meter has no post-creation indicator-color setter -- the struct
-     * is public (lv_meter.h), so mutate the field directly and invalidate
-     * to force a redraw with the new color. */
-    live_arc->type_data.arc.color = status_color;
-
-    char buf[64];
-    uint32_t ghs;
-    int32_t gauge_deciTH = 0;
-    if (paused) {
-        lv_label_set_text(live_hashrate_big, "IDLE");
-        lv_obj_set_style_text_color(live_hashrate_big, C_TEXT_3, LV_PART_MAIN);
-    } else if (kv_u32("hashrate_ghs", &ghs) && ghs > 0) {
-        snprintf(buf, sizeof(buf), "%.2f", ghs / 1000.0);
-        lv_label_set_text(live_hashrate_big, buf);
-        lv_obj_set_style_text_color(live_hashrate_big, C_TEXT_1, LV_PART_MAIN);
-        gauge_deciTH = (int32_t)((ghs + 50) / 100);
-        if (gauge_deciTH > HASHRATE_GAUGE_MAX) {
-            gauge_deciTH = HASHRATE_GAUGE_MAX;
+static void init_ring_lut(void) {
+    ring_lut_len = 0;
+    for (int y = 0; y < VER_RES; y++) {
+        float dy = (float)y - 119.5f;
+        for (int x = 0; x < HOR_RES; x++) {
+            float dx = (float)x - 119.5f;
+            float r = sqrtf(dx * dx + dy * dy);
+            if (r >= 84.0f && r <= 116.5f && ring_lut_len < RING_LUT_MAX) {
+                float deg = atan2f(dy, dx) * 57.2957795f;
+                if (deg < 0.0f) deg += 360.0f;
+                ring_lut[ring_lut_len].idx = (uint16_t)(y * HOR_RES + x);
+                ring_lut[ring_lut_len].r = r;
+                ring_lut[ring_lut_len].deg = deg;
+                ring_lut_len++;
+            }
         }
-    } else {
-        lv_label_set_text(live_hashrate_big, "--");
-        lv_obj_set_style_text_color(live_hashrate_big, C_TEXT_3, LV_PART_MAIN);
     }
-    lv_meter_set_indicator_end_value(live_meter, live_arc, gauge_deciTH);
-
-    /* Power ring -- fixed accent color (this one isn't a pass/fail signal
-     * like temp is, just "how close to the fill"), clamped to the gauge's
-     * own range so an out-of-range reading still shows as visually maxed
-     * rather than silently misbehaving. */
-    double power_w;
-    int have_power = kv_f64("power_w", &power_w);
-    int32_t gauge_power = 0;
-    if (have_power) {
-        gauge_power = (int32_t)(power_w + 0.5);
-        if (gauge_power < 0) gauge_power = 0;
-        if (gauge_power > POWER_GAUGE_MAX) gauge_power = POWER_GAUGE_MAX;
-    }
-    lv_meter_set_indicator_end_value(live_meter, live_arc_power, gauge_power);
-
-    /* Temp ring -- same thermal-threshold coloring as the rest of the UI. */
-    double avg;
-    int have_temp = kv_f64("temp_avg", &avg);
-    int32_t gauge_temp = 0;
-    lv_color_t temp_color = C_TEXT_3;
-    if (have_temp) {
-        gauge_temp = (int32_t)(avg + 0.5);
-        if (gauge_temp < 0) gauge_temp = 0;
-        if (gauge_temp > TEMP_GAUGE_MAX) gauge_temp = TEMP_GAUGE_MAX;
-        temp_color = temp_color_c(avg);
-    }
-    live_arc_temp->type_data.arc.color = temp_color;
-    lv_meter_set_indicator_end_value(live_meter, live_arc_temp, gauge_temp);
-
-    lv_obj_invalidate(live_meter);
-
-    /* Compact center readout -- the rings already carry hashrate/power/temp
-     * at a glance, this is just the precise numbers, kept terse since the
-     * innermost ring's clearance (inside the temp ring) is only ~58px
-     * radius before running into the rings' fixed start point at the
-     * 135 degree (bottom-left) position. Full diff/PLL/voltage detail is
-     * one button press away on the diagnostics page. */
-    if (have_temp && have_power) {
-        snprintf(buf, sizeof(buf), "%.1fC  #" C_IP_BLUE_HEX " %.0fW#", avg, power_w);
-    } else if (have_temp) {
-        snprintf(buf, sizeof(buf), "%.1fC", avg);
-    } else if (have_power) {
-        snprintf(buf, sizeof(buf), "#" C_IP_BLUE_HEX " %.0fW#", power_w);
-    } else {
-        snprintf(buf, sizeof(buf), "--");
-    }
-    lv_label_set_text(live_temp_small, buf);
-    lv_obj_set_style_text_color(live_temp_small, temp_color, LV_PART_MAIN);
-
-    const char *shares = kv_str("shares_found");
-    lv_label_set_text(live_pool_small, shares ? shares : "0");
-
-    lv_scr_load(scr_live);
 }
 
-static void refresh_diag(void) {
-    char buf[64];
-    uint32_t chips;
-    if (kv_u32("asics_total", &chips)) {
-        snprintf(buf, sizeof(buf), "%u / 12", chips);
-        lv_label_set_text(diag_chips_label, buf);
-        lv_color_t chips_color = chips >= 12 ? C_GREEN : (chips == 0 ? C_RED : C_YELLOW);
-        lv_obj_set_style_text_color(diag_chips_label, C_TEXT_1, LV_PART_MAIN);
-        diag_chips_arc->type_data.arc.color = chips_color;
-        lv_meter_set_indicator_end_value(diag_chips_meter, diag_chips_arc, (int32_t)chips);
-    } else {
-        lv_label_set_text(diag_chips_label, "--");
-        lv_obj_set_style_text_color(diag_chips_label, C_TEXT_3, LV_PART_MAIN);
-        diag_chips_arc->type_data.arc.color = C_TEXT_3;
-        lv_meter_set_indicator_end_value(diag_chips_meter, diag_chips_arc, 0);
-    }
-    lv_obj_invalidate(diag_chips_meter);
-
-    uint32_t p0, p1, p2, p3;
-    if (kv_u32("pll0", &p0) && kv_u32("pll1", &p1) && kv_u32("pll2", &p2) && kv_u32("pll3", &p3)) {
-        snprintf(buf, sizeof(buf), "%u  %u  %u  %u", p0, p1, p2, p3);
-        lv_label_set_text(diag_pll, buf);
-        lv_obj_set_style_text_color(diag_pll, C_TEXT_1, LV_PART_MAIN);
-    } else {
-        lv_label_set_text(diag_pll, "--");
-        lv_obj_set_style_text_color(diag_pll, C_TEXT_3, LV_PART_MAIN);
-    }
-
-    uint32_t mv;
-    if (kv_u32("voltage_mv", &mv)) {
-        snprintf(buf, sizeof(buf), "%u MV", mv);
-        lv_label_set_text(diag_voltage, buf);
-        lv_obj_set_style_text_color(diag_voltage, C_TEXT_1, LV_PART_MAIN);
-    } else {
-        lv_label_set_text(diag_voltage, "--");
-        lv_obj_set_style_text_color(diag_voltage, C_TEXT_3, LV_PART_MAIN);
-    }
-
-    const char *err = kv_str("err_crc");
-    snprintf(buf, sizeof(buf), "ERR_CRC %s", err ? err : "0");
-    lv_label_set_text(diag_err, buf);
-
-    lv_scr_load(scr_diag);
+static inline uint16_t blend565(uint16_t bg, uint16_t fg, uint8_t alpha) {
+    if (alpha == 0) return bg;
+    if (alpha == 255) return fg;
+    uint32_t a = alpha;
+    uint32_t inv = 255u - a;
+    uint32_t r = (((bg >> 11) & 0x1F) * inv + ((fg >> 11) & 0x1F) * a + 127u) / 255u;
+    uint32_t g = (((bg >> 5) & 0x3F) * inv + ((fg >> 5) & 0x3F) * a + 127u) / 255u;
+    uint32_t b = ((bg & 0x1F) * inv + (fg & 0x1F) * a + 127u) / 255u;
+    return (uint16_t)((r << 11) | (g << 5) | b);
 }
 
-static void refresh_tuner(void) {
-    /* 1. Target Profile / Workmode */
-    const char *mode = kv_str("autotune_mode");
-    const char *mode_display = "OFF";
-    lv_color_t mode_color = C_TEXT_3;
+static inline uint16_t lerp565(uint16_t c1, uint16_t c2, float t) {
+    if (t <= 0.0f) return c1;
+    if (t >= 1.0f) return c2;
+    return blend565(c1, c2, (uint8_t)(t * 255.0f));
+}
 
-    if (mode && *mode) {
-        if (strcasecmp(mode, "max_hash") == 0 || strcasecmp(mode, "max hash") == 0 || strcasecmp(mode, "max") == 0) {
-            mode_display = "MAX HASH";
-            mode_color = C_AMBER;
-        } else if (strcasecmp(mode, "balanced") == 0) {
-            mode_display = "BALANCED";
-            mode_color = C_CYAN;
-        } else if (strcasecmp(mode, "efficient") == 0) {
-            mode_display = "EFFICIENT";
-            mode_color = C_GREEN;
-        } else if (strcasecmp(mode, "quiet") == 0) {
-            mode_display = "QUIET";
-            mode_color = C_GREEN;
-        } else if (strcasecmp(mode, "off") == 0) {
-            mode_display = "OFF";
-            mode_color = C_TEXT_3;
+static inline float wrap360(float a) {
+    a = fmodf(a, 360.0f);
+    if (a < 0.0f) a += 360.0f;
+    return a;
+}
+
+static void ui_draw_wedge_arc(float r_mid, float start_deg, float sweep_deg, float width, uint16_t col, uint8_t opa) {
+    if (sweep_deg <= 0.05f || width <= 0.1f) return;
+    float half_w = width * 0.5f;
+    float s_norm = wrap360(start_deg);
+    float end_deg = wrap360(s_norm + sweep_deg);
+    int full_circle = (sweep_deg >= 359.9f);
+
+    for (int i = 0; i < ring_lut_len; i++) {
+        float dr = fabsf(ring_lut[i].r - r_mid);
+        if (dr > half_w + 0.75f) continue;
+
+        float cov_r = (dr <= half_w - 0.5f) ? 1.0f : (half_w + 0.75f - dr) / 1.25f;
+        if (cov_r <= 0.0f) continue;
+
+        float cov_a = 1.0f;
+        if (!full_circle) {
+            float rel = ring_lut[i].deg - s_norm;
+            if (rel < 0.0f) rel += 360.0f;
+            if (rel > sweep_deg) {
+                /* Check angular AA near start or end boundary */
+                float d_start = 360.0f - rel;
+                float d_end = rel - sweep_deg;
+                float d_ang = (d_start < d_end) ? d_start : d_end;
+                float px_arc = d_ang * 0.0174532925f * ring_lut[i].r;
+                if (px_arc > 0.75f) continue;
+                cov_a = (0.75f - px_arc) / 1.5f;
+            } else {
+                float d_edge = (rel < sweep_deg - rel) ? rel : (sweep_deg - rel);
+                float px_arc = d_edge * 0.0174532925f * ring_lut[i].r;
+                if (px_arc < 0.75f) {
+                    cov_a = (px_arc + 0.75f) / 1.5f;
+                }
+            }
+        }
+        float a_f = cov_r * cov_a * (float)opa;
+        if (a_f > 1.0f) {
+            uint16_t idx = ring_lut[i].idx;
+            ui_fb[idx] = blend565(ui_fb[idx], col, (uint8_t)a_f);
+        }
+    }
+}
+
+static void ui_draw_smooth_arc(float r_mid, float start_deg, float sweep_deg, float width,
+                               uint16_t col_start, uint16_t col_end, uint8_t opa) {
+    if (sweep_deg <= 0.05f || width <= 0.1f) return;
+    float half_w = width * 0.5f;
+    float s_norm = wrap360(start_deg);
+    float s_rad = s_norm * 0.0174532925f;
+    float e_rad = wrap360(s_norm + sweep_deg) * 0.0174532925f;
+    float cx_s = 119.5f + r_mid * cosf(s_rad);
+    float cy_s = 119.5f + r_mid * sinf(s_rad);
+    float cx_e = 119.5f + r_mid * cosf(e_rad);
+    float cy_e = 119.5f + r_mid * sinf(e_rad);
+    int full_circle = (sweep_deg >= 359.9f);
+
+    for (int i = 0; i < ring_lut_len; i++) {
+        float dr = fabsf(ring_lut[i].r - r_mid);
+        if (dr > half_w + 0.75f) continue;
+
+        uint16_t idx = ring_lut[i].idx;
+        int x = idx % HOR_RES;
+        int y = idx / HOR_RES;
+        float rel = ring_lut[i].deg - s_norm;
+        if (rel < 0.0f) rel += 360.0f;
+
+        float dist = 999.0f;
+        float t = 0.0f;
+        if (full_circle || rel <= sweep_deg) {
+            dist = dr;
+            t = rel / sweep_deg;
         } else {
-            mode_display = mode;
-            mode_color = C_TEXT_1;
+            float dx1 = (float)x - cx_s, dy1 = (float)y - cy_s;
+            float max_d = half_w + 0.75f;
+            float max_d_sq = max_d * max_d;
+            float d1_sq = dx1 * dx1 + dy1 * dy1;
+            float dx2 = (float)x - cx_e, dy2 = (float)y - cy_e;
+            float d2_sq = dx2 * dx2 + dy2 * dy2;
+            if (d1_sq > max_d_sq && d2_sq > max_d_sq) continue;
+            if (d1_sq < d2_sq) {
+                dist = sqrtf(d1_sq);
+                t = 0.0f;
+            } else {
+                dist = sqrtf(d2_sq);
+                t = 1.0f;
+            }
+        }
+        if (dist > half_w + 0.75f) continue;
+        float cov = (dist <= half_w - 0.55f) ? 1.0f : (half_w + 0.75f - dist) / 1.3f;
+        if (cov <= 0.0f) continue;
+        uint16_t col = (col_start == col_end) ? col_start : lerp565(col_start, col_end, t);
+        uint8_t a = (uint8_t)(cov * (float)opa);
+        if (a > 0) ui_fb[idx] = blend565(ui_fb[idx], col, a);
+    }
+}
+
+static void ui_draw_radial_ticks(int n_ticks, float start_deg, float span_deg, float r_in_minor, float r_in_major,
+                                 float r_out, int major_mod, int active_limit, uint16_t col_on, uint16_t col_alert,
+                                 int alert_from, uint16_t col_off, float half_w_on, float half_w_off) {
+    if (n_ticks <= 0) return;
+    int full_circle = (span_deg >= 359.5f);
+    float step = (n_ticks > 1 && !full_circle) ? (span_deg / (float)(n_ticks - 1)) : (span_deg / (float)n_ticks);
+    float s_norm = wrap360(start_deg);
+    float r_min = (r_in_major < r_in_minor) ? r_in_major : r_in_minor;
+
+    for (int k = 0; k < ring_lut_len; k++) {
+        float r = ring_lut[k].r;
+        if (r < r_min - 0.6f || r > r_out + 0.6f) continue;
+
+        int i;
+        if (n_ticks == 1) {
+            i = 0;
+        } else {
+            float rel = ring_lut[k].deg - s_norm;
+            if (rel < 0.0f) rel += 360.0f;
+            if (full_circle) {
+                i = ((int)floorf((rel + 0.5f * step) / step)) % n_ticks;
+                if (i < 0) i += n_ticks;
+            } else if (rel > span_deg + 4.5f) {
+                float d0 = 360.0f - rel;
+                if (d0 <= 4.5f && d0 < (rel - span_deg)) i = 0;
+                else continue;
+            } else {
+                i = (int)floorf((rel + 0.5f * step) / step);
+                if (i < 0) i = 0;
+                if (i >= n_ticks) i = n_ticks - 1;
+            }
+        }
+
+        int is_on = (i < active_limit);
+        int is_maj = (major_mod > 0) && (i % major_mod == 0);
+        float r_in = is_maj ? r_in_major : r_in_minor;
+        if (r < r_in - 0.6f) continue;
+
+        float ang_deg = wrap360(s_norm + (float)i * step);
+        float da = fabsf(ring_lut[k].deg - ang_deg);
+        if (da > 180.0f) da = 360.0f - da;
+        if (da > 4.5f) continue;
+
+        float hw = is_on ? half_w_on : half_w_off;
+        float perp = r * sinf(da * 0.0174532925f);
+        if (perp > hw + 0.65f) continue;
+
+        uint16_t col = is_on ? ((alert_from >= 0 && i >= alert_from) ? col_alert : col_on) : col_off;
+        float cov_w = (perp <= hw - 0.45f) ? 1.0f : (hw + 0.65f - perp) / 1.1f;
+        float cov_r = 1.0f;
+        if (r < r_in + 0.45f) cov_r = (r - (r_in - 0.6f)) / 1.05f;
+        else if (r > r_out - 0.45f) cov_r = ((r_out + 0.6f) - r) / 1.05f;
+        if (cov_r < 0.0f) cov_r = 0.0f;
+        if (cov_r > 1.0f) cov_r = 1.0f;
+        uint8_t a = (uint8_t)(cov_w * cov_r * 255.0f);
+        if (a > 0) {
+            uint16_t idx = ring_lut[k].idx;
+            ui_fb[idx] = blend565(ui_fb[idx], col, a);
         }
     }
-    lv_label_set_text(tuner_mode_val, mode_display);
-    lv_obj_set_style_text_color(tuner_mode_val, mode_color, LV_PART_MAIN);
+}
 
-    /* 2. Continuous Tuning Pill */
-    int cont = kv_bool("autotune_continuous");
-    if (cont) {
-        lv_label_set_text(tuner_cont_lbl, "CONTINUOUS: ON");
-        lv_obj_set_style_text_color(tuner_cont_lbl, C_GREEN, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(tuner_cont_pill, lv_color_make(12, 38, 24), LV_PART_MAIN);
-        lv_obj_set_style_border_color(tuner_cont_pill, C_GREEN, LV_PART_MAIN);
+static void ui_fill_circle(float cx, float cy, float radius, uint16_t col, uint8_t opa) {
+    int x0 = (int)floorf(cx - radius - 1.5f);
+    int x1 = (int)ceilf(cx + radius + 1.5f);
+    int y0 = (int)floorf(cy - radius - 1.5f);
+    int y1 = (int)ceilf(cy + radius + 1.5f);
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 >= HOR_RES) x1 = HOR_RES - 1;
+    if (y1 >= VER_RES) y1 = VER_RES - 1;
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            float d = sqrtf(((float)x - cx) * ((float)x - cx) + ((float)y - cy) * ((float)y - cy));
+            if (d <= radius + 0.7f) {
+                float cov = (d <= radius - 0.5f) ? 1.0f : (radius + 0.7f - d) / 1.2f;
+                uint8_t a = (uint8_t)(cov * (float)opa);
+                if (a > 0) {
+                    int idx = y * HOR_RES + x;
+                    ui_fb[idx] = blend565(ui_fb[idx], col, a);
+                }
+            }
+        }
+    }
+}
+
+static void ui_fill_rect(int x, int y, int w, int h, uint16_t col) {
+    int x0 = (x < 0) ? 0 : x;
+    int y0 = (y < 0) ? 0 : y;
+    int x1 = (x + w > HOR_RES) ? HOR_RES : (x + w);
+    int y1 = (y + h > VER_RES) ? VER_RES : (y + h);
+    for (int yy = y0; yy < y1; yy++) {
+        for (int xx = x0; xx < x1; xx++) {
+            ui_fb[yy * HOR_RES + xx] = col;
+        }
+    }
+}
+
+static void ui_draw_rect_outline(int x, int y, int w, int h, int stroke, uint16_t col) {
+    ui_fill_rect(x, y, w, stroke, col);
+    ui_fill_rect(x, y + h - stroke, w, stroke, col);
+    ui_fill_rect(x, y, stroke, h, col);
+    ui_fill_rect(x + w - stroke, y, stroke, h, col);
+}
+
+static void ui_draw_chamfer_pill(int x, int y, int w, int h, uint16_t fill, uint16_t border) {
+    ui_fill_rect(x + 2, y + 1, w - 4, h - 2, fill);
+    ui_fill_rect(x + 1, y + 2, w - 2, h - 4, fill);
+    ui_fill_rect(x, y, w - 3, 1, border);
+    ui_fill_rect(x + 3, y + h - 1, w - 3, 1, border);
+    ui_fill_rect(x, y, 1, h - 3, border);
+    ui_fill_rect(x + w - 1, y + 3, 1, h - 3, border);
+    for (int i = 0; i <= 3; i++) {
+        int px1 = x + w - 4 + i, py1 = y + i;
+        if ((unsigned)px1 < HOR_RES && (unsigned)py1 < VER_RES) ui_fb[py1 * HOR_RES + px1] = border;
+        int px2 = x + i, py2 = y + h - 4 + i;
+        if ((unsigned)px2 < HOR_RES && (unsigned)py2 < VER_RES) ui_fb[py2 * HOR_RES + px2] = border;
+    }
+}
+
+/* ── Anti-Aliased UTF-8 Bitmap Font Rendering ─────────────────────────── */
+
+static const ui_glyph_t *find_glyph(const ui_font_t *font, uint16_t cp) {
+    for (uint16_t i = 0; i < font->glyph_count; i++) {
+        if (font->glyphs[i].codepoint == cp) {
+            return &font->glyphs[i];
+        }
+    }
+    return &font->glyphs[0];
+}
+
+static uint16_t next_utf8_cp(const char **p) {
+    const uint8_t *s = (const uint8_t *)(*p);
+    uint8_t c0 = s[0];
+    if (c0 < 0x80) {
+        (*p)++;
+        return c0;
+    }
+    if ((c0 & 0xE0) == 0xC0 && s[1]) {
+        uint16_t cp = (uint16_t)(((c0 & 0x1F) << 6) | (s[1] & 0x3F));
+        (*p) += 2;
+        return cp;
+    }
+    if ((c0 & 0xF0) == 0xE0 && s[1] && s[2]) {
+        uint16_t cp = (uint16_t)(((c0 & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F));
+        (*p) += 3;
+        return cp;
+    }
+    (*p)++;
+    return '?';
+}
+
+static int measure_text_px(const ui_font_t *font, const char *txt) {
+    int total = 0;
+    const char *p = txt;
+    while (*p) {
+        uint16_t cp = next_utf8_cp(&p);
+        total += find_glyph(font, cp)->advance;
+    }
+    return total;
+}
+
+static void draw_text_xy(const ui_font_t *font, int x, int y, const char *txt, uint16_t col) {
+    int pen_x = x;
+    const char *p = txt;
+    while (*p) {
+        uint16_t cp = next_utf8_cp(&p);
+        const ui_glyph_t *g = find_glyph(font, cp);
+        if (g->width > 0 && g->height > 0) {
+            const uint8_t *src = font->bitmap + g->data_offset;
+            int gx = pen_x + g->x_off;
+            int gy = y + g->y_off;
+            for (int r = 0; r < g->height; r++) {
+                int yy = gy + r;
+                if ((unsigned)yy >= VER_RES) continue;
+                for (int c = 0; c < g->width; c++) {
+                    int xx = gx + c;
+                    if ((unsigned)xx >= HOR_RES) continue;
+                    uint8_t alpha = src[r * g->width + c];
+                    if (alpha > 4) {
+                        int idx = yy * HOR_RES + xx;
+                        ui_fb[idx] = blend565(ui_fb[idx], col, alpha);
+                    }
+                }
+            }
+        }
+        pen_x += g->advance;
+    }
+}
+
+static void draw_text_centered(const ui_font_t *font, int cx, int y, const char *txt, uint16_t col) {
+    int w = measure_text_px(font, txt);
+    draw_text_xy(font, cx - w / 2, y, txt, col);
+}
+
+static const ui_font_t *fit_font_or_fallback(const ui_font_t *primary, const ui_font_t *fallback, int max_w, const char *txt) {
+    if (measure_text_px(primary, txt) <= max_w) return primary;
+    return fallback;
+}
+
+/* ── Thermal Color Mapping per Theme ──────────────────────────────────── */
+
+static uint16_t cyber_temp_color(double t) {
+    if (t < 65.0) return COL_CYBER_GREEN;
+    if (t < 75.0) return COL_CYAN;
+    if (t < 83.0) return COL_YELLOW;
+    if (t < 85.0) return COL_MAG;
+    return COL_HOT_RED;
+}
+
+static uint16_t minimal_temp_color(double t) {
+    if (t < 66.0) return COL_MIN_MINT;
+    if (t < 76.0) return COL_MIN_ROYAL;
+    if (t < 83.5) return COL_MIN_WARM;
+    return COL_MIN_HOT;
+}
+
+static uint16_t parasite_temp_color(double t) {
+    if (t >= 84.0) return COL_PARA_RED;
+    if (t < 65.0) return COL_PARA_COOL;
+    return COL_WHITE;
+}
+
+static void uppercase_str(char *dst, size_t dst_sz, const char *src) {
+    size_t i = 0;
+    while (src[i] && i + 1 < dst_sz) {
+        dst[i] = (char)toupper((unsigned char)src[i]);
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+/* ── Theme-Synced Screens (Direct RGB565 High-Precision Renderer) ─────── */
+
+static void refresh_splash_themed(ui_theme_t theme, uint32_t ms) {
+    float t = (float)(ms % 120000u) * 0.001f;
+    if (theme == THEME_MINIMAL) {
+        memcpy(ui_fb, bg_splash_minimal, sizeof(ui_fb));
+        float rot = fmodf(t * 36.0f, 360.0f);
+        ui_draw_smooth_arc(107.0f, rot, 130.0f, 6.0f, COL_MIN_ROYAL, COL_MIN_SKY_BRT, 255);
+        ui_draw_smooth_arc(107.0f, rot + 180.0f, 120.0f, 6.0f, COL_MIN_MINT, COL_MIN_MINT_BRT, 255);
+        /* Subtle orbiting specular glass beads on inner radius */
+        float orb = fmodf(-t * 28.0f, 360.0f) * 0.0174532925f;
+        ui_fill_circle(119.5f + 95.0f * cosf(orb), 119.5f + 95.0f * sinf(orb), 2.8f, COL_WHITE, 210);
+        ui_fill_circle(119.5f - 95.0f * cosf(orb), 119.5f - 95.0f * sinf(orb), 2.8f, COL_MIN_SKY_BRT, 190);
+    } else if (theme == THEME_PARASITE) {
+        memcpy(ui_fb, bg_splash_parasite, sizeof(ui_fb));
+        float rot_ticks = fmodf(t * 20.0f, 360.0f);
+        float rot_scan = fmodf(-t * 52.0f, 360.0f);
+        ui_draw_radial_ticks(36, rot_ticks, 360.0f, 106.0f, 102.5f, 111.5f, 3, 36, COL_WHITE, COL_WHITE, -1, COL_PARA_DARK, 0.9f, 0.6f);
+        ui_draw_wedge_arc(98.5f, rot_scan, 52.0f, 2.6f, COL_WHITE, 255);
+        ui_draw_wedge_arc(98.5f, rot_scan + 180.0f, 52.0f, 2.6f, COL_PARA_RED, 255);
     } else {
-        lv_label_set_text(tuner_cont_lbl, "CONTINUOUS: OFF");
-        lv_obj_set_style_text_color(tuner_cont_lbl, C_TEXT_3, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(tuner_cont_pill, lv_color_make(18, 22, 28), LV_PART_MAIN);
-        lv_obj_set_style_border_color(tuner_cont_pill, C_DIVIDER, LV_PART_MAIN);
+        memcpy(ui_fb, bg_splash_cyber, sizeof(ui_fb));
+        float rot1 = fmodf(t * 45.0f, 360.0f);
+        float rot2 = fmodf(-t * 30.0f, 360.0f);
+        ui_draw_wedge_arc(109.0f, rot1 + 20.0f, 52.0f, 5.5f, COL_CYAN, 255);
+        ui_draw_wedge_arc(109.0f, rot1 + 108.0f, 52.0f, 5.5f, COL_CYAN, 255);
+        ui_draw_wedge_arc(109.0f, rot1 + 200.0f, 52.0f, 5.5f, COL_CYAN, 255);
+        ui_draw_wedge_arc(109.0f, rot1 + 288.0f, 52.0f, 5.5f, COL_CYAN, 255);
+        ui_draw_wedge_arc(109.0f, rot1 + 78.0f, 24.0f, 5.5f, COL_MAG, 255);
+        ui_draw_wedge_arc(109.0f, rot1 + 258.0f, 24.0f, 5.5f, COL_MAG, 255);
+        /* Counter-rotating inner targeting ticks */
+        ui_draw_radial_ticks(4, rot2, 360.0f, 94.0f, 94.0f, 102.5f, 1, 4, COL_CYAN, COL_CYAN, -1, COL_CYAN, 1.0f, 1.0f);
+    }
+    blit_ui_fb(ui_fb);
+}
+
+static void refresh_parasite_logo(uint32_t ms) {
+    float t = (float)(ms % 120000u) * 0.001f;
+    memcpy(ui_fb, bg_parasite_logo, sizeof(ui_fb));
+    float rot_ticks = fmodf(t * 20.0f, 360.0f);
+    float rot_scan = fmodf(-t * 48.0f, 360.0f);
+    ui_draw_radial_ticks(36, rot_ticks, 360.0f, 106.0f, 102.5f, 111.5f, 3, 36, COL_WHITE, COL_WHITE, -1, COL_PARA_DARK, 0.9f, 0.6f);
+    ui_draw_wedge_arc(99.0f, rot_scan, 68.0f, 2.8f, COL_PARA_RED, 255);
+    ui_draw_wedge_arc(99.0f, rot_scan + 180.0f, 68.0f, 2.8f, COL_WHITE, 255);
+    blit_ui_fb(ui_fb);
+}
+
+static void refresh_live_themed(ui_theme_t theme) {
+    double ghs = 0.0, temp_avg = 0.0, temp_max = 0.0, power_w = 0.0;
+    uint32_t asics = 12;
+    int have_ghs = kv_f64("hashrate_ghs", &ghs);
+    int have_avg = kv_f64("temp_avg", &temp_avg);
+    int have_max = kv_f64("temp_max", &temp_max);
+    int have_pwr = kv_f64("power_w", &power_w);
+    kv_u32("asics_total", &asics);
+    int paused = kv_bool("paused");
+    int ipc_ok = kv_bool("ipc_connected");
+    const char *shares_str = kv_str("shares_found");
+    const char *mode_raw = kv_str("autotune_mode");
+    char mode_up[32] = "MINING";
+    if (mode_raw && *mode_raw) uppercase_str(mode_up, sizeof(mode_up), mode_raw);
+
+    double ths = have_ghs ? (ghs / 1000.0) : 0.0;
+    if (ths < 0.0) ths = 0.0;
+    double temp_show = have_avg ? temp_avg : (have_max ? temp_max : 0.0);
+    double hr_frac = ths / 7.0; if (hr_frac > 1.0) hr_frac = 1.0;
+    double t_frac = temp_show / 90.0; if (t_frac > 1.0) t_frac = 1.0; if (t_frac < 0.0) t_frac = 0.0;
+    double p_frac = power_w / 140.0; if (p_frac > 1.0) p_frac = 1.0; if (p_frac < 0.0) p_frac = 0.0;
+
+    char hr_buf[24], temp_buf[24], pwr_buf[24], foot1[48], foot2[36], pill_buf[48];
+    if (have_ghs) snprintf(hr_buf, sizeof(hr_buf), "%.2f", ths); else snprintf(hr_buf, sizeof(hr_buf), "--");
+    if (have_avg || have_max) snprintf(temp_buf, sizeof(temp_buf), "%.1f\xc2\xb0""C", temp_show); else snprintf(temp_buf, sizeof(temp_buf), "--");
+    if (have_pwr) snprintf(pwr_buf, sizeof(pwr_buf), "%.0f W", power_w); else snprintf(pwr_buf, sizeof(pwr_buf), "--");
+
+    double eff = (have_pwr && ths > 0.05) ? (power_w / ths) : 0.0;
+
+    if (theme == THEME_MINIMAL) {
+        memcpy(ui_fb, bg_live_minimal, sizeof(ui_fb));
+        ui_draw_smooth_arc(104.0f, 145.0f, 250.0f * (float)hr_frac, 7.5f, COL_MIN_ROYAL, COL_MIN_SKY, 255);
+        ui_draw_smooth_arc(91.0f, 115.0f, 85.0f * (float)t_frac, 5.5f, COL_MIN_MINT, COL_MIN_MINT, 255);
+        ui_draw_smooth_arc(91.0f, 425.0f - 85.0f * (float)p_frac, 85.0f * (float)p_frac, 5.5f, COL_MIN_BLUE, COL_MIN_BLUE, 255);
+
+        uint16_t dot_c = (!ipc_ok) ? COL_MIN_HOT : (paused ? COL_MIN_WARM : COL_MIN_MINT);
+        ui_fill_circle(73.0f, 55.0f, 3.0f, dot_c, 255);
+        if (!ipc_ok) snprintf(pill_buf, sizeof(pill_buf), "IPC Offline");
+        else if (paused) snprintf(pill_buf, sizeof(pill_buf), "Paused");
+        else snprintf(pill_buf, sizeof(pill_buf), "Mining \xe2\x80\xa2 %s", mode_raw ? mode_raw : "Auto");
+        draw_text_xy(&font_segoe_8, 81, 49, pill_buf, COL_MIN_INK);
+
+        draw_text_centered(&font_bahn_33, 120, 78, hr_buf, COL_MIN_ROYAL);
+        draw_text_centered(&font_bahn_13, 86, 150, temp_buf, COL_MIN_INK);
+        draw_text_centered(&font_bahn_13, 154, 150, pwr_buf, COL_MIN_ROYAL);
+
+        if (eff > 0.0) snprintf(foot1, sizeof(foot1), "%s Shares \xe2\x80\xa2 %.1f J/TH", shares_str ? shares_str : "0", eff);
+        else snprintf(foot1, sizeof(foot1), "%s Shares", shares_str ? shares_str : "0");
+        draw_text_centered(&font_segoe_8, 120, 173, foot1, COL_MIN_SUB);
+        snprintf(foot2, sizeof(foot2), "%u/12 ASICs OK", asics);
+        draw_text_centered(&font_segoe_8, 120, 186, foot2, COL_MIN_SUB);
+    } else if (theme == THEME_PARASITE) {
+        memcpy(ui_fb, bg_live_parasite, sizeof(ui_fb));
+        int alert = (!paused && (temp_avg >= 85.0 || temp_max >= 90.0));
+        int active_ticks = (int)round(hr_frac * 36.0);
+        ui_draw_radial_ticks(36, 135.0f, 270.0f, 101.0f, 98.0f, 109.0f, 6, active_ticks,
+                             COL_WHITE, COL_PARA_RED, alert ? 28 : 99, COL_PARA_DARK, 1.4f, 0.7f);
+
+        ui_fill_rect(57, 48, 126, 16, alert ? COL_PARA_RED : COL_WHITE);
+        if (!ipc_ok) snprintf(pill_buf, sizeof(pill_buf), "NO IPC CONNECTION");
+        else if (paused) snprintf(pill_buf, sizeof(pill_buf), "MINER PAUSED");
+        else if (alert) snprintf(pill_buf, sizeof(pill_buf), "THERMAL WARN // MAX");
+        else snprintf(pill_buf, sizeof(pill_buf), "MINING // %s", mode_up);
+        draw_text_centered(&font_courier_8, 120, 51, pill_buf, COL_BLACK);
+
+        draw_text_centered(&font_courier_31, 120, 76, hr_buf, COL_WHITE);
+        draw_text_centered(&font_courier_8, 84, 135, "TEMP", alert ? COL_PARA_RED : COL_PARA_DIM);
+        draw_text_centered(&font_courier_8, 156, 135, "POWER", COL_PARA_DIM);
+        if (have_avg || have_max) snprintf(temp_buf, sizeof(temp_buf), "%.1fC%s", temp_show, alert ? "!" : "");
+        draw_text_centered(&font_courier_13, 84, 145, temp_buf, alert ? COL_PARA_RED : COL_WHITE);
+        if (have_pwr) snprintf(pwr_buf, sizeof(pwr_buf), "%.0fW", power_w);
+        draw_text_centered(&font_courier_13, 156, 145, pwr_buf, COL_WHITE);
+
+        snprintf(foot1, sizeof(foot1), "SHARES: %s [OK]", shares_str ? shares_str : "0");
+        draw_text_centered(&font_courier_8, 120, 173, foot1, COL_WHITE);
+        if (eff > 0.0) snprintf(foot2, sizeof(foot2), "%.1f J/TH", eff); else snprintf(foot2, sizeof(foot2), "%u/12 ASICS", asics);
+        draw_text_centered(&font_courier_8, 120, 185, foot2, COL_PARA_DIM);
+    } else {
+        /* THEME_CYBERPUNK */
+        memcpy(ui_fb, bg_live_cyber, sizeof(ui_fb));
+        int n_segs = 24;
+        float start_a = 150.0f, seg_a = (240.0f - 23.0f * 2.2f) / 24.0f;
+        int filled = (int)round(hr_frac * n_segs);
+        for (int i = 0; i < n_segs; i++) {
+            float a1 = start_a + (float)i * (seg_a + 2.2f);
+            uint16_t sc = (i < filled) ? ((i >= 19) ? COL_MAG : COL_CYAN) : COL_CYBER_TRACK;
+            ui_draw_wedge_arc(107.0f, a1, seg_a, 6.5f, sc, 255);
+        }
+        uint16_t t_col = cyber_temp_color(temp_max > 0.0 ? temp_max : temp_show);
+        ui_draw_wedge_arc(95.0f, 115.0f, 90.0f, 4.5f, COL_CYBER_TRACK, 255);
+        ui_draw_wedge_arc(95.0f, 115.0f, 90.0f * (float)t_frac, 4.5f, t_col, 255);
+        ui_draw_wedge_arc(95.0f, 335.0f, 90.0f, 4.5f, COL_CYBER_TRACK, 255);
+        ui_draw_wedge_arc(95.0f, 425.0f - 90.0f * (float)p_frac, 90.0f * (float)p_frac, 4.5f, (p_frac > 0.90) ? COL_LIME : COL_CYAN, 255);
+
+        uint16_t st_col = (!ipc_ok) ? COL_HOT_RED : (paused ? COL_AMBER : COL_CYBER_GREEN);
+        ui_draw_chamfer_pill(59, 54, 122, 16, (!ipc_ok) ? COL_CYBER_WARN : COL_CYBER_PILL, st_col);
+        ui_fill_circle(67.0f, 62.0f, 2.6f, st_col, 255);
+        if (!ipc_ok) snprintf(pill_buf, sizeof(pill_buf), "IPC // OFFLINE");
+        else if (paused) snprintf(pill_buf, sizeof(pill_buf), "PAUSED // IDLE");
+        else snprintf(pill_buf, sizeof(pill_buf), "MINING // %s", mode_up);
+        const ui_font_t *pf = fit_font_or_fallback(&font_space_8, &font_space_8, 98, pill_buf);
+        draw_text_xy(pf, 74, 57, pill_buf, st_col);
+
+        draw_text_centered(&font_orbitron_29, 120, 80, hr_buf, COL_WHITE);
+        draw_text_centered(&font_orbitron_12, 85, 148, temp_buf, t_col);
+        draw_text_centered(&font_orbitron_12, 155, 148, pwr_buf, COL_CYAN);
+
+        if (eff > 0.0) snprintf(foot1, sizeof(foot1), "%s SHARES \xe2\x80\xa2 %.1f J/TH", shares_str ? shares_str : "0", eff);
+        else snprintf(foot1, sizeof(foot1), "%s SHARES", shares_str ? shares_str : "0");
+        draw_text_centered(&font_space_8, 120, 174, foot1, COL_CYBER_LIGHT);
+        snprintf(foot2, sizeof(foot2), "%u/12 CHIPS OK", asics);
+        draw_text_centered(&font_space_8, 120, 189, foot2, COL_CYBER_DIM);
     }
 
-    /* 3. Perimeter Chip Thermal Arcs (12 arcs spread around full 360 circle with zero gap)
-     * As chips get hotter, their arc expands inward towards the center and changes color. */
+    blit_ui_fb(ui_fb);
+}
+
+static void refresh_tuner_themed(ui_theme_t theme) {
+    double chips[12] = {0};
+    int n_chips = 0;
     const char *csv = kv_str("chip_temps");
     if (csv && *csv) {
-        char copy[128];
+        char copy[160];
         strncpy(copy, csv, sizeof(copy) - 1);
         copy[sizeof(copy) - 1] = '\0';
         char *saveptr = NULL;
-        char *token = strtok_r(copy, ",", &saveptr);
-        int idx = 0;
-        while (token && idx < 12) {
-            double t = atof(token);
-            lv_color_t tc = temp_to_color(t);
-            int w = 4;
-            if (t <= 45.0) {
-                w = 4;
-            } else if (t >= 85.0) {
-                w = 12;
-            } else {
-                w = 4 + (int)((t - 45.0) / (85.0 - 45.0) * 8.0 + 0.5);
-            }
-            lv_obj_set_style_arc_width(chip_arcs[idx], w, LV_PART_MAIN);
-            lv_obj_set_style_arc_width(chip_arcs[idx], w, LV_PART_INDICATOR);
-            lv_obj_set_style_arc_color(chip_arcs[idx], tc, LV_PART_INDICATOR);
-            lv_obj_invalidate(chip_arcs[idx]);
-            token = strtok_r(NULL, ",", &saveptr);
-            idx++;
-        }
-        for (; idx < 12; idx++) {
-            lv_obj_set_style_arc_width(chip_arcs[idx], 4, LV_PART_MAIN);
-            lv_obj_set_style_arc_width(chip_arcs[idx], 4, LV_PART_INDICATOR);
-            lv_obj_set_style_arc_color(chip_arcs[idx], lv_color_make(30, 35, 45), LV_PART_INDICATOR);
-            lv_obj_invalidate(chip_arcs[idx]);
-        }
-    } else {
-        for (int i = 0; i < 12; i++) {
-            lv_obj_set_style_arc_width(chip_arcs[i], 4, LV_PART_MAIN);
-            lv_obj_set_style_arc_width(chip_arcs[i], 4, LV_PART_INDICATOR);
-            lv_obj_set_style_arc_color(chip_arcs[i], lv_color_make(30, 35, 45), LV_PART_INDICATOR);
-            lv_obj_invalidate(chip_arcs[i]);
+        char *tok = strtok_r(copy, ",", &saveptr);
+        while (tok && n_chips < 12) {
+            chips[n_chips++] = atof(tok);
+            tok = strtok_r(NULL, ",", &saveptr);
         }
     }
 
-    /* 4. Thermal Extremity Cards (Coolest vs Hottest) & Average */
+    const char *mode_raw = kv_str("autotune_mode");
+    char mode_disp[32] = "OFF";
+    if (mode_raw && *mode_raw) uppercase_str(mode_disp, sizeof(mode_disp), mode_raw);
+    int cont = kv_bool("autotune_continuous");
+
     double min_t = 0.0, max_t = 0.0, avg_t = 0.0;
     int have_min = kv_f64("temp_min", &min_t);
     int have_max = kv_f64("temp_max", &max_t);
@@ -916,66 +891,248 @@ static void refresh_tuner(void) {
     const char *min_chip = kv_str("temp_min_chip");
     const char *max_chip = kv_str("temp_max_chip");
 
-    if (have_min) {
-        char buf_min[32];
-        snprintf(buf_min, sizeof(buf_min), "%.1fC", min_t);
-        lv_label_set_text(tuner_cool_val, buf_min);
-        lv_obj_set_style_text_color(tuner_cool_val, temp_to_color(min_t), LV_PART_MAIN);
-        lv_label_set_text(tuner_cool_title, (min_chip && *min_chip) ? min_chip : "MIN");
+    char min_lbl[24], min_val[24], max_lbl[24], max_val[24], avg_buf[36], cont_buf[32];
+
+    if (theme == THEME_MINIMAL) {
+        memcpy(ui_fb, bg_tuner_minimal, sizeof(ui_fb));
+        for (int i = 0; i < 12; i++) {
+            double t = (i < n_chips) ? chips[i] : 60.0;
+            double tn = (t - 55.0) / 35.0; if (tn < 0.0) tn = 0.0; if (tn > 1.0) tn = 1.0;
+            float thick = 5.0f + 6.0f * (float)tn;
+            float a1 = -90.0f + (float)i * 30.0f + 6.5f;
+            uint16_t col = (i < n_chips) ? minimal_temp_color(t) : COL_MIN_SUB;
+            ui_draw_smooth_arc(110.5f - thick * 0.5f, a1, 17.0f, thick, col, col, 255);
+        }
+        const ui_font_t *mf = fit_font_or_fallback(&font_bahn_22, &font_bahn_13, 126, mode_disp);
+        draw_text_centered(mf, 120, (mf == &font_bahn_22) ? 77 : 82, mode_disp, COL_MIN_ROYAL);
+
+        ui_fill_circle(67.0f, 123.0f, 2.8f, cont ? COL_MIN_MINT : COL_MIN_SUB, 255);
+        snprintf(cont_buf, sizeof(cont_buf), "Continuous \xe2\x80\xa2 %s", cont ? "ON" : "OFF");
+        draw_text_xy(&font_segoe_8, 75, 117, cont_buf, COL_MIN_INK);
+
+        snprintf(min_lbl, sizeof(min_lbl), "%s \xe2\x80\xa2 Cool", (min_chip && *min_chip) ? min_chip : "MIN");
+        snprintf(max_lbl, sizeof(max_lbl), "%s \xe2\x80\xa2 Hot", (max_chip && *max_chip) ? max_chip : "MAX");
+        if (have_min) snprintf(min_val, sizeof(min_val), "%.1f\xc2\xb0""C", min_t); else snprintf(min_val, sizeof(min_val), "--");
+        if (have_max) snprintf(max_val, sizeof(max_val), "%.1f\xc2\xb0""C", max_t); else snprintf(max_val, sizeof(max_val), "--");
+
+        draw_text_centered(&font_segoe_8, 84, 143, min_lbl, COL_MIN_SUB);
+        draw_text_centered(&font_bahn_13, 84, 155, min_val, COL_MIN_MINT);
+        draw_text_centered(&font_segoe_8, 156, 143, max_lbl, COL_MIN_SUB);
+        draw_text_centered(&font_bahn_13, 156, 155, max_val, COL_MIN_HOT);
+
+        if (have_avg) snprintf(avg_buf, sizeof(avg_buf), "Avg Chip \xe2\x80\xa2 %.1f\xc2\xb0""C", avg_t);
+        else snprintf(avg_buf, sizeof(avg_buf), "Avg Chip \xe2\x80\xa2 --");
+        draw_text_centered(&font_segoe_8, 120, 185, avg_buf, COL_MIN_SUB);
+    } else if (theme == THEME_PARASITE) {
+        memcpy(ui_fb, bg_tuner_parasite, sizeof(ui_fb));
+        for (int i = 0; i < 12; i++) {
+            double t = (i < n_chips) ? chips[i] : 60.0;
+            double tn = (t - 55.0) / 35.0; if (tn < 0.0) tn = 0.0; if (tn > 1.0) tn = 1.0;
+            float thick = 5.0f + 7.0f * (float)tn;
+            float a1 = -90.0f + (float)i * 30.0f + 4.0f;
+            uint16_t col = (i < n_chips) ? parasite_temp_color(t) : COL_PARA_DARK;
+            ui_draw_wedge_arc(111.0f - thick * 0.5f, a1, 22.0f, thick, col, 255);
+        }
+        const ui_font_t *mf = fit_font_or_fallback(&font_courier_20, &font_courier_13, 122, mode_disp);
+        draw_text_centered(mf, 120, (mf == &font_courier_20) ? 77 : 81, mode_disp, COL_WHITE);
+
+        ui_fill_rect(54, 114, 132, 15, COL_WHITE);
+        snprintf(cont_buf, sizeof(cont_buf), "[ CONT. TUNING: %s ]", cont ? "ON" : "OFF");
+        draw_text_centered(&font_courier_8, 120, 117, cont_buf, COL_BLACK);
+
+        snprintf(min_lbl, sizeof(min_lbl), "MIN [%s]", (min_chip && *min_chip) ? min_chip : "--");
+        snprintf(max_lbl, sizeof(max_lbl), "MAX [%s]", (max_chip && *max_chip) ? max_chip : "--");
+        if (have_min) snprintf(min_val, sizeof(min_val), "%.1fC", min_t); else snprintf(min_val, sizeof(min_val), "--");
+        int hot_warn = (have_max && max_t >= 84.0);
+        if (have_max) snprintf(max_val, sizeof(max_val), "%.1fC%s", max_t, hot_warn ? "!" : ""); else snprintf(max_val, sizeof(max_val), "--");
+
+        ui_draw_rect_outline(123, 138, 66, 38, 1, hot_warn ? COL_PARA_RED : 0xD69A);
+        draw_text_centered(&font_courier_8, 84, 143, min_lbl, COL_PARA_DIM);
+        draw_text_centered(&font_courier_13, 84, 155, min_val, COL_WHITE);
+        draw_text_centered(&font_courier_8, 156, 143, max_lbl, hot_warn ? COL_PARA_RED : COL_PARA_DIM);
+        draw_text_centered(&font_courier_13, 156, 155, max_val, hot_warn ? COL_PARA_RED : COL_WHITE);
+
+        if (have_avg) snprintf(avg_buf, sizeof(avg_buf), "AVG_CHIP: %.1fC", avg_t);
+        else snprintf(avg_buf, sizeof(avg_buf), "AVG_CHIP: --");
+        draw_text_centered(&font_courier_8, 120, 184, avg_buf, COL_PARA_DIM);
     } else {
-        lv_label_set_text(tuner_cool_val, "--");
-        lv_label_set_text(tuner_cool_title, "MIN");
+        /* THEME_CYBERPUNK */
+        memcpy(ui_fb, bg_tuner_cyber, sizeof(ui_fb));
+        for (int i = 0; i < 12; i++) {
+            double t = (i < n_chips) ? chips[i] : 60.0;
+            double tn = (t - 55.0) / 35.0; if (tn < 0.0) tn = 0.0; if (tn > 1.0) tn = 1.0;
+            float thick = 5.0f + 7.0f * (float)tn;
+            float a1 = -90.0f + (float)i * 30.0f + 4.0f;
+            uint16_t col = (i < n_chips) ? cyber_temp_color(t) : COL_CYBER_TRACK;
+            ui_draw_wedge_arc(111.0f - thick * 0.5f, a1, 22.0f, thick, col, 255);
+        }
+        const ui_font_t *mf = fit_font_or_fallback(&font_orbitron_19, &font_orbitron_12, 124, mode_disp);
+        draw_text_centered(mf, 120, (mf == &font_orbitron_19) ? 78 : 82, mode_disp, COL_WHITE);
+
+        uint16_t cc = cont ? COL_CYBER_GREEN : COL_CYBER_DIM;
+        ui_draw_chamfer_pill(55, 115, 130, 17, cont ? COL_CYBER_PILL : COL_CYBER_TRACK, cc);
+        ui_fill_circle(64.0f, 123.5f, 2.6f, cc, 255);
+        snprintf(cont_buf, sizeof(cont_buf), "CONTINUOUS : %s", cont ? "ON" : "OFF");
+        draw_text_xy(&font_space_8, 71, 118, cont_buf, cc);
+
+        snprintf(min_lbl, sizeof(min_lbl), "COOL \xe2\x80\xa2 %s", (min_chip && *min_chip) ? min_chip : "--");
+        snprintf(max_lbl, sizeof(max_lbl), "HOT \xe2\x80\xa2 %s", (max_chip && *max_chip) ? max_chip : "--");
+        if (have_min) snprintf(min_val, sizeof(min_val), "%.1f\xc2\xb0""C", min_t); else snprintf(min_val, sizeof(min_val), "--");
+        if (have_max) snprintf(max_val, sizeof(max_val), "%.1f\xc2\xb0""C", max_t); else snprintf(max_val, sizeof(max_val), "--");
+
+        draw_text_centered(&font_space_8, 84, 143, min_lbl, COL_CYBER_DIM);
+        draw_text_centered(&font_orbitron_12, 84, 155, min_val, COL_CYBER_GREEN);
+        draw_text_centered(&font_space_8, 156, 143, max_lbl, COL_CYBER_DIM);
+        draw_text_centered(&font_orbitron_12, 156, 155, max_val, have_max ? cyber_temp_color(max_t) : COL_HOT_RED);
+
+        if (have_avg) snprintf(avg_buf, sizeof(avg_buf), "AVG CHIP: %.1f\xc2\xb0""C", avg_t);
+        else snprintf(avg_buf, sizeof(avg_buf), "AVG CHIP: --");
+        draw_text_centered(&font_space_8, 120, 185, avg_buf, COL_CYBER_LIGHT);
     }
 
-    if (have_max) {
-        char buf_max[32];
-        snprintf(buf_max, sizeof(buf_max), "%.1fC", max_t);
-        lv_label_set_text(tuner_hot_val, buf_max);
-        lv_obj_set_style_text_color(tuner_hot_val, temp_to_color(max_t), LV_PART_MAIN);
-        lv_label_set_text(tuner_hot_title, (max_chip && *max_chip) ? max_chip : "MAX");
-    } else {
-        lv_label_set_text(tuner_hot_val, "--");
-        lv_label_set_text(tuner_hot_title, "MAX");
-    }
-
-    if (have_avg) {
-        char buf_avg[32];
-        snprintf(buf_avg, sizeof(buf_avg), "AVG CHIP: %.1fC", avg_t);
-        lv_label_set_text(tuner_avg_lbl, buf_avg);
-        lv_obj_set_style_text_color(tuner_avg_lbl, temp_to_color(avg_t), LV_PART_MAIN);
-    } else {
-        lv_label_set_text(tuner_avg_lbl, "AVG CHIP: -- C");
-        lv_obj_set_style_text_color(tuner_avg_lbl, C_TEXT_2, LV_PART_MAIN);
-    }
-
-    lv_scr_load(scr_tuner);
+    blit_ui_fb(ui_fb);
 }
 
-static void refresh_ip(void) {
-    char ip[32];
-    if (wlan_ip(ip, sizeof(ip))) {
-        lv_label_set_text(ip_value, ip);
-        lv_obj_clear_flag(ip_caption, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(ip_value, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(ip_no_wifi, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(ip_caption, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(ip_value, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(ip_no_wifi, LV_OBJ_FLAG_HIDDEN);
+static void refresh_ip_themed(ui_theme_t theme) {
+    char ip[32] = "";
+    int online = wlan_ip(ip, sizeof(ip));
+    int rssi = -48;
+    int have_rssi = wlan_rssi_dbm(&rssi);
+
+    /* Map RSSI [-90..-30 dBm] to 1..6 signal segments */
+    int sig_segs = 0;
+    if (online) {
+        if (!have_rssi) sig_segs = 5;
+        else if (rssi >= -50) sig_segs = 6;
+        else if (rssi >= -60) sig_segs = 5;
+        else if (rssi >= -70) sig_segs = 4;
+        else if (rssi >= -80) sig_segs = 3;
+        else sig_segs = 2;
     }
-    lv_scr_load(scr_ip);
+
+    char rssi_buf[24], url_buf[48];
+    if (online && have_rssi) snprintf(rssi_buf, sizeof(rssi_buf), "%d dBm", rssi);
+    else if (online) snprintf(rssi_buf, sizeof(rssi_buf), "GOOD");
+    else snprintf(rssi_buf, sizeof(rssi_buf), "-- dBm");
+    if (online) snprintf(url_buf, sizeof(url_buf), "http://%s", ip);
+
+    if (theme == THEME_MINIMAL) {
+        memcpy(ui_fb, bg_ip_minimal, sizeof(ui_fb));
+        float sig_sweep = online ? (110.0f * (float)sig_segs / 6.0f) : 18.0f;
+        ui_draw_smooth_arc(107.0f, 125.0f, sig_sweep, 6.5f, online ? COL_MIN_MINT : COL_MIN_HOT, online ? COL_MIN_MINT : COL_MIN_HOT, 255);
+        ui_draw_smooth_arc(107.0f, 305.0f, online ? 110.0f : 22.0f, 6.5f, COL_MIN_ROYAL, COL_MIN_SKY, 255);
+
+        ui_fill_circle(71.0f, 65.5f, 2.8f, online ? COL_MIN_MINT : COL_MIN_HOT, 255);
+        draw_text_xy(&font_segoe_8, 79, 59, online ? "wlan0 \xe2\x80\xa2 Connected" : "wlan0 \xe2\x80\xa2 No WiFi", COL_MIN_INK);
+
+        const char *ip_txt = online ? ip : "NO WIFI";
+        const ui_font_t *ipf = fit_font_or_fallback(&font_bahn_22, &font_bahn_13, 146, ip_txt);
+        draw_text_centered(ipf, 120, 97, ip_txt, online ? COL_MIN_ROYAL : COL_MIN_HOT);
+
+        draw_text_centered(&font_bahn_13, 84, 155, rssi_buf, COL_MIN_MINT);
+        draw_text_centered(&font_bahn_13, 156, 155, "Port 80", COL_MIN_ROYAL);
+        draw_text_centered(&font_segoe_8, 120, 184, online ? url_buf : "Waiting for DHCP", COL_MIN_SUB);
+    } else if (theme == THEME_PARASITE) {
+        memcpy(ui_fb, bg_ip_parasite, sizeof(ui_fb));
+        int on_ticks = online ? ((sig_segs * 14) / 6) : 0;
+        ui_draw_radial_ticks(14, 135.0f, 90.0f, 106.0f, 103.0f, 111.0f, 3, on_ticks, COL_WHITE, COL_PARA_RED, -1, COL_PARA_DARK, 1.1f, 0.6f);
+        ui_draw_radial_ticks(14, 315.0f, 90.0f, 106.0f, 103.0f, 111.0f, 3, online ? 14 : 2, COL_WHITE, COL_PARA_RED, -1, COL_PARA_DARK, 1.1f, 0.6f);
+
+        ui_fill_rect(56, 57, 128, 15, online ? COL_WHITE : COL_PARA_RED);
+        draw_text_centered(&font_courier_8, 120, 60, online ? "[ WLAN0 : BOUND ]" : "[ NO WIFI LINK ]", COL_BLACK);
+
+        const char *ip_txt = online ? ip : "DISCONNECTED";
+        const ui_font_t *ipf = fit_font_or_fallback(&font_courier_20, &font_courier_13, 148, ip_txt);
+        draw_text_centered(ipf, 120, 98, ip_txt, online ? COL_WHITE : COL_PARA_RED);
+
+        if (online && have_rssi) snprintf(rssi_buf, sizeof(rssi_buf), "%ddBm", rssi);
+        draw_text_centered(&font_courier_13, 84, 155, rssi_buf, COL_WHITE);
+        draw_text_centered(&font_courier_13, 156, 155, "PORT 80", COL_WHITE);
+        if (online) snprintf(url_buf, sizeof(url_buf), "> http://%s", ip); else snprintf(url_buf, sizeof(url_buf), "> STA_RETRY...");
+        draw_text_centered(&font_courier_8, 120, 184, url_buf, COL_WHITE);
+    } else {
+        /* THEME_CYBERPUNK */
+        memcpy(ui_fb, bg_ip_cyber, sizeof(ui_fb));
+        float span = 96.0f, gap = 3.0f, seg = (span - 5.0f * gap) / 6.0f;
+        for (int i = 0; i < 6; i++) {
+            float a1 = 132.0f + (float)i * (seg + gap);
+            uint16_t sc = (i < sig_segs) ? COL_CYBER_GREEN : (online ? COL_CYBER_TRACK : COL_HOT_RED);
+            ui_draw_wedge_arc(109.0f, a1, seg, 6.0f, sc, 255);
+            float a2 = 312.0f + (float)i * (seg + gap);
+            uint16_t lc = online ? ((i == 5) ? COL_MAG : COL_CYAN) : COL_CYBER_TRACK;
+            ui_draw_wedge_arc(109.0f, a2, seg, 6.0f, lc, 255);
+        }
+
+        uint16_t st_col = online ? COL_CYBER_GREEN : COL_HOT_RED;
+        ui_draw_chamfer_pill(59, 57, 122, 16, online ? COL_CYBER_PILL : COL_CYBER_WARN, st_col);
+        ui_fill_circle(68.0f, 65.0f, 2.6f, st_col, 255);
+        draw_text_xy(&font_space_8, 75, 60, online ? "WLAN0 // ONLINE" : "NO WIFI LINK", st_col);
+
+        const char *ip_txt = online ? ip : "DISCONNECTED";
+        const ui_font_t *ipf = fit_font_or_fallback(&font_orbitron_19, &font_orbitron_12, 146, ip_txt);
+        draw_text_centered(ipf, 120, 98, ip_txt, online ? COL_WHITE : COL_HOT_RED);
+
+        draw_text_centered(&font_orbitron_12, 84, 155, rssi_buf, online ? COL_CYBER_GREEN : COL_CYBER_DIM);
+        draw_text_centered(&font_orbitron_12, 156, 155, "HTTP :80", COL_CYAN);
+        draw_text_centered(&font_space_8, 120, 184, online ? url_buf : "STA MODE RETRY", COL_CYBER_LIGHT);
+    }
+
+    blit_ui_fb(ui_fb);
 }
 
-/* BLE WiFi-setup progress -- reads BLE_WIFI_STATUS_FILE (written by
- * ble_setup.rs), maps its `state` field to a short status line + color
- * and an optional `detail` line (device name while waiting, SSID while
- * connecting, IP on success). Falls back to a generic "waiting" message
- * if the file doesn't exist yet (e.g. right at boot before ble_setup
- * has written anything). */
+/* ── Legacy LVGL Screens (only used for BLE WiFi Setup & early STARTING) ── */
+
+static lv_obj_t *scr_waiting, *waiting_label;
+static lv_obj_t *scr_wifi_setup, *wifi_setup_status, *wifi_setup_detail, *wifi_setup_meter;
+static lv_meter_scale_t *wifi_setup_scale;
+static lv_meter_indicator_t *wifi_setup_arc;
+
+static lv_obj_t *make_label(lv_obj_t *parent, const lv_font_t *font, lv_color_t color, lv_coord_t y, const char *text) {
+    lv_obj_t *l = lv_label_create(parent);
+    lv_obj_set_style_text_font(l, font, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, color, LV_PART_MAIN);
+    lv_obj_align(l, LV_ALIGN_TOP_MID, 0, y);
+    if (text) lv_label_set_text(l, text);
+    return l;
+}
+
+static void build_screens(void) {
+    const lv_font_t *f14 = &lv_font_montserrat_14;
+    const lv_font_t *f24 = &lv_font_montserrat_24;
+
+    scr_waiting = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_waiting, C_BG, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(scr_waiting, LV_OPA_COVER, LV_PART_MAIN);
+    waiting_label = make_label(scr_waiting, f24, C_TEXT_1, 108, "STARTING");
+
+    scr_wifi_setup = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_wifi_setup, C_BG, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(scr_wifi_setup, LV_OPA_COVER, LV_PART_MAIN);
+
+    wifi_setup_meter = lv_meter_create(scr_wifi_setup);
+    lv_obj_remove_style_all(wifi_setup_meter);
+    lv_obj_set_size(wifi_setup_meter, 220, 220);
+    lv_obj_center(wifi_setup_meter);
+
+    wifi_setup_scale = lv_meter_add_scale(wifi_setup_meter);
+    lv_meter_set_scale_ticks(wifi_setup_meter, wifi_setup_scale, 0, 0, 0, lv_color_black());
+    lv_meter_set_scale_range(wifi_setup_meter, wifi_setup_scale, 0, 100, 270, 135);
+
+    lv_meter_indicator_t *ws_bg = lv_meter_add_arc(wifi_setup_meter, wifi_setup_scale, 14, lv_color_make(0x1f, 0x22, 0x2a), 0);
+    lv_meter_set_indicator_start_value(wifi_setup_meter, ws_bg, 0);
+    lv_meter_set_indicator_end_value(wifi_setup_meter, ws_bg, 100);
+
+    wifi_setup_arc = lv_meter_add_arc(wifi_setup_meter, wifi_setup_scale, 14, C_YELLOW, 0);
+    lv_meter_set_indicator_start_value(wifi_setup_meter, wifi_setup_arc, 0);
+    lv_meter_set_indicator_end_value(wifi_setup_meter, wifi_setup_arc, 0);
+
+    wifi_setup_status = make_label(scr_wifi_setup, f24, C_YELLOW, 78, "...");
+    wifi_setup_detail = make_label(scr_wifi_setup, f14, C_TEXT_2, 114, NULL);
+    lv_obj_set_style_text_align(wifi_setup_detail, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_width(wifi_setup_detail, 176);
+}
+
 static void refresh_wifi_setup(void) {
-    /* ring_word: short, fits inside the ring at f24. sentence: full
-     * status line shown below the ring. detail_buf: SSID/IP/device-name
-     * context line under that. */
     const char *ring_word = "...";
     const char *sentence = "Starting...";
     lv_color_t color = C_TEXT_3;
@@ -987,41 +1144,22 @@ static void refresh_wifi_setup(void) {
         const char *detail = kv_str("detail");
         if (!state) state = "";
         if (!detail) detail = "";
-
         if (strcmp(state, "advertising") == 0) {
-            ring_word = "BLE";
-            sentence = "Waiting for phone";
-            color = C_YELLOW;
-            fill = 20;
+            ring_word = "BLE"; sentence = "Waiting for phone"; color = C_YELLOW; fill = 20;
             if (detail[0]) snprintf(detail_buf, sizeof(detail_buf), "Open Avalon Life,\nlook for %s", detail);
         } else if (strcmp(state, "client_connected") == 0) {
-            ring_word = "LINK";
-            sentence = "Phone connected";
-            color = C_YELLOW;
-            fill = 40;
+            ring_word = "LINK"; sentence = "Phone connected"; color = C_YELLOW; fill = 40;
         } else if (strcmp(state, "credentials_received") == 0) {
-            ring_word = "SAVE";
-            sentence = "Wifi info received";
-            color = C_YELLOW;
-            fill = 60;
+            ring_word = "SAVE"; sentence = "Wifi info received"; color = C_YELLOW; fill = 60;
             if (detail[0]) snprintf(detail_buf, sizeof(detail_buf), "%s", detail);
         } else if (strcmp(state, "connecting") == 0) {
-            ring_word = "...";
-            sentence = "Connecting";
-            color = C_YELLOW;
-            fill = 80;
+            ring_word = "..."; sentence = "Connecting"; color = C_YELLOW; fill = 80;
             if (detail[0]) snprintf(detail_buf, sizeof(detail_buf), "%s", detail);
         } else if (strcmp(state, "connected") == 0) {
-            ring_word = "OK";
-            sentence = "Wifi connected!";
-            color = C_GREEN;
-            fill = 100;
+            ring_word = "OK"; sentence = "Wifi connected!"; color = C_GREEN; fill = 100;
             if (detail[0]) snprintf(detail_buf, sizeof(detail_buf), "IP %s", detail);
         } else if (strcmp(state, "failed") == 0) {
-            ring_word = "X";
-            sentence = "Setup failed";
-            color = C_RED;
-            fill = 100;
+            ring_word = "X"; sentence = "Setup failed"; color = C_RED; fill = 100;
             snprintf(detail_buf, sizeof(detail_buf), "Check password,\ntry again");
         }
     }
@@ -1035,45 +1173,20 @@ static void refresh_wifi_setup(void) {
     lv_obj_invalidate(wifi_setup_meter);
 
     char full_detail[120];
-    if (detail_buf[0]) {
-        snprintf(full_detail, sizeof(full_detail), "%s\n%s", sentence, detail_buf);
-    } else {
-        snprintf(full_detail, sizeof(full_detail), "%s", sentence);
-    }
+    if (detail_buf[0]) snprintf(full_detail, sizeof(full_detail), "%s\n%s", sentence, detail_buf);
+    else snprintf(full_detail, sizeof(full_detail), "%s", sentence);
     lv_label_set_text(wifi_setup_detail, full_detail);
-
     lv_scr_load(scr_wifi_setup);
 }
 
-/* Raw full-screen static image -- bypasses LVGL entirely, same as
- * fb_draw.rs's Screen::load_image()+flush() for this page. Drawn once on
- * page-change only (the source image never changes, unlike the original's
- * unconditional periodic redraw). */
 static void refresh_pizza(void) {
     static uint8_t pizza_buf[FB_BYTES];
     FILE *f = fopen(PIZZA_FILE, "rb");
-    if (!f) {
-        return;
-    }
+    if (!f) return;
     size_t n = fread(pizza_buf, 1, sizeof(pizza_buf), f);
     fclose(f);
-    if (n != sizeof(pizza_buf)) {
-        return;
-    }
-    int fd = open(FB_DEV, O_WRONLY);
-    if (fd < 0) {
-        return;
-    }
-    lseek(fd, 0, SEEK_SET);
-    size_t written = 0;
-    while (written < sizeof(pizza_buf)) {
-        ssize_t wn = write(fd, pizza_buf + written, sizeof(pizza_buf) - written);
-        if (wn <= 0) {
-            break;
-        }
-        written += (size_t)wn;
-    }
-    close(fd);
+    if (n != sizeof(pizza_buf)) return;
+    blit_ui_fb((const uint16_t *)pizza_buf);
 }
 
 /* ── Procedural Plasma Disk Animation with Black Bitcoin B ──────────────── */
@@ -1413,49 +1526,64 @@ static void refresh_plasma(int init) {
     }
 }
 
-/* ── Page-file polling loop (mirrors fb_draw.rs's run_live_nano3s()) ────── */
 
-typedef enum { PG_LIVE, PG_DIAG, PG_TUNER, PG_IP, PG_PIZZA, PG_PLASMA, PG_DOOM, PG_WIFI_SETUP } page_t;
+/* ── Page-file polling & Theme Sync Event Loop ────────────────────────── */
+
+typedef enum {
+    PG_SPLASH,
+    PG_LIVE,
+    PG_TUNER,
+    PG_IP,
+    PG_PARASITE,
+    PG_PIZZA,
+    PG_PLASMA,
+    PG_DOOM,
+    PG_WIFI_SETUP
+} page_t;
 
 static page_t parse_page(const char *s) {
-    if (strcmp(s, "nano3s-diag") == 0) return PG_DIAG;
+    if (strcmp(s, "mujina-logo") == 0) return PG_SPLASH;
+    if (strcmp(s, "nano3s") == 0) return PG_LIVE;
     if (strcmp(s, "nano3s-tuner") == 0) return PG_TUNER;
     if (strcmp(s, "ip") == 0) return PG_IP;
+    if (strcmp(s, "parasite-logo") == 0) return PG_PARASITE;
     if (strcmp(s, "pizza") == 0) return PG_PIZZA;
     if (strcmp(s, "plasma") == 0) return PG_PLASMA;
     if (strcmp(s, "wifi-setup") == 0) return PG_WIFI_SETUP;
-    /* "doom" fully yields /dev/fb0 -- nano3s_doom owns the panel while
-     * this page is selected, same idea as the pizza page's raw-image
-     * bypass, just taken further: no refresh, no lv_timer_handler at all,
-     * so nano3s_ui can never race nano3s_doom for framebuffer writes. */
     if (strcmp(s, "doom") == 0) return PG_DOOM;
-    return PG_LIVE;
+    /* Diagnostics (nano3s-diag) removed; unrecognized names default to Splash */
+    return PG_SPLASH;
 }
 
 static void run_event_loop(void) {
     char last_page[64] = "";
+    ui_theme_t last_theme = (ui_theme_t)(-1);
     uint32_t last_refresh = now_ms() - REFRESH_INTERVAL_MS;
     uint32_t last_tick = now_ms();
     int was_doom = 0;
+    int was_lvgl = 0;
 
     for (;;) {
         uint32_t now = now_ms();
         lv_tick_inc(now - last_tick);
         last_tick = now;
 
-        char page[64] = "nano3s";
+        char page[64] = "mujina-logo";
         FILE *pf = fopen(PAGE_FILE, "r");
         if (pf) {
             if (fgets(page, sizeof(page), pf)) {
                 page[strcspn(page, "\r\n")] = '\0';
-            } else {
-                strcpy(page, "nano3s");
             }
             fclose(pf);
         }
 
+        ui_theme_t theme = read_ui_theme();
         page_t pg = parse_page(page);
+        if (pg == PG_PARASITE && theme != THEME_PARASITE) {
+            pg = PG_SPLASH;
+        }
         int page_changed = strcmp(page, last_page) != 0;
+        int theme_changed = (theme != last_theme);
 
         if (was_doom && pg != PG_DOOM) {
             silence_buzzer();
@@ -1463,10 +1591,9 @@ static void run_event_loop(void) {
         was_doom = (pg == PG_DOOM);
 
         if (pg == PG_DOOM) {
-            /* Touch nothing -- not even lv_timer_handler -- while doom
-             * owns the panel. Just keep polling so we notice when the
-             * page changes back. */
             strcpy(last_page, page);
+            last_theme = theme;
+            was_lvgl = 0;
             usleep(POLL_INTERVAL_MS * 1000);
             continue;
         }
@@ -1474,36 +1601,58 @@ static void run_event_loop(void) {
         if (pg == PG_PLASMA) {
             refresh_plasma(page_changed);
             strcpy(last_page, page);
-            usleep(50 * 1000); /* 20 FPS procedural lightning animation */
+            last_theme = theme;
+            was_lvgl = 0;
+            usleep(50 * 1000); /* 20 FPS Bitcoin Plasma */
             continue;
         }
 
-        if (page_changed || now - last_refresh >= REFRESH_INTERVAL_MS) {
+        if (pg == PG_SPLASH) {
+            refresh_splash_themed(theme, now);
             strcpy(last_page, page);
+            last_theme = theme;
+            was_lvgl = 0;
+            usleep(ANIM_INTERVAL_MS * 1000); /* 25 FPS animated splash rings */
+            continue;
+        }
+
+        if (pg == PG_PARASITE) {
+            refresh_parasite_logo(now);
+            strcpy(last_page, page);
+            last_theme = theme;
+            was_lvgl = 0;
+            usleep(ANIM_INTERVAL_MS * 1000); /* 25 FPS animated Parasite chronograph */
+            continue;
+        }
+
+        if (page_changed || theme_changed || now - last_refresh >= REFRESH_INTERVAL_MS) {
+            strcpy(last_page, page);
+            last_theme = theme;
             last_refresh = now;
 
             if (pg == PG_IP) {
-                refresh_ip();
+                refresh_ip_themed(theme);
+                was_lvgl = 0;
             } else if (pg == PG_PIZZA) {
-                if (page_changed) {
-                    refresh_pizza();
-                }
+                if (page_changed) refresh_pizza();
+                was_lvgl = 0;
             } else if (pg == PG_WIFI_SETUP) {
-                refresh_wifi_setup();
-            } else if (read_kv_file(NANO3S_LIVE_FILE)) {
-                if (pg == PG_DIAG) {
-                    refresh_diag();
-                } else if (pg == PG_TUNER) {
-                    refresh_tuner();
-                } else {
-                    refresh_live();
+                if (!was_lvgl) {
+                    lv_obj_invalidate(scr_wifi_setup);
                 }
+                refresh_wifi_setup();
+                was_lvgl = 1;
+            } else if (read_kv_file(NANO3S_LIVE_FILE)) {
+                if (pg == PG_TUNER) refresh_tuner_themed(theme);
+                else refresh_live_themed(theme);
+                was_lvgl = 0;
             } else {
-                refresh_waiting("STARTING");
+                refresh_splash_themed(theme, now);
+                was_lvgl = 0;
             }
         }
 
-        if (pg != PG_PIZZA) {
+        if (was_lvgl) {
             lv_timer_handler();
         }
         usleep(POLL_INTERVAL_MS * 1000);
@@ -1513,16 +1662,12 @@ static void run_event_loop(void) {
 static void clear_framebuffer(void) {
     static uint8_t zeros[FB_BYTES];
     int fd = open(FB_DEV, O_WRONLY);
-    if (fd < 0) {
-        return;
-    }
+    if (fd < 0) return;
     lseek(fd, 0, SEEK_SET);
     size_t written = 0;
     while (written < sizeof(zeros)) {
         ssize_t n = write(fd, zeros + written, sizeof(zeros) - written);
-        if (n <= 0) {
-            break;
-        }
+        if (n <= 0) break;
         written += (size_t)n;
     }
     close(fd);
@@ -1530,6 +1675,7 @@ static void clear_framebuffer(void) {
 
 int nano3s_ui_run(void) {
     clear_framebuffer();
+    init_ring_lut();
     lv_init();
 
     static lv_disp_draw_buf_t draw_buf;
@@ -1544,7 +1690,7 @@ int nano3s_ui_run(void) {
     lv_disp_drv_register(&disp_drv);
 
     build_screens();
-    refresh_waiting("STARTING");
+    refresh_splash_themed(read_ui_theme(), now_ms());
 
     run_event_loop();
     return 0;

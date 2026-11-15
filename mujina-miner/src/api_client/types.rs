@@ -392,6 +392,22 @@ pub struct FirmwareBundleResponse {
     pub detail: String,
 }
 
+/// Current LCD display theme and active page state (`GET /api/v0/display`).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct DisplayState {
+    pub theme: String,
+    pub page: String,
+}
+
+/// Request body for `PATCH /api/v0/display`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct DisplayPatchRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<String>,
+}
+
 /// Job source telemetry.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct SourceTelemetry {

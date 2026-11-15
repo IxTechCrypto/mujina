@@ -57,16 +57,36 @@ fn beep(beeper: &mut File, millis: u64) {
 // "temps" cycle, since "temps" depended on cgminer's PVT_T[] stats
 // reply, which doesn't exist once mm_miner/cgminer are gone. "pizza"
 // and "ip" are stack-independent (static image, ifconfig) and stay.
+const UI_THEME_TMP: &str = "/tmp/ui_theme";
+const UI_THEME_CONF: &str = "/data/userconfig/theme.conf";
+
+fn read_ui_theme() -> String {
+    if let Ok(t) = fs::read_to_string(UI_THEME_TMP) {
+        let t = t.trim().to_owned();
+        if !t.is_empty() { return t; }
+    }
+    if let Ok(raw) = fs::read_to_string(UI_THEME_CONF) {
+        for line in raw.lines() {
+            if let Some((_, v)) = line.split_once('=') {
+                let v = v.trim();
+                if !v.is_empty() { return v.to_owned(); }
+            }
+        }
+    }
+    "cyberpunk".to_owned()
+}
+
 fn toggle_page() {
-    let current = fs::read_to_string(PAGE_FILE).unwrap_or_else(|_| "nano3s".to_owned());
+    let current = fs::read_to_string(PAGE_FILE).unwrap_or_else(|_| "mujina-logo".to_owned());
+    let theme = read_ui_theme();
     let next = match current.trim() {
-        "nano3s" => "nano3s-diag",
-        "nano3s-diag" => "nano3s-tuner",
+        "mujina-logo" => "nano3s",
+        "nano3s" => "nano3s-tuner",
         "nano3s-tuner" => "ip",
-        "ip" => "pizza",
-        "pizza" => "plasma",
-        "plasma" => "nano3s",
-        _ => "nano3s",
+        "ip" => if theme == "parasite" { "parasite-logo" } else { "plasma" },
+        "parasite-logo" => "plasma",
+        "plasma" => "mujina-logo",
+        _ => "mujina-logo",
     };
     let _ = fs::write(PAGE_FILE, format!("{next}\n"));
 }

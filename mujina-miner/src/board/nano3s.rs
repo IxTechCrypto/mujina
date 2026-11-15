@@ -2307,6 +2307,153 @@ pub(crate) fn get_led_state() -> crate::api_client::types::BoardLedState {
     }
 }
 
+/// Non-volatile configuration path for LCD display visual theme.
+const THEME_CONF_PATH: &str = "/data/userconfig/theme.conf";
+const UI_THEME_TMP_PATH: &str = "/tmp/ui_theme";
+const FB_PAGE_PATH: &str = "/mntapp/release/linux/app/fb_page";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiTheme {
+    Cyberpunk,
+    Minimal,
+    Parasite,
+}
+
+impl UiTheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            UiTheme::Cyberpunk => "cyberpunk",
+            UiTheme::Minimal => "minimal",
+            UiTheme::Parasite => "parasite",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self, String> {
+        match s.trim() {
+            "cyberpunk" => Ok(UiTheme::Cyberpunk),
+            "minimal" | "apple" => Ok(UiTheme::Minimal),
+            "parasite" => Ok(UiTheme::Parasite),
+            other => Err(format!("unknown UI theme '{other}' (want cyberpunk/minimal/parasite)")),
+        }
+    }
+}
+
+pub(crate) enum DisplayError {
+    BadRequest(String),
+    Io(String),
+}
+
+fn atomic_write_file(path: &std::path::Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp_path = format!("{}.tmp", path.display());
+    let mut f = std::fs::File::create(&tmp_path)
+        .map_err(|e| format!("failed to create {tmp_path}: {e}"))?;
+    if let Err(e) = std::io::Write::write_all(&mut f, content.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("failed to write {tmp_path}: {e}"));
+    }
+    if let Err(e) = f.sync_all() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("failed to sync {tmp_path}: {e}"));
+    }
+    drop(f);
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| format!("failed to rename {tmp_path} to {}: {e}", path.display()))
+}
+
+fn load_ui_theme() -> UiTheme {
+    let theme = std::fs::read_to_string(THEME_CONF_PATH)
+        .ok()
+        .and_then(|raw| {
+            for line in raw.lines() {
+                if let Some((k, v)) = line.split_once('=') {
+                    if k.trim() == "theme" {
+                        return UiTheme::parse(v).ok();
+                    }
+                } else if let Ok(t) = UiTheme::parse(line) {
+                    return Some(t);
+                }
+            }
+            None
+        })
+        .unwrap_or(UiTheme::Cyberpunk);
+    if let Err(e) = atomic_write_file(
+        std::path::Path::new(UI_THEME_TMP_PATH),
+        &format!("{}\n", theme.as_str()),
+    ) {
+        eprintln!("[nano3s] {e}");
+    }
+    theme
+}
+
+static UI_THEME: std::sync::LazyLock<std::sync::Mutex<UiTheme>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(load_ui_theme()));
+
+fn is_valid_page(p: &str) -> bool {
+    matches!(
+        p.trim(),
+        "mujina-logo" | "nano3s" | "nano3s-tuner" | "ip" | "parasite-logo" | "plasma" | "pizza" | "wifi-setup" | "doom"
+    )
+}
+
+pub(crate) fn write_display_command(
+    theme: Option<String>,
+    page: Option<String>,
+) -> Result<crate::api_client::types::DisplayState, DisplayError> {
+    let mut current = UI_THEME.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(t_str) = theme {
+        let parsed = UiTheme::parse(&t_str).map_err(DisplayError::BadRequest)?;
+        atomic_write_file(
+            std::path::Path::new(THEME_CONF_PATH),
+            &format!("theme={}\n", parsed.as_str()),
+        )
+        .map_err(DisplayError::Io)?;
+        atomic_write_file(
+            std::path::Path::new(UI_THEME_TMP_PATH),
+            &format!("{}\n", parsed.as_str()),
+        )
+        .map_err(DisplayError::Io)?;
+        *current = parsed;
+        if parsed != UiTheme::Parasite {
+            let cur_page = std::fs::read_to_string(FB_PAGE_PATH).unwrap_or_default();
+            if cur_page.trim() == "parasite-logo" {
+                atomic_write_file(std::path::Path::new(FB_PAGE_PATH), "mujina-logo\n")
+                    .map_err(DisplayError::Io)?;
+            }
+        }
+    }
+    if let Some(p_str) = page {
+        let p = p_str.trim();
+        if !is_valid_page(p) {
+            return Err(DisplayError::BadRequest(format!("unknown display page '{p}'")));
+        }
+        atomic_write_file(std::path::Path::new(FB_PAGE_PATH), &format!("{p}\n"))
+            .map_err(DisplayError::Io)?;
+    }
+    let active_page = std::fs::read_to_string(FB_PAGE_PATH)
+        .unwrap_or_else(|_| "mujina-logo".to_string())
+        .trim()
+        .to_string();
+    Ok(crate::api_client::types::DisplayState {
+        theme: current.as_str().to_string(),
+        page: if active_page.is_empty() { "mujina-logo".to_string() } else { active_page },
+    })
+}
+
+pub(crate) fn get_display_state() -> crate::api_client::types::DisplayState {
+    let current = *UI_THEME.lock().unwrap_or_else(|e| e.into_inner());
+    let active_page = std::fs::read_to_string(FB_PAGE_PATH)
+        .unwrap_or_else(|_| "mujina-logo".to_string())
+        .trim()
+        .to_string();
+    crate::api_client::types::DisplayState {
+        theme: current.as_str().to_string(),
+        page: if active_page.is_empty() { "mujina-logo".to_string() } else { active_page },
+    }
+}
+
 /// Standard HSV -> RGB conversion. `h` in degrees (any range, wrapped
 /// mod 360); `s`/`v` in `[0,1]`.
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
@@ -2733,7 +2880,8 @@ fn write_live_status(ipc_ok: bool, current_job_id: Option<u32>, shares_found: u3
          pll2={pll2}\n\
          pll3={pll3}\n\
          err_crc={err_crc}\n\
-         voltage_mv={voltage_mv}\n",
+         voltage_mv={voltage_mv}\n\
+         ui_theme={ui_theme}\n",
         ipc = if ipc_ok { 1 } else { 0 },
         paused = if is_idle { 1 } else { 0 },
         asics_total = st.asics_total,
@@ -2752,6 +2900,7 @@ fn write_live_status(ipc_ok: bool, current_job_id: Option<u32>, shares_found: u3
         pll3 = st.pll_freq[3],
         err_crc = st.err_crc,
         voltage_mv = st.voltage_mv,
+        ui_theme = UI_THEME.lock().unwrap_or_else(|e| e.into_inner()).as_str(),
     );
     if let Err(e) = std::fs::write(NANO3S_LIVE_FILE, body) {
         eprintln!("[nano3s] failed to write {NANO3S_LIVE_FILE}: {e}");
@@ -2802,6 +2951,7 @@ fn run_worker(
     status: Arc<Mutex<HashThreadStatus>>,
     telemetry_tx: watch::Sender<BoardTelemetry>,
 ) {
+    let _ = get_display_state();
     let mut led = Ws2812Strip::open();
     led.set_all(led_color::INITIALIZING);
     // Phase/decay/PRNG memory for the animated LED effects (everything

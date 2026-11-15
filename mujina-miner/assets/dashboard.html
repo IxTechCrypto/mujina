@@ -896,7 +896,7 @@
     body.theme-parasite .chartcard,
     body.theme-parasite .bs-card {
       clip-path: none !important;
-      border: 4px double #ffffff !important;
+      border: 1px solid #d4d4d4 !important;
       border-radius: 0 !important;
       background: #000000 !important;
     }
@@ -906,7 +906,7 @@
     body.theme-parasite input[type=text],
     body.theme-parasite input[type=password],
     body.theme-parasite input[type=number] {
-      border: 3px double #ffffff !important;
+      border: 1px solid #d4d4d4 !important;
       border-radius: 0 !important;
       background: #000000 !important;
       color: #ffffff !important;
@@ -914,14 +914,14 @@
       outline: none !important;
     }
     body.theme-parasite .toggle-row {
-      border: 3px double #ffffff !important;
+      border: 1px solid #d4d4d4 !important;
       border-radius: 0 !important;
       background: #000000 !important;
     }
     body.theme-parasite .toggle-row .toggle-label { color: #ffffff !important; }
     body.theme-parasite #ownContinuousState.on { color: #ffffff !important; text-shadow: none !important; }
     body.theme-parasite .switch .slider {
-      border: 2px solid #ffffff !important;
+      border: 1px solid #d4d4d4 !important;
       border-radius: 0 !important;
       background: #000000 !important;
       box-shadow: none !important;
@@ -942,11 +942,13 @@
     body.theme-parasite .btab {
       clip-path: none !important;
       border-radius: 0 !important;
-      border: 1px solid #ffffff !important;
+      border: 1px solid #888888 !important;
       background: #000000 !important;
     }
     body.theme-parasite .btab.active {
-      border: 4px double #ffffff !important;
+      border: 1px solid #ffffff !important;
+      background: #ffffff !important;
+      color: #000000 !important;
       font-weight: bold;
     }
     body.theme-parasite .btab-tune-btn {
@@ -1008,7 +1010,7 @@
     body.theme-parasite .at-best-badge { color: #ffffff !important; }
     body.theme-parasite .chiptile {
       background: #000000 !important;
-      border: 2px solid #ffffff !important;
+      border: 1px solid #b8b8b8 !important;
       border-radius: 0 !important;
     }
     body.theme-parasite .chiptile .ctname {
@@ -1036,7 +1038,7 @@
       border-radius: 0 !important;
     }
     body.theme-parasite .chiptile.weak {
-      border: 2px solid var(--mag) !important;
+      border: 1px solid var(--mag) !important;
       background: #000000 !important;
     }
 
@@ -1048,11 +1050,11 @@
       border: 1px solid rgba(255,255,255,.6) !important; border-radius: 10px !important; box-shadow: none !important; }
     body.theme-minimal .menubar .menubtn.on { background: rgba(255,255,255,.7) !important; }
     body.theme-minimal .modebadge { color: #2d3e50; border-color: rgba(255,255,255,.6); background: rgba(255,255,255,.45); border-radius: 10px; }
-    body.theme-parasite .menubar .menubtn { background: #000 !important; color: #fff !important; border: 3px double #fff !important;
+    body.theme-parasite .menubar .menubtn { background: #000 !important; color: #fff !important; border: 1px solid #d4d4d4 !important;
       border-radius: 0 !important; box-shadow: none !important; }
     body.theme-parasite .menubar .menubtn.on { background: #fff !important; color: #000 !important; }
-    body.theme-parasite .modebadge { color: #fff; border: 3px double #fff; border-radius: 0; }
-    body.theme-parasite .sysnotice { color: #fff; border: 3px double #fff; }
+    body.theme-parasite .modebadge { color: #fff; border: 1px solid #d4d4d4; border-radius: 0; }
+    body.theme-parasite .sysnotice { color: #fff; border: 1px solid #d4d4d4; }
   </style>
 <script src="/auth.js"></script>
 </head>
@@ -1318,7 +1320,7 @@
     <div class="sheet">
       <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
       <h2>Display</h2>
-      <div class="sec">Theme<span class="sec-sub">saved in this browser</span></div>
+      <div class="sec">Theme<span class="sec-sub">synced with unit LCD</span></div>
       <div class="card" style="max-width:560px">
         <div class="row">
           <label for="uitheme">Visual Theme</label>
@@ -2962,12 +2964,35 @@ $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(b => {
 
 const themeSel = $('uitheme');
 themeSel.value = themeNow();
-themeSel.addEventListener('change', () => {
-  const t = THEMES.indexOf(themeSel.value) >= 0 ? themeSel.value : 'cyberpunk';
+let LAST_THEME_PUSH_MS = 0;
+function applyThemeSelection(t, pushToUnit) {
+  if (THEMES.indexOf(t) < 0) t = 'cyberpunk';
+  themeSel.value = t;
   try { localStorage.setItem('mujina-theme', t); } catch (e) { /* storage blocked */ }
   document.body.className = 'theme-' + t;
   if (LAST) render(LAST);
-});
+  if (pushToUnit) {
+    LAST_THEME_PUSH_MS = Date.now();
+    fetch('/api/v0/display', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ theme: t })
+    }).catch(() => {});
+  }
+}
+themeSel.addEventListener('change', () => applyThemeSelection(themeSel.value, true));
+async function loadDisplayTheme() {
+  try {
+    const r = await fetch('/api/v0/display');
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d && d.theme && Date.now() - LAST_THEME_PUSH_MS > 3000 && d.theme !== themeNow()) {
+      applyThemeSelection(d.theme, false);
+    }
+  } catch (e) {}
+}
+loadDisplayTheme();
+setInterval(loadDisplayTheme, 8000);
 
 loadPool();
 applySystem();
