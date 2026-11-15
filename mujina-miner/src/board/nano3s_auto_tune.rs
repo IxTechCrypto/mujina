@@ -193,10 +193,31 @@ pub(crate) fn envelope_from_cali(c: &[CaliMode; 3]) -> TuneEnvelope {
 /// Envelope for this device: from `path` when it parses, else the constants.
 /// The bool is true when the file was used.
 pub(crate) fn load_envelope(path: &str) -> (TuneEnvelope, bool) {
+    let (env, _, ok) = load_envelope_with_cali(path);
+    (env, ok)
+}
+
+pub(crate) fn load_envelope_with_cali(path: &str) -> (TuneEnvelope, Option<[CaliMode; 3]>, bool) {
     match std::fs::read_to_string(path).ok().as_deref().and_then(parse_cali) {
-        Some(c) => (envelope_from_cali(&c), true),
-        None => (NANO3S_ENVELOPE, false),
+        Some(c) => (envelope_from_cali(&c), Some(c), true),
+        None => (NANO3S_ENVELOPE, None, false),
     }
+}
+
+pub(crate) fn cali_recovery_point(
+    choice: TuneChoice,
+    env: &TuneEnvelope,
+    cali: Option<&[CaliMode; 3]>,
+) -> Option<TuneSetpoint> {
+    let modes = cali?;
+    let mode = match choice {
+        TuneChoice::Profile(TuneProfile::Quiet) => modes[0],
+        TuneChoice::Profile(TuneProfile::Efficient | TuneProfile::Balanced) => modes[1],
+        TuneChoice::Profile(TuneProfile::MaxHash) | TuneChoice::Target(_) => modes[2],
+    };
+    let mv = (snap_voltage_mv(mode.mv as i64) as u16).clamp(env.min_voltage_mv, env.max_voltage_mv);
+    let mhz = (mode.mhz as f32).clamp(env.min_freq_mhz, env.max_freq_mhz);
+    Some(TuneSetpoint { frequency_mhz: mhz, core_voltage_mv: mv })
 }
 
 // --- API types -------------------------------------------------------------
@@ -729,6 +750,8 @@ pub(crate) enum AutoTuneCmd {
     Fan(&'static str),
     /// `fan:manual,<duty>` from the chip-temp fan loop.
     FanManual(u8),
+    /// Power-cycle and re-enumerate the hash chain after a persistent stall.
+    ReinitChain,
 }
 
 /// Maps a tuner action to hardware commands. Fan actions map to nothing here:
@@ -737,6 +760,7 @@ pub(crate) fn action_to_cmds(action: TuneAction) -> Vec<AutoTuneCmd> {
     match action {
         TuneAction::SetFrequency(base) => vec![AutoTuneCmd::SetMode(domain_freqs(base))],
         TuneAction::SetVoltage(mv) => vec![AutoTuneCmd::SetVoltage(snap_voltage_mv(mv as i64) as i32)],
+        TuneAction::ReinitChain => vec![AutoTuneCmd::ReinitChain],
         // Fan actions are routed through the fan loop (`AutoTune`), which
         // owns the fan while the autotuner is on.
         TuneAction::SetFanFull | TuneAction::RestoreFanAuto | TuneAction::SetFanMinPercent(_) => vec![],
@@ -758,6 +782,77 @@ pub(crate) fn clear_other_loops(
 }
 
 /// At startup, the autotuner wins over any persisted/env loop.
+/// True when two [`TuneTarget`] values represent the same target (within
+/// float formatting/parsing epsilon).
+pub(crate) fn targets_match(a: TuneTarget, b: TuneTarget) -> bool {
+    match (a, b) {
+        (TuneTarget::Power(w1), TuneTarget::Power(w2)) => (w1 - w2).abs() < 0.01,
+        (TuneTarget::Hashrate(h1), TuneTarget::Hashrate(h2)) => (h1 - h2).abs() < 0.01,
+        _ => false,
+    }
+}
+
+/// Parses `target_memory=<choice>,<freq>,<mv>,<ths>,<jth>,<floor_mv>,<ceil_mhz>`.
+pub(crate) fn parse_target_memory(s: &str) -> Option<(TuneTarget, SearchMemory)> {
+    let f: Vec<&str> = s.split(',').map(str::trim).collect();
+    let [choice_str, freq, mv, ths, jth, floor, ceil] = f.as_slice() else {
+        return None;
+    };
+    let Some(TuneChoice::Target(target)) = parse_choice(choice_str).ok().flatten() else {
+        return None;
+    };
+    Some((
+        target,
+        SearchMemory {
+            best: TuneSetpoint {
+                frequency_mhz: freq.parse().ok()?,
+                core_voltage_mv: mv.parse().ok()?,
+            },
+            best_hashrate_ths: ths.parse().ok()?,
+            best_j_th: jth.parse().ok()?,
+            probe_floor_mv: floor.parse().ok()?,
+            probe_ceiling_mhz: ceil.parse().ok()?,
+        },
+    ))
+}
+
+pub(crate) fn format_target_memory((t, m): &(TuneTarget, SearchMemory)) -> String {
+    format!(
+        "{},{},{},{},{},{},{}",
+        choice_text(Some(TuneChoice::Target(*t))),
+        m.best.frequency_mhz,
+        m.best.core_voltage_mv,
+        m.best_hashrate_ths,
+        m.best_j_th,
+        m.probe_floor_mv,
+        m.probe_ceiling_mhz
+    )
+}
+
+/// Resolves startup PLL frequencies, voltage, and optional target [`SearchMemory`]
+/// on boot. When `choice` is a [`TuneChoice::Target`] matching `target_mem`,
+/// restores `startup_pll_freq` and `voltage_mv` from the remembered good
+/// setpoint even if `tuning.conf`'s `pll_freq_mhz` was absent or stale.
+pub(crate) fn resolve_target_startup(
+    choice: Option<TuneChoice>,
+    target_mem: Option<(TuneTarget, SearchMemory)>,
+    persisted_pll: Option<[u32; 4]>,
+    persisted_mv: Option<u32>,
+    default_pll: [u32; 4],
+) -> ([u32; 4], Option<u32>, Option<SearchMemory>) {
+    if let Some(TuneChoice::Target(t)) = choice
+        && let Some((mt, mem)) = target_mem
+        && targets_match(t, mt)
+    {
+        return (
+            domain_freqs(mem.best.frequency_mhz),
+            Some(mem.best.core_voltage_mv as u32),
+            Some(mem),
+        );
+    }
+    (persisted_pll.unwrap_or(default_pll), persisted_mv, None)
+}
+
 pub(crate) fn startup_loop_allowed(auto_tune_profile: Option<TuneChoice>, autotune_hashrate: Option<f64>) -> bool {
     auto_tune_profile.is_none() && autotune_hashrate.is_none()
 }
@@ -766,6 +861,8 @@ pub(crate) fn startup_loop_allowed(auto_tune_profile: Option<TuneChoice>, autotu
 
 pub(crate) struct AutoTune {
     tuner: AutoTuner,
+    envelope: TuneEnvelope,
+    cali_modes: Option<[CaliMode; 3]>,
     /// What is running: a profile or a power/hashrate target. `None` = off.
     choice: Option<TuneChoice>,
     next_tick: Option<std::time::Instant>,
@@ -783,10 +880,16 @@ impl AutoTune {
     }
 
     pub(crate) fn with_envelope(envelope: TuneEnvelope) -> Self {
+        Self::with_envelope_and_cali(envelope, None)
+    }
+
+    pub(crate) fn with_envelope_and_cali(envelope: TuneEnvelope, cali_modes: Option<[CaliMode; 3]>) -> Self {
         let mut tuner = AutoTuner::default();
         tuner.set_envelope(envelope);
         Self {
             tuner,
+            envelope,
+            cali_modes,
             choice: None,
             next_tick: None,
             continuous_ceiling_w: None,
@@ -853,17 +956,16 @@ impl AutoTune {
         fan_step(&mut self.fan, temp_max_c, cap, target, force).map(AutoTuneCmd::FanManual)
     }
 
-    /// The running profile's search memory (see [`SearchMemory`]). Target
-    /// mode keeps none: a different setpoint is a different search.
+    /// The running choice's search memory (see [`SearchMemory`]).
     pub(crate) fn memory(&self) -> Option<SearchMemory> {
-        self.profile()?;
+        self.choice?;
         self.tuner.memory()
     }
 
-    /// Restores a saved search for the running profile. Call right after
-    /// [`Self::enable`] on a boot-time resume.
+    /// Restores a saved search for the running choice (profile or target).
+    /// Call right after [`Self::enable_choice`] on a boot-time or re-enable resume.
     pub(crate) fn restore_memory(&mut self, mem: SearchMemory) {
-        if self.profile().is_some() {
+        if self.choice.is_some() {
             self.tuner.restore_memory(mem);
         }
     }
@@ -921,6 +1023,11 @@ impl AutoTune {
             TuneChoice::Profile(p) => self.tuner.enable_profile(p),
             TuneChoice::Target(t) => self.tuner.enable_target(t),
         }
+        self.tuner.set_recovery_point(cali_recovery_point(
+            choice,
+            &self.envelope,
+            self.cali_modes.as_ref(),
+        ));
         self.choice = Some(choice);
         self.next_tick = None;
         self.fan = FanState::default();
@@ -962,6 +1069,10 @@ impl AutoTune {
     pub(crate) fn set_power_ceiling(&mut self, w: f32) {
         self.continuous_ceiling_w = Some(w);
         self.tuner.set_power_ceiling(Some(w));
+    }
+
+    pub(crate) fn set_power_safety(&mut self, watts: Option<f32>) {
+        self.tuner.set_power_safety(watts);
     }
 
     pub(crate) fn evaluate(&mut self, m: &Metrics) -> Vec<AutoTuneCmd> {
@@ -1578,5 +1689,72 @@ mod tests {
     #[test]
     fn startup_exclusivity_includes_targets() {
         assert!(!startup_loop_allowed(Some(TuneChoice::Target(TuneTarget::Hashrate(6.0))), None));
+    }
+
+    #[test]
+    fn target_memory_roundtrip_and_startup_restore() {
+        let mem = SearchMemory {
+            best: TuneSetpoint { frequency_mhz: 480.0, core_voltage_mv: 3828 },
+            best_hashrate_ths: 6.12,
+            best_j_th: 22.7,
+            probe_floor_mv: 3780,
+            probe_ceiling_mhz: 500.0,
+        };
+        let target = TuneTarget::Power(140.0);
+        let formatted = format_target_memory(&(target, mem));
+        assert!(formatted.starts_with("power:140,"));
+        let (parsed_t, parsed_m) = parse_target_memory(&formatted).expect("parse target_memory");
+        assert!(targets_match(target, parsed_t));
+        assert_eq!(parsed_m, mem);
+        assert!(targets_match(TuneTarget::Power(140.0), TuneTarget::Power(140.004)));
+        assert!(!targets_match(TuneTarget::Power(140.0), TuneTarget::Power(130.0)));
+
+        // Even if persisted_pll is stale (e.g. 210 MHz from fallback/manual),
+        // boot restore for matching power:140 picks up the remembered setpoint.
+        let (pll, mv, restored) = resolve_target_startup(
+            Some(TuneChoice::Target(TuneTarget::Power(140.0))),
+            Some((parsed_t, parsed_m)),
+            Some([210, 210, 210, 210]),
+            Some(3678),
+            [350, 350, 350, 350],
+        );
+        assert_eq!(pll, domain_freqs(480.0));
+        assert_eq!(mv, Some(3828));
+        assert_eq!(restored, Some(mem));
+
+        let mut o = AutoTune::new();
+        o.enable_choice(TuneChoice::Target(TuneTarget::Power(140.0)));
+        o.restore_memory(restored.unwrap());
+        assert_eq!(o.memory(), Some(mem));
+
+        // Different target falls back to persisted pll/mv and restores no memory.
+        let (pll2, mv2, restored2) = resolve_target_startup(
+            Some(TuneChoice::Target(TuneTarget::Power(120.0))),
+            Some((parsed_t, parsed_m)),
+            Some([210, 210, 210, 210]),
+            Some(3678),
+            [350, 350, 350, 350],
+        );
+        assert_eq!(pll2, [210, 210, 210, 210]);
+        assert_eq!(mv2, Some(3678));
+        assert_eq!(restored2, None);
+    }
+
+    #[test]
+    fn reinit_chain_cmd_and_cali_recovery_point_selection() {
+        assert_eq!(action_to_cmds(TuneAction::ReinitChain), vec![AutoTuneCmd::ReinitChain]);
+
+        let cali = parse_cali(SAMPLE_CALI).unwrap();
+        let env = envelope_from_cali(&cali);
+
+        let q = cali_recovery_point(TuneChoice::Profile(TuneProfile::Quiet), &env, Some(&cali)).unwrap();
+        assert_eq!(q.frequency_mhz, cali[0].mhz as f32);
+
+        let b = cali_recovery_point(TuneChoice::Profile(TuneProfile::Balanced), &env, Some(&cali)).unwrap();
+        assert_eq!(b.frequency_mhz, cali[1].mhz as f32);
+        assert_eq!(b.core_voltage_mv, snap_voltage_mv(cali[1].mv as i64) as u16);
+
+        let t = cali_recovery_point(TuneChoice::Target(TuneTarget::Power(140.0)), &env, Some(&cali)).unwrap();
+        assert_eq!(t.frequency_mhz, cali[2].mhz as f32);
     }
 }

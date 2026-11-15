@@ -251,6 +251,9 @@ pub enum TuneProfile {
 pub struct Caps {
     pub temp_c: f32,
     pub power_w: f32,
+    /// Instantaneous safety trip ceiling (W). Defaults to `power_w`, or
+    /// `power_safety_w` when explicitly configured (e.g. 1.03x PSU override).
+    pub safety_power_w: f32,
     /// Seek higher clock (raising voltage if needed) vs. hold conservative.
     pub seek_hash: bool,
     /// Trim voltage for efficiency while stable.
@@ -275,6 +278,7 @@ impl TuneProfile {
         Caps {
             temp_c: limits.temp_c,
             power_w: limits.power_w,
+            safety_power_w: limits.power_w,
             seek_hash,
             seek_efficiency,
             continuous: false,
@@ -329,6 +333,7 @@ impl TuneMode {
                 // Small headroom above the target so the breach branch
                 // doesn't fight the convergence branch right at setpoint.
                 power_w: watts * env.target_power_headroom,
+                safety_power_w: watts * env.target_power_headroom,
                 seek_hash: false,
                 seek_efficiency: false,
                 continuous: false,
@@ -339,6 +344,7 @@ impl TuneMode {
                 // The target's power draw isn't known in advance; reuse
                 // MaxHash's ceiling as the outer safety bound.
                 power_w: env.target_hashrate_power_w,
+                safety_power_w: env.target_hashrate_power_w,
                 seek_hash: false,
                 seek_efficiency: false,
                 continuous: false,
@@ -386,6 +392,10 @@ pub struct Metrics {
     pub fail_rate_pct: Option<f32>,
 }
 
+/// Consecutive zero-hashrate ticks (`< MIN_HASHRATE_THS`) while mining before
+/// the tuner escapes `Warmup` by reverting to a known-good setpoint (40 * 15s = 10 min).
+pub const WARMUP_STALL_TIMEOUT_TICKS: u32 = 40;
+
 /// A change the tuner wants applied to the board.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TuneAction {
@@ -402,6 +412,17 @@ pub enum TuneAction {
     /// Slowly adjust the minimum fan speed in automatic mode to find a
     /// stable cooling state.
     SetFanMinPercent(u8),
+    /// Power-cycle and re-enumerate the hash chain after a persistent
+    /// zero-hashrate stall did not clear on setpoint revert.
+    ReinitChain,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum StallStage {
+    #[default]
+    None,
+    RevertedWaiting,
+    ReinitRequested,
 }
 
 /// Where the tuner is in its search.
@@ -478,6 +499,9 @@ pub struct AutoTuner {
     /// nano-mujina addition: live whole-board power ceiling (W) imposed by
     /// the board's PSU, applied as `min()` over the mode's power cap.
     power_ceiling_w: Option<f32>,
+    /// nano-mujina addition: instantaneous safety trip ceiling (W), e.g.
+    /// 1.03x PSU override so normal warmup ripples don't trip backoff.
+    power_safety_w: Option<f32>,
     phase: TunePhase,
     /// Cycles since the last applied change (settle gate).
     cycles_since_change: u32,
@@ -533,6 +557,17 @@ pub struct AutoTuner {
     /// Number of `evaluate` calls while enabled.
     cycle: u64,
     log: VecDeque<TuneEvent>,
+    /// True once `evaluate_inner` has issued at least one `SetFrequency` or
+    /// `SetVoltage` in the current search session.
+    has_acted: bool,
+    /// First setpoint in this session observed with `hashrate_ths >= MIN_HASHRATE_THS`.
+    starting_point: Option<TuneSetpoint>,
+    /// External calibrated fallback setpoint (e.g. from `hashrate_cali.ini`).
+    recovery_point: Option<TuneSetpoint>,
+    stall_ticks: u32,
+    stall_stage: StallStage,
+    pending_revert_freq: Option<f32>,
+    reinit_attempts: u8,
 }
 
 /// Running means for averaged judgement.
@@ -581,6 +616,7 @@ impl Default for AutoTuner {
             envelope: TuneEnvelope::default(),
             chip_count: 1,
             power_ceiling_w: None,
+            power_safety_w: None,
             phase: TunePhase::Disabled,
             cycles_since_change: 0,
             best: None,
@@ -597,6 +633,13 @@ impl Default for AutoTuner {
             acc: Accum::default(),
             cycle: 0,
             log: VecDeque::with_capacity(LOG_CAPACITY),
+            has_acted: false,
+            starting_point: None,
+            recovery_point: None,
+            stall_ticks: 0,
+            stall_stage: StallStage::None,
+            pending_revert_freq: None,
+            reinit_attempts: 0,
         }
     }
 }
@@ -629,6 +672,19 @@ impl AutoTuner {
         self.stuck_at_limit_cycles = 0;
         self.pending_trim_from_mv = None;
         self.log.clear();
+        self.has_acted = false;
+        self.starting_point = None;
+        self.recovery_point = None;
+        self.stall_ticks = 0;
+        self.stall_stage = StallStage::None;
+        self.pending_revert_freq = None;
+        self.reinit_attempts = 0;
+    }
+
+    /// Supply a calibrated fallback setpoint (e.g. from `hashrate_cali.ini`)
+    /// to revert to if the chain stalls before `best` is recorded.
+    pub fn set_recovery_point(&mut self, point: Option<TuneSetpoint>) {
+        self.recovery_point = point;
     }
 
     /// Enable tuning with a cap-based profile, resetting the search.
@@ -712,6 +768,13 @@ impl AutoTuner {
         self.power_ceiling_w = watts;
     }
 
+    /// nano-mujina addition: set the instantaneous safety trip ceiling (W),
+    /// e.g. `override_w * 1.03` on the PSU-override path so transient ripples
+    /// under `safety_power_w` do not trigger an immediate backoff.
+    pub fn set_power_safety(&mut self, watts: Option<f32>) {
+        self.power_safety_w = watts;
+    }
+
     /// nano-mujina addition: another controller (the PSU safety trip) changed
     /// the core voltage behind the tuner's back. Adopt it as the commanded
     /// voltage so the next step walks from the real value instead of
@@ -779,6 +842,7 @@ impl AutoTuner {
                 caps.power_w = caps.power_w.min(ceiling);
             }
         }
+        caps.safety_power_w = self.power_safety_w.unwrap_or(caps.power_w);
         caps
     }
 
@@ -856,6 +920,9 @@ impl AutoTuner {
             self.acc.add(m);
         }
         let action = self.evaluate_inner(m);
+        if matches!(action, Some(TuneAction::SetFrequency(_) | TuneAction::SetVoltage(_))) {
+            self.has_acted = true;
+        }
         if action.is_some() {
             self.acc = Accum::default();
         }
@@ -903,7 +970,7 @@ impl AutoTuner {
         //    instantaneous). A breach is treated as a transient condition,
         //    never as permanent evidence the silicon can't run this clock —
         //    nothing here narrows the search space for future attempts.
-        if m.asic_temp_c > caps.temp_c || m.power_w > caps.power_w {
+        if m.asic_temp_c > caps.temp_c || m.power_w > caps.safety_power_w {
             self.phase = TunePhase::BackedOff;
             // A breach supersedes any trim still being judged: its fail rate
             // is no longer evidence about that trim, and reverting would
@@ -969,13 +1036,13 @@ impl AutoTuner {
             let why = if m.asic_temp_c > caps.temp_c {
                 format!("temp {:.1}C over {:.0}C cap", m.asic_temp_c, caps.temp_c)
             } else {
-                format!("power {:.1}W over {:.0}W cap", m.power_w, caps.power_w)
+                format!("power {:.1}W over {:.1}W safety cap", m.power_w, caps.safety_power_w)
             };
             // Cap hysteresis: a clock above best that breaches the POWER cap
             // is a real ceiling (power is deterministic in clock), so the
             // climb must not return to it and oscillate across the cap.
             if env.best_point_margin_w > 0.0
-                && m.power_w > caps.power_w
+                && m.power_w > caps.safety_power_w
                 && let Some((b, ..)) = self.best
                 && m.frequency_mhz > b.frequency_mhz + FREQ_TOLERANCE_MHZ
             {
@@ -1014,6 +1081,23 @@ impl AutoTuner {
             return Some(TuneAction::RestoreFanAuto);
         }
 
+        if m.hashrate_ths >= MIN_HASHRATE_THS {
+            if self.starting_point.is_none() {
+                self.starting_point = Some(TuneSetpoint {
+                    frequency_mhz: m.frequency_mhz,
+                    core_voltage_mv: self.commanded_voltage(m).max(env.min_voltage_mv),
+                });
+            }
+            self.stall_ticks = 0;
+            self.stall_stage = StallStage::None;
+            self.pending_revert_freq = None;
+            self.reinit_attempts = 0;
+        } else {
+            if let Some(act) = self.handle_warmup_stall(m, &env) {
+                return act;
+            }
+        }
+
         // 2. Tuning steps are slow: wait a full settle so the ~300 s windowed
         //    hashrate reflects the last change before it is judged.
         if self.cycles_since_change < env.settle_cycles {
@@ -1027,6 +1111,54 @@ impl AutoTuner {
         let judged = if self.envelope.average_judgement { self.acc.mean_of(m) } else { *m };
         self.acc = Accum::default();
         let m = &judged;
+
+        // Sustained over-cap window mean (when safety_power_w > caps.power_w,
+        // e.g. PSU override 1.03x safety margin): back down cleanly without
+        // falsing on transient instantaneous spikes <= safety_power_w.
+        // Target(Power) already steps down on `m.power_w > hi` in `evaluate_target`.
+        if !matches!(self.mode, TuneMode::Target(TuneTarget::Power(_)))
+            && m.power_w > caps.power_w
+        {
+            self.phase = TunePhase::BackedOff;
+            self.pending_trim_from_mv = None;
+            if env.best_point_margin_w > 0.0
+                && let Some((b, ..)) = self.best
+                && m.frequency_mhz > b.frequency_mhz + FREQ_TOLERANCE_MHZ
+            {
+                self.probe_ceiling_mhz = self.probe_ceiling_mhz.min(m.frequency_mhz);
+            }
+            if m.frequency_mhz > env.min_freq_mhz {
+                let target = (m.frequency_mhz - env.freq_step_mhz).max(env.min_freq_mhz);
+                self.log_event(
+                    format!(
+                        "sustained power {:.1}W over {:.0}W cap: lowering to {target:.0} MHz",
+                        m.power_w, caps.power_w
+                    ),
+                    m,
+                );
+                return Some(TuneAction::SetFrequency(target));
+            }
+            if m.core_voltage_mv > env.min_voltage_mv {
+                let v = env.voltage_down(m.core_voltage_mv).max(env.min_voltage_mv);
+                self.last_commanded_voltage_mv = Some(v);
+                self.log_event(
+                    format!(
+                        "sustained power {:.1}W over {:.0}W cap: at clock floor, trimming voltage to {v} mV",
+                        m.power_w, caps.power_w
+                    ),
+                    m,
+                );
+                return Some(TuneAction::SetVoltage(v));
+            }
+            self.log_event(
+                format!(
+                    "sustained power {:.1}W over {:.0}W cap: at floor, holding",
+                    m.power_w, caps.power_w
+                ),
+                m,
+            );
+            return None;
+        }
 
         // Target mode converges to a fixed setpoint rather than climbing as
         // far as the caps allow -- entirely different logic from the
@@ -1328,6 +1460,138 @@ impl AutoTuner {
             self.log_event("converged: holding best known-good point", m);
         }
         None
+    }
+
+    /// Escape the warmup trap (`m.hashrate_ths < MIN_HASHRATE_THS`):
+    /// returns `Some(action)` when the stall handler owns this tick's return
+    /// value, or `None` to fall through to normal `settle_cycles` judgement
+    /// (so `Profile` mode with `best.is_some()` still reverts in one window).
+    fn handle_warmup_stall(&mut self, m: &Metrics, env: &TuneEnvelope) -> Option<Option<TuneAction>> {
+        if let Some(f) = self.pending_revert_freq.take() {
+            self.cycles_since_change = 0;
+            self.acc = Accum::default();
+            self.log_event(format!("warmup stall: restoring frequency to {f:.0} MHz"), m);
+            return Some(Some(TuneAction::SetFrequency(f)));
+        }
+
+        self.stall_ticks += 1;
+        match self.stall_stage {
+            StallStage::None => {
+                let pending_profile_revert_to_best = matches!(self.mode, TuneMode::Profile(_))
+                    && self.best.is_some_and(|(b, ..)| {
+                        (m.frequency_mhz - b.frequency_mhz).abs() > FREQ_TOLERANCE_MHZ
+                            || self
+                                .commanded_voltage(m)
+                                .max(env.min_voltage_mv)
+                                .abs_diff(b.core_voltage_mv)
+                                > VOLT_TOLERANCE_MV
+                    });
+                let threshold = if !self.has_acted {
+                    WARMUP_STALL_TIMEOUT_TICKS * 2
+                } else if pending_profile_revert_to_best {
+                    // Let normal Profile `settle_cycles` reconciliation handle
+                    // collapse-above-best in one settle window without
+                    // preempting it when `settle_cycles > WARMUP_STALL_TIMEOUT_TICKS`.
+                    WARMUP_STALL_TIMEOUT_TICKS.max(env.settle_cycles + 1)
+                } else {
+                    WARMUP_STALL_TIMEOUT_TICKS
+                };
+                if self.stall_ticks >= threshold {
+                    let revert = self
+                        .best
+                        .map(|(b, ..)| b)
+                        .or(self.recovery_point)
+                        .or(self.starting_point);
+                    self.stall_stage = StallStage::RevertedWaiting;
+                    self.stall_ticks = 0;
+                    self.cycles_since_change = 0;
+                    self.acc = Accum::default();
+                    self.phase = match self.mode {
+                        TuneMode::Profile(_) => TunePhase::Seeking,
+                        TuneMode::Target(_) => TunePhase::Converging,
+                    };
+                    if let Some(sp) = revert {
+                        let commanded_v = self.commanded_voltage(m).max(env.min_voltage_mv);
+                        let volt_diff = commanded_v.abs_diff(sp.core_voltage_mv) > VOLT_TOLERANCE_MV;
+                        let freq_diff = (m.frequency_mhz - sp.frequency_mhz).abs() > FREQ_TOLERANCE_MHZ;
+                        if volt_diff {
+                            self.last_commanded_voltage_mv = Some(sp.core_voltage_mv);
+                            if freq_diff {
+                                self.pending_revert_freq = Some(sp.frequency_mhz);
+                            }
+                            self.log_event(
+                                format!(
+                                    "warmup stall: no hashrate for {threshold} ticks; reverting voltage to {} mV",
+                                    sp.core_voltage_mv
+                                ),
+                                m,
+                            );
+                            return Some(Some(TuneAction::SetVoltage(sp.core_voltage_mv)));
+                        }
+                        if freq_diff {
+                            self.log_event(
+                                format!(
+                                    "warmup stall: no hashrate for {threshold} ticks; reverting to {:.0} MHz",
+                                    sp.frequency_mhz
+                                ),
+                                m,
+                            );
+                            return Some(Some(TuneAction::SetFrequency(sp.frequency_mhz)));
+                        }
+                        self.log_event(
+                            "warmup stall: no hashrate; already at revert point, waiting before chain re-init",
+                            m,
+                        );
+                    } else {
+                        self.log_event(
+                            "warmup stall: no hashrate; no revert point, waiting before chain re-init",
+                            m,
+                        );
+                    }
+                    return Some(None);
+                }
+                if matches!(self.mode, TuneMode::Profile(_)) && self.best.is_some() {
+                    None
+                } else {
+                    self.phase = TunePhase::Warmup;
+                    Some(None)
+                }
+            }
+            StallStage::RevertedWaiting => {
+                let wait = env.settle_cycles.clamp(1, WARMUP_STALL_TIMEOUT_TICKS);
+                if self.stall_ticks >= wait {
+                    if self.reinit_attempts < 2 {
+                        self.stall_stage = StallStage::ReinitRequested;
+                        self.stall_ticks = 0;
+                        self.cycles_since_change = 0;
+                        self.acc = Accum::default();
+                        self.reinit_attempts += 1;
+                        self.log_event(
+                            "warmup stall persisted after revert: requesting chain re-init",
+                            m,
+                        );
+                        return Some(Some(TuneAction::ReinitChain));
+                    }
+                    self.phase = TunePhase::Warmup;
+                }
+                Some(None)
+            }
+            StallStage::ReinitRequested => {
+                if self.stall_ticks >= WARMUP_STALL_TIMEOUT_TICKS && self.reinit_attempts < 2 {
+                    self.stall_ticks = 0;
+                    self.cycles_since_change = 0;
+                    self.acc = Accum::default();
+                    self.reinit_attempts += 1;
+                    self.log_event(
+                        "warmup stall persisted after re-init: retrying chain re-init",
+                        m,
+                    );
+                    return Some(Some(TuneAction::ReinitChain));
+                }
+                self.phase = TunePhase::Warmup;
+                Some(None)
+            }
+        }
     }
 
     /// Target-mode convergence plus efficiency optimization.
@@ -3074,5 +3338,147 @@ mod tests {
         }
         assert_eq!(a, Some(TuneAction::SetFrequency(500.0)));
         assert_eq!(t.phase, TunePhase::BackedOff);
+    }
+
+    #[test]
+    fn psu_override_safety_margin_ignores_warmup_spikes_but_trips_above_safety_cap() {
+        let mut t = AutoTuner::default();
+        let mut env = TuneEnvelope::default();
+        env.average_judgement = true;
+        env.settle_cycles = 4;
+        env.power_settle_cycles = 2;
+        env.min_freq_mhz = 210.0;
+        env.max_freq_mhz = 600.0;
+        env.freq_step_mhz = 10.0;
+        t.set_envelope(env);
+        t.set_chip_count(6);
+        t.set_power_ceiling(Some(140.0));
+        t.set_power_safety(Some(140.0 * 1.03));
+        t.enable_profile(TuneProfile::MaxHash);
+
+        // Window of 4 samples: two momentary warmup spikes (140.5 W, 142.0 W)
+        // plus two lower samples (137.75 W, 137.75 W) -> mean = 139.5 W.
+        // Neither instantaneous safety (144.2 W) nor power cap (140.0 W) trips.
+        for p in [140.5_f32, 142.0, 137.75, 137.75] {
+            let act = t.evaluate(&tm(p, 5.8, 460.0, 3850, Some(0.5)));
+            assert_ne!(t.phase, TunePhase::BackedOff, "spike {p} W <= 144.2 W must not back off");
+            assert!(!matches!(act, Some(TuneAction::SetFrequency(f)) if f < 460.0));
+        }
+
+        // 145.0 W instantaneous exceeds 144.2 W safety cap -> must back off.
+        let mut a = None;
+        for _ in 0..=env.power_settle_cycles {
+            if let Some(act) = t.evaluate(&tm(145.0, 5.8, 460.0, 3850, Some(0.5))) {
+                a = Some(act);
+                break;
+            }
+        }
+        assert_eq!(a, Some(TuneAction::SetFrequency(450.0)));
+        assert_eq!(t.phase, TunePhase::BackedOff);
+    }
+
+    #[test]
+    fn psu_override_sustained_over_cap_window_mean_backs_off() {
+        let mut t = AutoTuner::default();
+        let mut env = TuneEnvelope::default();
+        env.average_judgement = true;
+        env.settle_cycles = 4;
+        env.power_settle_cycles = 2;
+        env.min_freq_mhz = 210.0;
+        env.max_freq_mhz = 600.0;
+        env.freq_step_mhz = 10.0;
+        t.set_envelope(env);
+        t.set_chip_count(6);
+        t.set_power_ceiling(Some(140.0));
+        t.set_power_safety(Some(140.0 * 1.03));
+        t.enable_profile(TuneProfile::MaxHash);
+
+        // Sustained 141.0 W: under 144.2 W safety cap, but window mean > 140.0 W cap.
+        let mut a = None;
+        for _ in 0..env.settle_cycles {
+            a = t.evaluate(&tm(141.0, 6.2, 510.0, 3912, Some(1.0)));
+        }
+        assert_eq!(a, Some(TuneAction::SetFrequency(500.0)));
+        assert_eq!(t.phase, TunePhase::BackedOff);
+    }
+
+    #[test]
+    fn balanced_warmup_stall_after_steps_reverts_instead_of_holding_forever() {
+        let mut t = AutoTuner::default();
+        let mut env = TuneEnvelope::bm1370();
+        env.settle_cycles = 20;
+        t.set_envelope(env);
+        t.enable_profile(TuneProfile::Balanced);
+        // Step once while hashing >= 0.3 TH/s so `has_acted` and `starting_point` are set.
+        let mut act = None;
+        for _ in 0..env.settle_cycles {
+            act = t.evaluate(&m(55.0, 12.0, 1.0, 420.0, 1150));
+        }
+        assert!(matches!(act, Some(TuneAction::SetFrequency(_) | TuneAction::SetVoltage(_))));
+
+        // Collapse to 0.0 TH/s for WARMUP_STALL_TIMEOUT_TICKS -> reverts on tick 40.
+        let mut revert_act = None;
+        for i in 0..WARMUP_STALL_TIMEOUT_TICKS {
+            let a = t.evaluate(&m(55.0, 10.0, 0.0, 450.0, 1150));
+            if i + 1 < WARMUP_STALL_TIMEOUT_TICKS {
+                // Profile with best.is_some() may revert on settle_cycles or stay None;
+                // ensure if it reverts at tick 40 or earlier it is not stuck forever.
+                if a.is_some() {
+                    revert_act = a;
+                    break;
+                }
+            } else {
+                revert_act = a;
+            }
+        }
+        assert!(
+            matches!(revert_act, Some(TuneAction::SetFrequency(_) | TuneAction::SetVoltage(_))),
+            "expected revert action, got {revert_act:?}"
+        );
+
+        // If `best` triggered early revert in 4 ticks, keep feeding 0.0 TH/s to reach ReinitChain.
+        let mut reinit_seen = false;
+        for _ in 0..(WARMUP_STALL_TIMEOUT_TICKS + t.envelope.settle_cycles + 2) {
+            if matches!(
+                t.evaluate(&m(55.0, 10.0, 0.0, 420.0, 1150)),
+                Some(TuneAction::ReinitChain)
+            ) {
+                reinit_seen = true;
+                break;
+            }
+        }
+        assert!(reinit_seen, "expected TuneAction::ReinitChain after persistent stall");
+    }
+
+    #[test]
+    fn target_warmup_stall_after_steps_reverts_and_requests_reinit() {
+        let mut t = AutoTuner::default();
+        t.enable_target(TuneTarget::Power(120.0));
+        t.set_recovery_point(Some(TuneSetpoint { frequency_mhz: 420.0, core_voltage_mv: 1150 }));
+        // Initial healthy hash below target -> climbs frequency (`has_acted = true`).
+        let act = step_to_action(&mut t, &tm(90.0, 4.0, 420.0, 1150, Some(0.5)));
+        assert!(matches!(act, Some(TuneAction::SetFrequency(_))));
+
+        let mut revert_act = None;
+        for _ in 0..WARMUP_STALL_TIMEOUT_TICKS {
+            revert_act = t.evaluate(&tm(40.0, 0.0, 450.0, 1150, Some(0.0)));
+        }
+        assert_eq!(revert_act, Some(TuneAction::SetFrequency(420.0)));
+
+        let mut reinit_act = None;
+        for _ in 0..t.envelope.settle_cycles.clamp(1, WARMUP_STALL_TIMEOUT_TICKS) {
+            reinit_act = t.evaluate(&tm(40.0, 0.0, 420.0, 1150, Some(0.0)));
+        }
+        assert_eq!(reinit_act, Some(TuneAction::ReinitChain));
+    }
+
+    #[test]
+    fn cold_warmup_before_action_stays_warmup() {
+        let mut t = AutoTuner::default();
+        t.enable_profile(TuneProfile::Balanced);
+        for _ in 0..(WARMUP_STALL_TIMEOUT_TICKS - 1) {
+            assert_eq!(t.evaluate(&m(55.0, 10.0, 0.0, 420.0, 1150)), None);
+            assert_eq!(t.phase(), TunePhase::Warmup);
+        }
     }
 }

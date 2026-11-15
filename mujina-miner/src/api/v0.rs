@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::commands::SchedulerCommand;
-use crate::board::nano3s_auto_tune::{AutoTuneRequest, AutoTuneStatus};
+use crate::board::nano3s_auto_tune::{AutoTuneRequest, AutoTuneStatus, MAX_DOMAIN_MHZ, NANO3S_ENVELOPE};
 use super::server::SharedState;
 use crate::api_client::types::{
     AutotuneHashrateRequest, AutotuneHashrateResponse, BoardFanRequest, BoardLedRequest,
@@ -179,6 +179,48 @@ async fn get_board(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+/// Validate a manual `PATCH /boards/{name}/tuning` request against the
+/// shared Nano 3S tuner envelope (`MAX_DOMAIN_MHZ`, `NANO3S_ENVELOPE`).
+fn validate_board_tuning(req: &BoardTuningRequest) -> Result<(), StatusCode> {
+    if req.pll_freq_mhz.is_none()
+        && req.voltage_mv.is_none()
+        && req.power_target_w.is_none()
+        && req.temp_target_c.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    // Frequency range check; the four PLL ramp domains must be non-decreasing.
+    if let Some(f) = req.pll_freq_mhz {
+        let in_range = f.iter().all(|&mhz| (100..=MAX_DOMAIN_MHZ).contains(&mhz));
+        let non_decreasing = f[0] <= f[1] && f[1] <= f[2] && f[2] <= f[3];
+        if !in_range || !non_decreasing {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    // Voltage range and forbidden grid point check.
+    if let Some(v) = req.voltage_mv {
+        let max_mv = NANO3S_ENVELOPE.max_voltage_mv as u32;
+        if !(3300..=max_mv).contains(&v)
+            || u16::try_from(v).is_ok_and(|mv| NANO3S_ENVELOPE.forbidden_voltages_mv.contains(&mv))
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    // Same range check as the dedicated power-target endpoint.
+    if let Some(w) = req.power_target_w
+        && !(20.0..=137.0).contains(&w)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    // Same range check as the dedicated temp-target endpoint.
+    if let Some(c) = req.temp_target_c
+        && !(30.0..=95.0).contains(&c)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
 /// Apply a live PLL frequency and/or core voltage change over IPC, no
 /// reboot required.
 ///
@@ -217,39 +259,7 @@ async fn patch_board_tuning(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    if req.pll_freq_mhz.is_none()
-        && req.voltage_mv.is_none()
-        && req.power_target_w.is_none()
-        && req.temp_target_c.is_none()
-    {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    // Frequency range check; the four PLL ramp domains must be non-decreasing.
-    if let Some(f) = req.pll_freq_mhz {
-        let in_range = f.iter().all(|&mhz| (100..=520).contains(&mhz));
-        let non_decreasing = f[0] <= f[1] && f[1] <= f[2] && f[2] <= f[3];
-        if !in_range || !non_decreasing {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    }
-    // Voltage range check.
-    if let Some(v) = req.voltage_mv
-        && !(3300..=3860).contains(&v)
-    {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    // Same range check as the dedicated power-target endpoint.
-    if let Some(w) = req.power_target_w
-        && !(20.0..=137.0).contains(&w)
-    {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    // Same range check as the dedicated temp-target endpoint.
-    if let Some(c) = req.temp_target_c
-        && !(30.0..=95.0).contains(&c)
-    {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    validate_board_tuning(&req)?;
 
     #[cfg(feature = "nano3s")]
     {
@@ -2409,5 +2419,76 @@ mod tests {
         .await
         .expect("upload after lock release should succeed");
         assert!(res.0.ok);
+    }
+
+    fn tuning_req(
+        pll_freq_mhz: Option<[u32; 4]>,
+        voltage_mv: Option<u32>,
+    ) -> BoardTuningRequest {
+        BoardTuningRequest {
+            pll_freq_mhz,
+            voltage_mv,
+            power_target_w: None,
+            temp_target_c: None,
+        }
+    }
+
+    #[test]
+    fn board_tuning_accepts_tuner_envelope_bounds() {
+        // Base clock up to 520 MHz with +20/+40/+60 MHz domains reaches MAX_DOMAIN_MHZ (580 MHz).
+        assert_eq!(
+            validate_board_tuning(&tuning_req(Some([520, 540, 560, MAX_DOMAIN_MHZ]), None)),
+            Ok(())
+        );
+        assert_eq!(
+            validate_board_tuning(&tuning_req(Some([100, 100, 100, 100]), Some(3300))),
+            Ok(())
+        );
+        assert_eq!(
+            validate_board_tuning(&tuning_req(None, Some(NANO3S_ENVELOPE.max_voltage_mv as u32))),
+            Ok(())
+        );
+        assert_eq!(
+            validate_board_tuning(&tuning_req(None, Some(3605))),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn board_tuning_rejects_out_of_envelope_and_forbidden_points() {
+        // Empty request.
+        assert_eq!(
+            validate_board_tuning(&tuning_req(None, None)),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        // Domain frequency above MAX_DOMAIN_MHZ (580 MHz) or below 100 MHz, or non-monotonic.
+        assert_eq!(
+            validate_board_tuning(&tuning_req(Some([520, 540, 560, MAX_DOMAIN_MHZ + 1]), None)),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            validate_board_tuning(&tuning_req(Some([99, 100, 100, 100]), None)),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            validate_board_tuning(&tuning_req(Some([500, 490, 510, 520]), None)),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        // Voltage outside [3300, NANO3S_ENVELOPE.max_voltage_mv] (3912 mV).
+        assert_eq!(
+            validate_board_tuning(&tuning_req(None, Some(3299))),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            validate_board_tuning(&tuning_req(None, Some(NANO3S_ENVELOPE.max_voltage_mv as u32 + 1))),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        // Forbidden voltage grid point (3600 mV).
+        for &forbidden in NANO3S_ENVELOPE.forbidden_voltages_mv {
+            assert_eq!(
+                validate_board_tuning(&tuning_req(None, Some(forbidden as u32))),
+                Err(StatusCode::BAD_REQUEST)
+            );
+        }
     }
 }

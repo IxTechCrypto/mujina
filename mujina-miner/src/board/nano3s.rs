@@ -1409,28 +1409,34 @@ struct PersistedTuning {
     chip_offset_mhz: Option<[i16; CHIP_COUNT]>,
     /// AutoTune search memory and the profile it belongs to.
     auto_memory: Option<(TuneProfile, SearchMemory)>,
+    /// AutoTune search memory for Target mode (`power:<W>` / `hashrate:<T>`).
+    target_memory: Option<(TuneTarget, SearchMemory)>,
     /// Per-chip clock tuner switch.
     chip_tune: bool,
     /// Continuous dynamic tuning switch.
     continuous: bool,
 }
 
+static TUNING_CONF_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn update_tuning_conf(f: impl FnOnce(&mut PersistedTuning)) {
+    let _guard = TUNING_CONF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = std::path::Path::new(TUNING_CONF_PATH);
+    let mut cfg = load_tuning_from(path);
+    f(&mut cfg);
+    write_tuning_conf_to(path, &cfg);
+}
+
 fn persist_continuous(on: bool) {
-    let mut cfg = load_tuning();
-    cfg.continuous = on;
-    write_tuning_conf(&cfg);
+    update_tuning_conf(|cfg| cfg.continuous = on);
 }
 
 fn persist_chip_tune(on: bool) {
-    let mut cfg = load_tuning();
-    cfg.chip_tune = on;
-    write_tuning_conf(&cfg);
+    update_tuning_conf(|cfg| cfg.chip_tune = on);
 }
 
 fn persist_chip_offsets(o: [i16; CHIP_COUNT]) {
-    let mut cfg = load_tuning();
-    cfg.chip_offset_mhz = Some(o);
-    write_tuning_conf(&cfg);
+    update_tuning_conf(|cfg| cfg.chip_offset_mhz = Some(o));
 }
 
 /// Sends `want` to the firmware unless it is already applied. On failure
@@ -1496,17 +1502,24 @@ fn format_auto_memory((p, m): &(TuneProfile, SearchMemory)) -> String {
 }
 
 fn persist_auto_memory(mem: Option<(TuneProfile, SearchMemory)>) {
-    let mut cfg = load_tuning();
-    cfg.auto_memory = mem;
-    write_tuning_conf(&cfg);
+    update_tuning_conf(|cfg| cfg.auto_memory = mem);
+}
+
+fn persist_target_memory(mem: Option<(TuneTarget, SearchMemory)>) {
+    update_tuning_conf(|cfg| cfg.target_memory = mem);
 }
 
 /// Reads [`TUNING_CONF_PATH`], or all-`None` if missing/unparseable --
 /// callers fall back to the existing hardcoded/env-var defaults either
 /// way, same as `pool_config`'s own `load()`.
 fn load_tuning() -> PersistedTuning {
+    let _guard = TUNING_CONF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    load_tuning_from(std::path::Path::new(TUNING_CONF_PATH))
+}
+
+fn load_tuning_from(path: &std::path::Path) -> PersistedTuning {
     let mut cfg = PersistedTuning::default();
-    let Ok(contents) = std::fs::read_to_string(TUNING_CONF_PATH) else {
+    let Ok(contents) = std::fs::read_to_string(path) else {
         return cfg;
     };
     let mut freq = [None; 4];
@@ -1537,6 +1550,7 @@ fn load_tuning() -> PersistedTuning {
             }
             "chip_offset_mhz" => cfg.chip_offset_mhz = parse_chip_offsets(value),
             "auto_memory" | "owner_memory" => cfg.auto_memory = parse_auto_memory(value),
+            "target_memory" => cfg.target_memory = auto_tune::parse_target_memory(value),
             "chip_tune" => cfg.chip_tune = value == "on",
             "continuous" => cfg.continuous = value == "on",
             _ => {}
@@ -1548,7 +1562,8 @@ fn load_tuning() -> PersistedTuning {
     cfg
 }
 
-fn write_tuning_conf(cfg: &PersistedTuning) {
+fn write_tuning_conf_to(path: &std::path::Path, cfg: &PersistedTuning) {
+    use std::io::Write as _;
     let mut out = String::new();
     if let Some(f) = cfg.pll_freq_mhz {
         out.push_str(&format!("freq0={}\nfreq1={}\nfreq2={}\nfreq3={}\n", f[0], f[1], f[2], f[3]));
@@ -1577,6 +1592,9 @@ fn write_tuning_conf(cfg: &PersistedTuning) {
     if let Some(m) = &cfg.auto_memory {
         out.push_str(&format!("auto_memory={}\n", format_auto_memory(m)));
     }
+    if let Some(m) = &cfg.target_memory {
+        out.push_str(&format!("target_memory={}\n", auto_tune::format_target_memory(m)));
+    }
     if cfg.chip_tune {
         out.push_str("chip_tune=on\n");
     }
@@ -1586,8 +1604,31 @@ fn write_tuning_conf(cfg: &PersistedTuning) {
     if let Some(o) = cfg.chip_offset_mhz.filter(|o| o.iter().any(|x| *x != 0)) {
         out.push_str(&format!("chip_offset_mhz={}\n", join_chip_offsets(&o)));
     }
-    if let Err(e) = std::fs::write(TUNING_CONF_PATH, out) {
-        eprintln!("[nano3s] failed to write {TUNING_CONF_PATH}: {e}");
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp_name = format!(
+        "{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("tuning.conf")
+    );
+    let tmp_path = path.with_file_name(tmp_name);
+    let res = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(out.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(&tmp_path);
+        eprintln!("[nano3s] failed to write {}: {e}", path.display());
     }
 }
 
@@ -1605,32 +1646,28 @@ fn persist_tuning_set(
     power_target_w: Option<f64>,
     temp_target_c: Option<f64>,
 ) {
-    let mut cfg = load_tuning();
-    if pll_freq_mhz.is_some() {
-        cfg.pll_freq_mhz = pll_freq_mhz;
-    }
-    if voltage_mv.is_some() {
-        cfg.voltage_mv = voltage_mv;
-    }
-    if power_target_w.is_some() {
-        cfg.power_target_w = power_target_w;
-    }
-    if temp_target_c.is_some() {
-        cfg.temp_target_c = temp_target_c;
-    }
-    write_tuning_conf(&cfg);
+    update_tuning_conf(|cfg| {
+        if pll_freq_mhz.is_some() {
+            cfg.pll_freq_mhz = pll_freq_mhz;
+        }
+        if voltage_mv.is_some() {
+            cfg.voltage_mv = voltage_mv;
+        }
+        if power_target_w.is_some() {
+            cfg.power_target_w = power_target_w;
+        }
+        if temp_target_c.is_some() {
+            cfg.temp_target_c = temp_target_c;
+        }
+    });
 }
 
 fn persist_tuning_clear_power_target() {
-    let mut cfg = load_tuning();
-    cfg.power_target_w = None;
-    write_tuning_conf(&cfg);
+    update_tuning_conf(|cfg| cfg.power_target_w = None);
 }
 
 fn persist_tuning_clear_temp_target() {
-    let mut cfg = load_tuning();
-    cfg.temp_target_c = None;
-    write_tuning_conf(&cfg);
+    update_tuning_conf(|cfg| cfg.temp_target_c = None);
 }
 
 /// `Some(target_ths)` enables hashrate-mode autotune and resets its
@@ -1639,24 +1676,20 @@ fn persist_tuning_clear_temp_target() {
 /// untouched, same "leaves things wherever they were" convention as
 /// `persist_tuning_clear_temp_target`.
 fn persist_autotune_hashrate_target(target_ths: Option<f64>) {
-    let mut cfg = load_tuning();
-    cfg.autotune_hashrate_target_ths = target_ths;
-    if target_ths.is_some() {
-        cfg.autotune_level = Some(0.5);
-    }
-    write_tuning_conf(&cfg);
+    update_tuning_conf(|cfg| {
+        cfg.autotune_hashrate_target_ths = target_ths;
+        if target_ths.is_some() {
+            cfg.autotune_level = Some(0.5);
+        }
+    });
 }
 
 fn persist_auto_fan_target(c: Option<f32>) {
-    let mut cfg = load_tuning();
-    cfg.auto_fan_target_c = c;
-    write_tuning_conf(&cfg);
+    update_tuning_conf(|cfg| cfg.auto_fan_target_c = c);
 }
 
 fn persist_auto_tune_profile(profile: Option<TuneChoice>) {
-    let mut cfg = load_tuning();
-    cfg.auto_tune_profile = profile;
-    write_tuning_conf(&cfg);
+    update_tuning_conf(|cfg| cfg.auto_tune_profile = profile);
 }
 
 /// Turns the AutoTune off because a manual/aadhi control took over.
@@ -1699,22 +1732,52 @@ pub(crate) fn write_auto_tune_command(
     if let Some(on) = continuous {
         line.push_str(if on { ";continuous=on" } else { ";continuous=off" });
     }
+    if let Some(body) = line.strip_prefix("auto_tune:")
+        && let Ok(d) = auto_tune::parse_auto_tune_directive(body)
+    {
+        update_tuning_conf(|cfg| {
+            match d.profile {
+                Some(Some(choice)) => {
+                    cfg.power_target_w = None;
+                    cfg.temp_target_c = None;
+                    cfg.autotune_hashrate_target_ths = None;
+                    cfg.auto_tune_profile = Some(choice);
+                    if d.fan_target_c.is_none() {
+                        cfg.auto_fan_target_c = None;
+                    }
+                    if matches!(choice, TuneChoice::Profile(_)) {
+                        cfg.auto_memory = None;
+                    }
+                }
+                Some(None) => {
+                    cfg.auto_tune_profile = None;
+                    cfg.chip_tune = false;
+                }
+                None => {}
+            }
+            if let Some(c) = d.fan_target_c {
+                cfg.auto_fan_target_c = Some(c);
+            }
+            if let Some(on) = d.chip_tune {
+                cfg.chip_tune = on;
+            }
+            if let Some(on) = d.continuous {
+                cfg.continuous = on;
+            }
+        });
+    }
     std::fs::write(MUJINA_CONTROL_FILE, line)
 }
 
 /// Queues a `chip_offset:a,b,...` directive (per-chip clock offsets, MHz)
 /// and persists it. Shares the single-slot control file: space calls >= 5 s.
 pub(crate) fn write_chip_offset_command(offset_mhz: [i16; CHIP_COUNT]) -> std::io::Result<()> {
-    let mut cfg = load_tuning();
-    cfg.chip_offset_mhz = Some(offset_mhz);
-    write_tuning_conf(&cfg);
+    update_tuning_conf(|cfg| cfg.chip_offset_mhz = Some(offset_mhz));
     std::fs::write(MUJINA_CONTROL_FILE, format!("chip_offset:{}", join_chip_offsets(&offset_mhz)))
 }
 
 fn persist_autotune_level(level: f64) {
-    let mut cfg = load_tuning();
-    cfg.autotune_level = Some(level);
-    write_tuning_conf(&cfg);
+    update_tuning_conf(|cfg| cfg.autotune_level = Some(level));
 }
 
 /// Writes a `tune:` directive to [`MUJINA_CONTROL_FILE`] for the run loop
@@ -2650,6 +2713,32 @@ fn write_live_status(ipc_ok: bool, current_job_id: Option<u32>, shares_found: u3
     }
 }
 
+/// Re-applies the last commanded PLL frequency, voltage, and non-zero per-chip
+/// offsets after a chain re-enum (which resets chips to the ~100 MHz bring-up clock).
+fn reapply_chain_tuning(
+    pll_freq: [u32; 4],
+    voltage_mv: Option<i32>,
+    chip_offset_mhz: &[i16; CHIP_COUNT],
+    why: &str,
+) {
+    let rc = unsafe { nano3s_ipc_set_mode(pll_freq.as_ptr(), 0) };
+    if rc != 0 {
+        eprintln!("[nano3s] {why}: nano3s_ipc_set_mode failed -- chain may stay at cold bring-up clock");
+    }
+    if let Some(mv) = voltage_mv {
+        let rc = unsafe { nano3s_ipc_set_voltage_raw(mv) };
+        if rc != 0 {
+            eprintln!("[nano3s] {why}: nano3s_ipc_set_voltage_raw failed");
+        }
+    }
+    if chip_offset_mhz.iter().any(|o| *o != 0) {
+        let rc = unsafe { nano3s_ipc_set_chip_pll_offset(chip_offset_mhz.as_ptr()) };
+        if rc != 0 {
+            eprintln!("[nano3s] {why}: nano3s_ipc_set_chip_pll_offset failed");
+        }
+    }
+}
+
 /// Re-powers the chain and waits for a settle gap (power_en HIGH to RST
 /// release) before resuming rtos_core.elf, which then does its own
 /// RST-deassert/re-enum sequence.
@@ -2680,7 +2769,13 @@ fn run_worker(
     // used to live only in local variables and silently reset to
     // hardcoded defaults on every reboot, a real reported bug).
     let mut persisted_tuning = load_tuning();
-    let startup_pll_freq = persisted_tuning.pll_freq_mhz.unwrap_or(NANO3S_PLL_FREQ_TARGET);
+    let (startup_pll_freq, startup_voltage_mv, startup_target_mem) = auto_tune::resolve_target_startup(
+        persisted_tuning.auto_tune_profile,
+        persisted_tuning.target_memory,
+        persisted_tuning.pll_freq_mhz,
+        persisted_tuning.voltage_mv,
+        NANO3S_PLL_FREQ_TARGET,
+    );
     let mut chip_offset_mhz: [i16; CHIP_COUNT] = persisted_tuning.chip_offset_mhz.unwrap_or_default();
     let mut psu_override_max_w = load_psu_override_w();
     let mut last_pd_ceiling_logged_w: Option<f64> = None;
@@ -2701,7 +2796,7 @@ fn run_worker(
         if rc != 0 {
             eprintln!("[nano3s] nano3s_ipc_set_mode failed -- chain will stay at cold bring-up clock");
         }
-        if let Some(mv) = persisted_tuning.voltage_mv {
+        if let Some(mv) = startup_voltage_mv {
             let rc = unsafe { nano3s_ipc_set_voltage_raw(mv as i32) };
             if rc != 0 {
                 eprintln!("[nano3s] startup nano3s_ipc_set_voltage_raw failed");
@@ -2779,7 +2874,7 @@ fn run_worker(
     // startup ramp target, which already accounts for persisted tuning
     // above) and reapply both after every resume.
     let mut last_applied_pll_freq: [u32; 4] = startup_pll_freq;
-    let mut last_applied_voltage_mv: Option<i32> = persisted_tuning.voltage_mv.map(|v| v as i32);
+    let mut last_applied_voltage_mv: Option<i32> = startup_voltage_mv.map(|v| v as i32);
     // Temp-target PLL throttle -- see TEMP_TARGET_DEADBAND_C's doc comment.
     // `None` means the feature is off (no automatic frequency changes).
     // Same "autotune wins at startup, full stop" guard as power_target_w
@@ -2834,7 +2929,7 @@ fn run_worker(
     // autotune_hashrate_target_ths are all None (startup guards above, and
     // the `auto_tune:` arm). aadhi's PSU safety trip and the 97C backstop
     // below keep running and win over it.
-    let (auto_tune_env, auto_tune_env_from_file) = auto_tune::load_envelope(auto_tune::CALI_PATH);
+    let (auto_tune_env, auto_tune_cali, auto_tune_env_from_file) = auto_tune::load_envelope_with_cali(auto_tune::CALI_PATH);
     if auto_tune_env_from_file {
         eprintln!(
             "[nano3s] auto-tune: caps from {}: min {} mV, quiet {}W/{}C, efficient {}W/{}C, balanced {}W/{}C, max_hash {}W/{}C",
@@ -2848,7 +2943,7 @@ fn run_worker(
     } else {
         eprintln!("[nano3s] auto-tune: {} missing/invalid, using built-in cap constants", auto_tune::CALI_PATH);
     }
-    let mut auto_tuner = AutoTune::with_envelope(auto_tune_env);
+    let mut auto_tuner = AutoTune::with_envelope_and_cali(auto_tune_env, auto_tune_cali);
     auto_tuner.set_fan_target(persisted_tuning.auto_fan_target_c);
     auto_tuner.set_continuous(persisted_tuning.continuous);
     if let Some(p) = persisted_tuning.auto_tune_profile {
@@ -2861,9 +2956,16 @@ fn run_worker(
         {
             auto_tuner.restore_memory(mem);
             eprintln!("[nano3s] auto-tune: restored search memory {mem:?}");
+        } else if let Some(mem) = startup_target_mem {
+            auto_tuner.restore_memory(mem);
+            if let Some(mv) = startup_voltage_mv {
+                auto_tuner.note_external_voltage(mv as u16);
+            }
+            eprintln!("[nano3s] auto-tune: restored target memory {mem:?}");
         }
     }
     let mut last_auto_memory = auto_tuner.profile().zip(auto_tuner.memory());
+    let mut last_target_memory = auto_tuner.target().zip(auto_tuner.memory());
     // Per-chip tuner: runs on the AutoTune tick while the AutoTune is locked
     // and its base point hasn't moved since the last tick.
     let new_chip_tuner = |p: Option<TuneChoice>, o: [i16; CHIP_COUNT]| {
@@ -2899,16 +3001,12 @@ fn run_worker(
                 // Re-apply the last commanded PLL frequency and voltage,
                 // since a fresh re-enum resets the chip's PLL to 100MHz.
                 // Fire-and-forget, same as the initial startup ramp.
-                let rc = unsafe { nano3s_ipc_set_mode(last_applied_pll_freq.as_ptr(), 0) };
-                if rc != 0 {
-                    eprintln!("[nano3s] post-resume nano3s_ipc_set_mode failed -- chain may stay at cold bring-up clock");
-                }
-                if let Some(mv) = last_applied_voltage_mv {
-                    let rc = unsafe { nano3s_ipc_set_voltage_raw(mv) };
-                    if rc != 0 {
-                        eprintln!("[nano3s] post-resume nano3s_ipc_set_voltage_raw failed");
-                    }
-                }
+                reapply_chain_tuning(
+                    last_applied_pll_freq,
+                    last_applied_voltage_mv,
+                    &chip_offset_mhz,
+                    "post-resume",
+                );
                 is_idle = false;
                 manual_pause = false;
                 eprintln!("[nano3s] manual RESUME via {MUJINA_CONTROL_FILE} (reapplied pll_freq={last_applied_pll_freq:?} voltage_mv={last_applied_voltage_mv:?})");
@@ -2983,8 +3081,10 @@ fn run_worker(
                         persist_tuning_clear_temp_target();
                         persist_autotune_hashrate_target(None);
                         persist_auto_tune_profile(Some(profile));
-                        persist_auto_memory(None);
-                        last_auto_memory = None;
+                        if matches!(profile, TuneChoice::Profile(_)) {
+                            persist_auto_memory(None);
+                            last_auto_memory = None;
+                        }
                         // A profile pick also means its default fan target
                         // (cap - 5), unless this request set one.
                         if !fan_given {
@@ -3000,6 +3100,38 @@ fn run_worker(
                         temp_throttle_base_freq = last_applied_pll_freq;
                         psu_ceiling_freq = last_applied_pll_freq;
                         auto_tuner.pick(profile, parsed.as_ref().ok().and_then(|d| d.fan_target_c));
+                        if let TuneChoice::Target(t) = profile
+                            && let Some((mt, mem)) = load_tuning().target_memory
+                            && auto_tune::targets_match(t, mt)
+                        {
+                            auto_tuner.restore_memory(mem);
+                            last_target_memory = Some((mt, mem));
+                            let target_freqs = auto_tune::domain_freqs(mem.best.frequency_mhz);
+                            let target_mv = mem.best.core_voltage_mv as i32;
+                            if last_applied_pll_freq != target_freqs {
+                                let rc = unsafe { nano3s_ipc_set_mode(target_freqs.as_ptr(), 0) };
+                                if rc != 0 {
+                                    eprintln!("[nano3s] auto-tune: re-enable nano3s_ipc_set_mode failed");
+                                } else {
+                                    last_applied_pll_freq = target_freqs;
+                                    temp_throttle_base_freq = target_freqs;
+                                    psu_ceiling_freq = target_freqs;
+                                    persist_tuning_set(Some(target_freqs), None, None, None);
+                                    eprintln!("[nano3s] auto-tune: re-enable restored clock {target_freqs:?}");
+                                }
+                            }
+                            if last_applied_voltage_mv != Some(target_mv) {
+                                let rc = unsafe { nano3s_ipc_set_voltage_raw(target_mv) };
+                                if rc != 0 {
+                                    eprintln!("[nano3s] auto-tune: re-enable nano3s_ipc_set_voltage_raw failed");
+                                } else {
+                                    last_applied_voltage_mv = Some(target_mv);
+                                    persist_tuning_set(None, Some(mem.best.core_voltage_mv as u32), None, None);
+                                    eprintln!("[nano3s] auto-tune: re-enable restored voltage {target_mv} mV");
+                                }
+                            }
+                            auto_tuner.note_external_voltage(mem.best.core_voltage_mv);
+                        }
                         auto_tuner.seed_fan_duty(read_fan_status().and_then(|f| f.percent));
                         auto_tuner.publish(None);
                         eprintln!("[nano3s] auto-tune: enabled {profile:?} (power-target/temp-target/autotune-hashrate disabled)");
@@ -3682,6 +3814,7 @@ fn run_worker(
             // instead of fighting it.
             if auto_tuner.is_enabled() {
                 auto_tuner.set_power_ceiling(tuner_power_ceiling_w);
+                auto_tuner.set_power_safety(psu_override_max_w.map(|_| effective_safety_w as f32));
                 if auto_tuner.tick_due(std::time::Instant::now()) {
                     let volt_now = last_applied_voltage_mv.map(|v| v.max(0) as u32).unwrap_or(st.voltage_mv);
                     let cmds: Vec<AutoTuneCmd> = if (st.temp_max as f64) >= auto_tune::BACKSTOP_TEMP_C {
@@ -3692,14 +3825,16 @@ fn run_worker(
                             auto_tune::BACKSTOP_TEMP_C
                         );
                         vec![AutoTuneCmd::SetMode(f)]
-                    } else if let Some(m) = auto_tune::metrics_from_readings(
-                        st.temp_max,
-                        power_w,
-                        st.ghsspd,
-                        last_applied_pll_freq[0],
-                        volt_now,
-                        st.spd_dh,
-                    ) {
+                    } else if !is_idle && !manual_pause && st.paused == 0 && current_task.is_some()
+                        && let Some(m) = auto_tune::metrics_from_readings(
+                            st.temp_max,
+                            power_w,
+                            st.ghsspd,
+                            last_applied_pll_freq[0],
+                            volt_now,
+                            st.spd_dh,
+                        )
+                    {
                         auto_tuner.evaluate(&m)
                     } else {
                         Vec::new()
@@ -3743,6 +3878,34 @@ fn run_worker(
                             AutoTuneCmd::FanManual(d) => {
                                 eprintln!("[nano3s] auto-tune: fan:manual,{d} (temp_max {:.1}C)", st.temp_max);
                                 write_harness_control(&format!("fan:manual,{d}"));
+                            }
+                            AutoTuneCmd::ReinitChain => {
+                                eprintln!("[nano3s] auto-tune: chain re-init requested (stalled hashrate)");
+                                let rc = unsafe { nano3s_ipc_pause() };
+                                if rc != 0 {
+                                    eprintln!("[nano3s] auto-tune: pre-reinit nano3s_ipc_pause failed");
+                                }
+                                write_harness_control("pause");
+                                std::thread::sleep(Duration::from_secs(2));
+                                resume_from_idle();
+                                reapply_chain_tuning(
+                                    last_applied_pll_freq,
+                                    last_applied_voltage_mv,
+                                    &chip_offset_mhz,
+                                    "auto-tune chain re-init",
+                                );
+                                if let Some(task) = current_task.as_ref() {
+                                    let job_id = job_id_counter.fetch_add(1, Ordering::Relaxed);
+                                    match send_task_to_chain(job_id, task, true) {
+                                        Ok(Some(ctx)) => {
+                                            jobs.insert(job_id, ctx);
+                                            current_job_id = Some(job_id);
+                                        }
+                                        Ok(None) => {}
+                                        Err(e) => eprintln!("[nano3s] auto-tune: post-reinit send_task_to_chain failed: {e}"),
+                                    }
+                                }
+                                eprintln!("[nano3s] auto-tune: chain re-init complete");
                             }
                         }
                     }
@@ -3813,6 +3976,11 @@ fn run_worker(
                     if mem != last_auto_memory && (mem.is_some() || auto_tuner.profile().is_some()) {
                         persist_auto_memory(mem);
                         last_auto_memory = mem;
+                    }
+                    let tmem = auto_tuner.target().zip(auto_tuner.memory());
+                    if tmem.is_some() && tmem != last_target_memory {
+                        persist_target_memory(tmem);
+                        last_target_memory = tmem;
                     }
                 }
             }
@@ -4254,6 +4422,50 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&corrupt_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[test]
+    fn tuning_conf_persistence_roundtrip_and_target_memory() {
+        let tmp_dir = std::env::temp_dir().join(format!("nano3s_tuning_test_{}", std::process::id()));
+        let path = tmp_dir.join("tuning.conf");
+        let _ = std::fs::remove_file(&path);
+
+        let mem = SearchMemory {
+            best: TuneSetpoint { frequency_mhz: 480.0, core_voltage_mv: 3828 },
+            best_hashrate_ths: 6.12,
+            best_j_th: 22.7,
+            probe_floor_mv: 3780,
+            probe_ceiling_mhz: 500.0,
+        };
+        let cfg = PersistedTuning {
+            pll_freq_mhz: Some([210, 210, 210, 210]),
+            voltage_mv: Some(3678),
+            auto_tune_profile: Some(TuneChoice::Target(TuneTarget::Power(140.0))),
+            target_memory: Some((TuneTarget::Power(140.0), mem)),
+            chip_tune: true,
+            ..Default::default()
+        };
+        write_tuning_conf_to(&path, &cfg);
+        let loaded = load_tuning_from(&path);
+        assert_eq!(loaded.auto_tune_profile, Some(TuneChoice::Target(TuneTarget::Power(140.0))));
+        assert!(loaded.chip_tune);
+        let (mt, loaded_mem) = loaded.target_memory.expect("target_memory roundtrip");
+        assert!(auto_tune::targets_match(mt, TuneTarget::Power(140.0)));
+        assert_eq!(loaded_mem, mem);
+
+        let (pll, mv, restored) = auto_tune::resolve_target_startup(
+            loaded.auto_tune_profile,
+            loaded.target_memory,
+            loaded.pll_freq_mhz,
+            loaded.voltage_mv,
+            NANO3S_PLL_FREQ_TARGET,
+        );
+        assert_eq!(pll, auto_tune::domain_freqs(480.0));
+        assert_eq!(mv, Some(3828));
+        assert_eq!(restored, Some(mem));
+
+        let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&tmp_dir);
     }
 }

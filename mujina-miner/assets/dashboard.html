@@ -1121,7 +1121,7 @@
     </div>
     <div class="row" id="psuCustomRow" style="display:none;margin-top:10px">
       <label for="psuCustomInput">Board Power Ceiling <small style="color:var(--dim)">Watts (50–140W)</small></label>
-      <input type="number" id="psuCustomInput" min="50" max="140" step="1" value="135" style="width:90px">
+      <input type="number" id="psuCustomInput" name="psu_power_w" min="50" max="140" step="1" value="135" autocomplete="off" style="width:90px">
     </div>
     <div id="psuOverclockWarning" style="display:none;margin-top:12px;padding:10px 12px;border-radius:8px;background:rgba(255,170,0,0.12);border:1px solid rgba(255,170,0,0.3);color:var(--amber,#ffaa00);font-size:12px;line-height:1.4">
       ⚠️ <strong>Overclock / Headroom Warning:</strong> Exceeds the standard 80% USB-PD continuous duty rating. Requires a high-grade 140W+ GaN adapter or a dedicated Mean Well DC power supply (e.g. 24–28V via XT30). Board VRM ceiling (140W) and thermal trip backstops remain permanently enforced.
@@ -1166,7 +1166,7 @@
         </div>
         <div class="row">
           <label for="ownTargetVal">Value <small style="color:var(--dim)" id="ownTargetUnit">W</small></label>
-          <input type="number" id="ownTargetVal" min="20" max="200" step="1" placeholder="e.g. 115">
+          <input type="number" id="ownTargetVal" name="tuner_target_value" min="20" max="200" step="1" placeholder="e.g. 115" autocomplete="off">
         </div>
         <div class="note" id="ownTargetNote"></div>
       </div>
@@ -1181,7 +1181,7 @@
         <div class="toggle-ctrl">
           <span id="ownContinuousState">OFF</span>
           <label class="switch" for="ownContinuous">
-            <input type="checkbox" id="ownContinuous">
+            <input type="checkbox" id="ownContinuous" name="tuner_continuous" autocomplete="off">
             <span class="slider"></span>
           </label>
         </div>
@@ -1211,15 +1211,15 @@
     </div>
     <div class="row">
       <label for="tuneFreq">Base Frequency <small style="color:var(--dim)">MHz (domains step +20 each)</small></label>
-      <input type="number" id="tuneFreq" min="100" max="500" step="1" value="338">
+      <input type="number" id="tuneFreq" name="manual_base_freq_mhz" min="100" max="520" step="1" value="338" autocomplete="off">
     </div>
     <div class="row">
       <label for="tuneVolt">Core Voltage <small style="color:var(--dim)">mV</small></label>
-      <input type="number" id="tuneVolt" min="3300" max="3800" step="1" value="3704">
+      <input type="number" id="tuneVolt" name="manual_core_voltage_mv" min="3300" max="3912" step="1" value="3704" autocomplete="off">
     </div>
     <div class="row" id="tunePowerRow">
       <label for="tunePowerTarget">Power Target <small style="color:var(--dim)">W (power-target loop, blank = leave unchanged)</small></label>
-      <input type="number" id="tunePowerTarget" min="20" max="130" step="0.1" value="95">
+      <input type="number" id="tunePowerTarget" name="manual_power_target_w" min="20" max="130" step="0.1" value="95" autocomplete="off">
     </div>
     <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:4px">
       <button class="btn pri wbtn" id="tuneApply">Apply Mode</button>
@@ -1249,7 +1249,7 @@
     </div>
     <div class="row" id="fanManualRow" style="display:none">
       <label for="fanDuty">Fan Duty <small style="color:var(--dim)">% (0-100, no floor)</small></label>
-      <input type="number" id="fanDuty" min="0" max="100" step="1" value="50">
+      <input type="number" id="fanDuty" name="fan_duty_percent" min="0" max="100" step="1" value="50" autocomplete="off">
     </div>
     <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:4px">
       <button class="btn pri wbtn" id="fanApply">Apply</button>
@@ -1294,15 +1294,15 @@
   <div class="card" id="poolCard" style="max-width:560px">
     <div class="prow">
       <label for="poolUrl">Pool URL</label>
-      <input type="text" id="poolUrl" placeholder="stratum+tcp://pool.example.com:3333" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <input type="text" id="poolUrl" name="pool_url" placeholder="stratum+tcp://pool.example.com:3333" autocomplete="off" autocapitalize="off" spellcheck="false">
     </div>
     <div class="prow">
       <label for="poolUser">Worker <small>(usually address.workername)</small></label>
-      <input type="text" id="poolUser" placeholder="bc1q....worker1" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <input type="text" id="poolUser" name="pool_user" placeholder="bc1q....worker1" autocomplete="off" autocapitalize="off" spellcheck="false">
     </div>
     <div class="prow">
       <label for="poolPass">Password <small>(blank keeps current; most pools ignore it)</small></label>
-      <input type="password" id="poolPass" placeholder="unchanged" autocomplete="new-password">
+      <input type="password" id="poolPass" name="pool_password" placeholder="unchanged" autocomplete="new-password">
     </div>
     <div class="pacts">
       <button class="btn pri wbtn" id="poolSave">Save</button>
@@ -1838,8 +1838,8 @@ function applyBoardCaps() {
   show('manualSection', manual);
   show('tuningNone', !!SYS && !tuner && !manual);
   const nano = hasCeiling();
-  show('tunePresetRow', nano); show('tunePowerRow', nano); $('tuneFreq').min = nano ? 100 : 50; $('tuneFreq').max = nano ? 500 : 1200;
-  $('tuneVolt').min = nano ? 3300 : 500; $('tuneVolt').max = nano ? 3800 : 1600;
+  show('tunePresetRow', nano); show('tunePowerRow', nano); $('tuneFreq').min = nano ? 100 : 50; $('tuneFreq').max = nano ? 520 : 1200;
+  $('tuneVolt').min = nano ? 3300 : 500; $('tuneVolt').max = nano ? 3912 : 1600;
   const fan = caps ? caps.fan : 'none';
   show('fanSection', !!SYS && fan && fan !== 'none');
   $('fanNote').textContent = fan === 'harness'
@@ -2388,7 +2388,7 @@ function renderCurveRows() {
       const c = mk('div'); c.style.flex = '1';
       const l = mk('label', null, label); l.style.cssText = 'font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim)';
       const inp = document.createElement('input');
-      inp.type = 'number'; inp.className = cls; inp.min = min; inp.max = max; inp.step = step; inp.value = val; inp.style.width = '100%';
+      inp.type = 'number'; inp.className = cls; inp.name = cls; inp.autocomplete = 'off'; inp.min = min; inp.max = max; inp.step = step; inp.value = val; inp.style.width = '100%';
       c.append(l, inp);
       return [c, inp];
     };
