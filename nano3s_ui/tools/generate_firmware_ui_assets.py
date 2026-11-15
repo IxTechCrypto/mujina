@@ -1,4 +1,7 @@
-"""Standalone generator for Nano 3S LCD 240x240 RGB565 background arrays and bitmap fonts."""
+"""Standalone generator for Nano 3S LCD 240x240 RGB565 background arrays and bitmap fonts.
+
+Requirements: numpy, pymupdf, Pillow
+"""
 
 import argparse
 import math
