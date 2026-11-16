@@ -1887,6 +1887,14 @@ async function sendJson(method, url, body) {
 function activeBoard() {
   return (LAST && LAST.boards) ? (LAST.boards.find(b => b.board_name === activeName()) || null) : null;
 }
+// Empty tuner log: say why the board isn't hashing instead of a generic
+// placeholder. input_v is null on nano3s until Core 1 sends its first STATUS.
+function warmupText(b) {
+  const host = typeof SYS !== 'undefined' && SYS && SYS.mode === 'host';
+  if (b && !host && b.input_v == null) return 'No status from the hash chain. Reboot the miner. If this keeps happening, update the firmware.';
+  if (b && !(b.hashrate_ghs > 0)) return 'Not hashing (0 GH/s). Check the pool settings and connection.';
+  return 'Warming up…';
+}
 function hrText(b) {
   return (b.hashrate_ghs == null) ? 'n/a'
     : ((b.hashrate_ghs >= 1000) ? (+b.hashrate_ths).toFixed(2) + ' TH/s' : (+b.hashrate_ghs).toFixed(2) + ' GH/s');
@@ -2735,7 +2743,7 @@ function renderOwnerTune(o) {
   if (list) {
     list.textContent = '';
     const ev = (o.events || o.log || []).slice().reverse();
-    if (!ev.length) { list.textContent = 'Warming up…'; return; }
+    if (!ev.length) { list.textContent = warmupText(activeBoard()); return; }
     for (const e of ev) {
       const row = mk('div', 'entry');
       row.append(mk('b', null, e.t_secs_ago != null ? '[-' + fmtAgo(e.t_secs_ago) + ']' : '[log]'), ' ');
