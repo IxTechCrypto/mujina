@@ -39,6 +39,32 @@ fn set_display_page(page: &str) {
     }
 }
 
+fn restore_display_page_in_file(path: &str) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(curr) if curr.trim() == "wifi-setup" => {
+            if let Err(e) = std::fs::write(path, "nano3s") {
+                eprintln!("step: failed to restore {path}: {e}");
+                false
+            } else {
+                true
+            }
+        }
+        _ => false,
+    }
+}
+
+fn restore_display_page_if_wifi_setup() {
+    if restore_display_page_in_file(PAGE_FILE) {
+        eprintln!("step: restored display page from wifi-setup to nano3s");
+    }
+}
+
+fn has_configured_wifi() -> bool {
+    std::fs::read_to_string("/data/userconfig/wpa_supplicant.conf")
+        .map(|s| s.contains("ssid="))
+        .unwrap_or(false)
+}
+
 /// Writes BLE_WIFI_STATUS_FILE for nano3s_ui's "wifi-setup" page to
 /// read. `state` is one of advertising/client_connected/
 /// credentials_received/connecting/connected/failed (see driver.c's
@@ -274,8 +300,18 @@ fn main() {
     // effect more simply by never starting it in the first place once
     // already connected, rechecked every 60s via the sleep+exit below.
     let force_advertise = std::env::var("BLE_SETUP_FORCE_ADVERTISE").as_deref() == Ok("1");
+    if !force_advertise && ifconfig_wlan0_ip().is_none() && has_configured_wifi() {
+        eprintln!("step: wpa_supplicant.conf exists; waiting up to 15s for wlan0 IP before BLE setup");
+        for _ in 0..15 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if ifconfig_wlan0_ip().is_some() {
+                break;
+            }
+        }
+    }
     if let Some(ip) = ifconfig_wlan0_ip() {
         if !force_advertise {
+            restore_display_page_if_wifi_setup();
             eprintln!("step: wlan0 connected (ip={ip}), not advertising; idling before recheck");
             std::thread::sleep(std::time::Duration::from_secs(60));
             return;
@@ -1001,6 +1037,8 @@ fn event_loop(fd: i32, device_name: &str) {
             std::thread::sleep(std::time::Duration::from_secs(20));
             if let Some(ip) = ifconfig_wlan0_ip() {
                 if !force_adv {
+                    write_wifi_status("connected", &ip);
+                    restore_display_page_if_wifi_setup();
                     eprintln!("step: wlan0 acquired IP ({ip}), exiting BLE setup advertiser");
                     std::process::exit(0);
                 }
@@ -1155,5 +1193,25 @@ wlan0     Scan completed :
         assert_eq!(res[0], format!("{},7,-40", hex::encode("TestNet_5G")));
         assert_eq!(res[1], format!("{},5,-65", hex::encode("TestNet_WPA")));
         assert_eq!(res[2], format!("{},1,-75", hex::encode("OpenNet")));
+    }
+
+    #[test]
+    fn test_restore_display_page_in_file() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("mujina_ble_fb_page_test_{}.txt", std::process::id()));
+        let path_str = path.to_string_lossy().into_owned();
+
+        std::fs::write(&path, "wifi-setup\n").unwrap();
+        assert!(restore_display_page_in_file(&path_str));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "nano3s");
+
+        assert!(!restore_display_page_in_file(&path_str));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "nano3s");
+
+        std::fs::write(&path, "plasma").unwrap();
+        assert!(!restore_display_page_in_file(&path_str));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "plasma");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

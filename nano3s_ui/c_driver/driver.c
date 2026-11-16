@@ -1080,12 +1080,182 @@ static void refresh_ip_themed(ui_theme_t theme) {
     blit_ui_fb(ui_fb);
 }
 
-/* ── Legacy LVGL Screens (only used for BLE WiFi Setup & early STARTING) ── */
+/* ── Animated Themed Bluetooth WiFi Setup Screen ─────────────────────── */
+
+static void ui_draw_aa_line(float x0, float y0, float x1, float y1, float half_w, uint16_t col, uint8_t opa) {
+    if (opa == 0 || half_w <= 0.0f) return;
+    float minx = (x0 < x1 ? x0 : x1) - half_w - 1.5f;
+    float maxx = (x0 > x1 ? x0 : x1) + half_w + 1.5f;
+    float miny = (y0 < y1 ? y0 : y1) - half_w - 1.5f;
+    float maxy = (y0 > y1 ? y0 : y1) + half_w + 1.5f;
+    int ix0 = (int)floorf(minx); if (ix0 < 0) ix0 = 0;
+    int ix1 = (int)ceilf(maxx);  if (ix1 >= HOR_RES) ix1 = HOR_RES - 1;
+    int iy0 = (int)floorf(miny); if (iy0 < 0) iy0 = 0;
+    int iy1 = (int)ceilf(maxy);  if (iy1 >= VER_RES) iy1 = VER_RES - 1;
+    float vx = x1 - x0, vy = y1 - y0;
+    float len_sq = vx * vx + vy * vy;
+    for (int y = iy0; y <= iy1; y++) {
+        for (int x = ix0; x <= ix1; x++) {
+            float px = (float)x - x0, py = (float)y - y0;
+            float t = (len_sq > 1e-5f) ? ((px * vx + py * vy) / len_sq) : 0.0f;
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+            float dx = px - t * vx, dy = py - t * vy;
+            float dist = sqrtf(dx * dx + dy * dy);
+            if (dist <= half_w + 0.75f) {
+                float cov = (dist <= half_w - 0.45f) ? 1.0f : (half_w + 0.75f - dist) / 1.2f;
+                if (cov > 1.0f) cov = 1.0f;
+                uint8_t a = (uint8_t)(cov * (float)opa);
+                if (a > 0) {
+                    int idx = y * HOR_RES + x;
+                    ui_fb[idx] = blend565(ui_fb[idx], col, a);
+                }
+            }
+        }
+    }
+}
+
+static void ui_draw_local_arc(float cx, float cy, float r_mid, float start_deg, float sweep_deg,
+                              float half_w, uint16_t col, uint8_t opa) {
+    if (opa == 0 || sweep_deg <= 0.1f || half_w <= 0.0f) return;
+    float r_max = r_mid + half_w + 1.5f;
+    int ix0 = (int)floorf(cx - r_max); if (ix0 < 0) ix0 = 0;
+    int ix1 = (int)ceilf(cx + r_max);  if (ix1 >= HOR_RES) ix1 = HOR_RES - 1;
+    int iy0 = (int)floorf(cy - r_max); if (iy0 < 0) iy0 = 0;
+    int iy1 = (int)ceilf(cy + r_max);  if (iy1 >= VER_RES) iy1 = VER_RES - 1;
+    float s_norm = wrap360(start_deg);
+    float s_rad = s_norm * 0.0174532925f;
+    float e_rad = wrap360(s_norm + sweep_deg) * 0.0174532925f;
+    float cx_s = cx + r_mid * cosf(s_rad), cy_s = cy + r_mid * sinf(s_rad);
+    float cx_e = cx + r_mid * cosf(e_rad), cy_e = cy + r_mid * sinf(e_rad);
+    float max_d = half_w + 0.75f;
+    float max_d_sq = max_d * max_d;
+    for (int y = iy0; y <= iy1; y++) {
+        float dy = (float)y - cy;
+        for (int x = ix0; x <= ix1; x++) {
+            float dx = (float)x - cx;
+            float r = sqrtf(dx * dx + dy * dy);
+            float dr = fabsf(r - r_mid);
+            if (dr > max_d) continue;
+            float deg = atan2f(dy, dx) * 57.2957795f;
+            if (deg < 0.0f) deg += 360.0f;
+            float rel = deg - s_norm;
+            if (rel < 0.0f) rel += 360.0f;
+            float dist;
+            if (sweep_deg >= 359.9f || rel <= sweep_deg) {
+                dist = dr;
+            } else {
+                float d1_sq = ((float)x - cx_s) * ((float)x - cx_s) + ((float)y - cy_s) * ((float)y - cy_s);
+                float d2_sq = ((float)x - cx_e) * ((float)x - cx_e) + ((float)y - cy_e) * ((float)y - cy_e);
+                float min_sq = (d1_sq < d2_sq) ? d1_sq : d2_sq;
+                if (min_sq > max_d_sq) continue;
+                dist = sqrtf(min_sq);
+            }
+            float cov = (dist <= half_w - 0.45f) ? 1.0f : (max_d - dist) / 1.2f;
+            if (cov > 1.0f) cov = 1.0f;
+            uint8_t a = (uint8_t)(cov * (float)opa);
+            if (a > 0) {
+                int idx = y * HOR_RES + x;
+                ui_fb[idx] = blend565(ui_fb[idx], col, a);
+            }
+        }
+    }
+}
+
+static void ui_draw_bt_symbol(float cx, float cy, float scale, uint16_t rune_col, uint16_t glow_col,
+                              uint16_t wave_col1, uint16_t wave_col2, float t_sec) {
+    /* Two staggered pairs of expanding RF broadcast arcs on left & right */
+    for (int w = 0; w < 2; w++) {
+        float phase = fmodf(t_sec * 0.85f + (float)w * 0.5f, 1.0f);
+        float r_arc = (13.5f + phase * 17.5f) * scale;
+        float fade = 1.0f - phase;
+        uint8_t w_opa = (uint8_t)(fade * fade * 235.0f);
+        uint16_t w_col = (w == 0) ? wave_col1 : wave_col2;
+        if (w_opa > 4) {
+            ui_draw_local_arc(cx, cy, r_arc, 148.0f, 64.0f, 1.15f * scale, w_col, w_opa);
+            ui_draw_local_arc(cx, cy, r_arc, 328.0f, 64.0f, 1.15f * scale, w_col, w_opa);
+        }
+    }
+
+    float hh = 14.0f * scale;
+    float hw = 7.5f * scale;
+    float hy = hh * 0.48f;
+    float stroke = 1.3f * scale;
+
+    /* Optional subtle breathing halo behind the Bluetooth bind-rune */
+    if (glow_col != rune_col) {
+        float pulse = 0.5f + 0.5f * sinf(t_sec * 3.14159265f);
+        uint8_t g_opa = (uint8_t)(55.0f + pulse * 65.0f);
+        float gs = stroke + 1.4f * scale;
+        ui_draw_aa_line(cx, cy - hh, cx, cy + hh, gs, glow_col, g_opa);
+        ui_draw_aa_line(cx, cy - hh, cx + hw, cy - hy, gs, glow_col, g_opa);
+        ui_draw_aa_line(cx + hw, cy - hy, cx - hw, cy + hy, gs, glow_col, g_opa);
+        ui_draw_aa_line(cx, cy + hh, cx + hw, cy + hy, gs, glow_col, g_opa);
+        ui_draw_aa_line(cx + hw, cy + hy, cx - hw, cy - hy, gs, glow_col, g_opa);
+    }
+
+    /* Crisp Bluetooth bind-rune (5 segments) */
+    ui_draw_aa_line(cx, cy - hh, cx, cy + hh, stroke, rune_col, 255);
+    ui_draw_aa_line(cx, cy - hh, cx + hw, cy - hy, stroke, rune_col, 255);
+    ui_draw_aa_line(cx + hw, cy - hy, cx - hw, cy + hy, stroke, rune_col, 255);
+    ui_draw_aa_line(cx, cy + hh, cx + hw, cy + hy, stroke, rune_col, 255);
+    ui_draw_aa_line(cx + hw, cy + hy, cx - hw, cy - hy, stroke, rune_col, 255);
+}
+
+static uint16_t ble_bg_cache[3][HOR_RES * VER_RES];
+static int ble_bg_inited[3] = {0, 0, 0};
+
+static void init_ble_bg_theme(ui_theme_t theme) {
+    if (ble_bg_inited[theme]) return;
+    if (theme == THEME_MINIMAL) {
+        for (int y = 0; y < VER_RES; y++) {
+            for (int x = 0; x < HOR_RES; x++) {
+                float dx1 = (float)(x - 62), dy1 = (float)(y - 62);
+                float dx2 = (float)(x - 182), dy2 = (float)(y - 105);
+                float dx3 = (float)(x - 125), dy3 = (float)(y - 190);
+                float w1 = expf(-(dx1 * dx1 + dy1 * dy1) / 5600.0f);
+                float w2 = expf(-(dx2 * dx2 + dy2 * dy2) / 6200.0f);
+                float w3 = expf(-(dx3 * dx3 + dy3 * dy3) / 6000.0f);
+                float r = 216.0f - 38.0f * w1 + 4.0f * w2 + 34.0f * w3;
+                float g = 232.0f - 18.0f * w1 - 28.0f * w2 - 10.0f * w3;
+                float b = 252.0f + 3.0f * w1 - 2.0f * w2 - 16.0f * w3;
+                if (r < 0.0f) r = 0.0f; if (r > 255.0f) r = 255.0f;
+                if (g < 0.0f) g = 0.0f; if (g > 255.0f) g = 255.0f;
+                if (b < 0.0f) b = 0.0f; if (b > 255.0f) b = 255.0f;
+                ui_fb[y * HOR_RES + x] = RGB565((int)r, (int)g, (int)b);
+            }
+        }
+        /* Frosted outer ring track + hero medallion + rounded info glass card */
+        ui_draw_smooth_arc(107.0f, 0.0f, 360.0f, 6.0f, RGB565(225, 236, 250), RGB565(225, 236, 250), 190);
+        ui_fill_circle(120.0f, 65.5f, 23.0f, RGB565(155, 175, 205), 85);
+        ui_fill_circle(120.0f, 63.0f, 23.0f, COL_WHITE, 210);
+        ui_fill_circle(120.0f, 63.0f, 22.0f, RGB565(245, 250, 255), 180);
+        ui_fill_rect(42, 118, 156, 56, RGB565(248, 251, 255));
+        ui_draw_rect_outline(42, 118, 156, 56, 1, COL_WHITE);
+    } else if (theme == THEME_PARASITE) {
+        memset(ui_fb, 0, sizeof(ui_fb));
+        ui_draw_rect_outline(40, 116, 160, 58, 1, 0xD69A);
+    } else {
+        /* THEME_CYBERPUNK */
+        uint16_t bg_dark = RGB565(5, 6, 12);
+        for (int i = 0; i < HOR_RES * VER_RES; i++) ui_fb[i] = bg_dark;
+        uint16_t grid_c = RGB565(0, 32, 40);
+        for (int x = 12; x < HOR_RES; x += 18) ui_fill_rect(x, 0, 1, VER_RES, grid_c);
+        for (int y = 12; y < VER_RES; y += 18) ui_fill_rect(0, y, HOR_RES, 1, grid_c);
+        ui_fill_circle(120.0f, 63.0f, 25.0f, RGB565(8, 28, 44), 175);
+        ui_draw_chamfer_pill(38, 116, 164, 58, RGB565(10, 15, 28), COL_CYAN);
+        ui_fill_rect(38, 121, 2, 48, COL_CYAN);
+        for (int y = 0; y < VER_RES; y += 3) {
+            for (int x = 0; x < HOR_RES; x++) {
+                ui_fb[y * HOR_RES + x] = blend565(ui_fb[y * HOR_RES + x], COL_BLACK, 45);
+            }
+        }
+    }
+    memcpy(ble_bg_cache[theme], ui_fb, sizeof(ui_fb));
+    ble_bg_inited[theme] = 1;
+}
 
 static lv_obj_t *scr_waiting, *waiting_label;
-static lv_obj_t *scr_wifi_setup, *wifi_setup_status, *wifi_setup_detail, *wifi_setup_meter;
-static lv_meter_scale_t *wifi_setup_scale;
-static lv_meter_indicator_t *wifi_setup_arc;
 
 static lv_obj_t *make_label(lv_obj_t *parent, const lv_font_t *font, lv_color_t color, lv_coord_t y, const char *text) {
     lv_obj_t *l = lv_label_create(parent);
@@ -1097,86 +1267,165 @@ static lv_obj_t *make_label(lv_obj_t *parent, const lv_font_t *font, lv_color_t 
 }
 
 static void build_screens(void) {
-    const lv_font_t *f14 = &lv_font_montserrat_14;
     const lv_font_t *f24 = &lv_font_montserrat_24;
 
     scr_waiting = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_waiting, C_BG, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(scr_waiting, LV_OPA_COVER, LV_PART_MAIN);
     waiting_label = make_label(scr_waiting, f24, C_TEXT_1, 108, "STARTING");
-
-    scr_wifi_setup = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr_wifi_setup, C_BG, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(scr_wifi_setup, LV_OPA_COVER, LV_PART_MAIN);
-
-    wifi_setup_meter = lv_meter_create(scr_wifi_setup);
-    lv_obj_remove_style_all(wifi_setup_meter);
-    lv_obj_set_size(wifi_setup_meter, 220, 220);
-    lv_obj_center(wifi_setup_meter);
-
-    wifi_setup_scale = lv_meter_add_scale(wifi_setup_meter);
-    lv_meter_set_scale_ticks(wifi_setup_meter, wifi_setup_scale, 0, 0, 0, lv_color_black());
-    lv_meter_set_scale_range(wifi_setup_meter, wifi_setup_scale, 0, 100, 270, 135);
-
-    lv_meter_indicator_t *ws_bg = lv_meter_add_arc(wifi_setup_meter, wifi_setup_scale, 14, lv_color_make(0x1f, 0x22, 0x2a), 0);
-    lv_meter_set_indicator_start_value(wifi_setup_meter, ws_bg, 0);
-    lv_meter_set_indicator_end_value(wifi_setup_meter, ws_bg, 100);
-
-    wifi_setup_arc = lv_meter_add_arc(wifi_setup_meter, wifi_setup_scale, 14, C_YELLOW, 0);
-    lv_meter_set_indicator_start_value(wifi_setup_meter, wifi_setup_arc, 0);
-    lv_meter_set_indicator_end_value(wifi_setup_meter, wifi_setup_arc, 0);
-
-    wifi_setup_status = make_label(scr_wifi_setup, f24, C_YELLOW, 78, "...");
-    wifi_setup_detail = make_label(scr_wifi_setup, f14, C_TEXT_2, 114, NULL);
-    lv_obj_set_style_text_align(wifi_setup_detail, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_set_width(wifi_setup_detail, 176);
 }
 
-static void refresh_wifi_setup(void) {
-    const char *ring_word = "...";
-    const char *sentence = "Starting...";
-    lv_color_t color = C_TEXT_3;
-    int32_t fill = 0;
-    char detail_buf[80] = "";
+static void refresh_wifi_setup_themed(ui_theme_t theme, uint32_t ms) {
+    static uint32_t last_kv_poll = 0;
+    static int kv_ready = 0;
+    static char cached_state[32] = "advertising";
+    static char cached_detail[64] = "nan3s_XXXX";
 
-    if (read_kv_file(BLE_WIFI_STATUS_FILE)) {
-        const char *state = kv_str("state");
-        const char *detail = kv_str("detail");
-        if (!state) state = "";
-        if (!detail) detail = "";
-        if (strcmp(state, "advertising") == 0) {
-            ring_word = "BLE"; sentence = "Waiting for phone"; color = C_YELLOW; fill = 20;
-            if (detail[0]) snprintf(detail_buf, sizeof(detail_buf), "Open Avalon Life,\nlook for %s", detail);
-        } else if (strcmp(state, "client_connected") == 0) {
-            ring_word = "LINK"; sentence = "Phone connected"; color = C_YELLOW; fill = 40;
-        } else if (strcmp(state, "credentials_received") == 0) {
-            ring_word = "SAVE"; sentence = "Wifi info received"; color = C_YELLOW; fill = 60;
-            if (detail[0]) snprintf(detail_buf, sizeof(detail_buf), "%s", detail);
-        } else if (strcmp(state, "connecting") == 0) {
-            ring_word = "..."; sentence = "Connecting"; color = C_YELLOW; fill = 80;
-            if (detail[0]) snprintf(detail_buf, sizeof(detail_buf), "%s", detail);
-        } else if (strcmp(state, "connected") == 0) {
-            ring_word = "OK"; sentence = "Wifi connected!"; color = C_GREEN; fill = 100;
-            if (detail[0]) snprintf(detail_buf, sizeof(detail_buf), "IP %s", detail);
-        } else if (strcmp(state, "failed") == 0) {
-            ring_word = "X"; sentence = "Setup failed"; color = C_RED; fill = 100;
-            snprintf(detail_buf, sizeof(detail_buf), "Check password,\ntry again");
+    if (!kv_ready || ms - last_kv_poll >= 400u) {
+        last_kv_poll = ms;
+        kv_ready = 1;
+        if (read_kv_file(BLE_WIFI_STATUS_FILE)) {
+            const char *st = kv_str("state");
+            const char *dt = kv_str("detail");
+            if (st && *st) snprintf(cached_state, sizeof(cached_state), "%s", st);
+            else snprintf(cached_state, sizeof(cached_state), "advertising");
+            if (dt && *dt) snprintf(cached_detail, sizeof(cached_detail), "%s", dt);
+            else cached_detail[0] = '\0';
+        } else {
+            snprintf(cached_state, sizeof(cached_state), "advertising");
+            snprintf(cached_detail, sizeof(cached_detail), "nan3s_XXXX");
         }
     }
 
-    lv_label_set_text(wifi_setup_status, ring_word);
-    lv_obj_set_style_text_color(wifi_setup_status, color, LV_PART_MAIN);
-    lv_obj_align(wifi_setup_status, LV_ALIGN_TOP_MID, 0, 78);
+    init_ble_bg_theme(theme);
+    memcpy(ui_fb, ble_bg_cache[theme], sizeof(ui_fb));
 
-    wifi_setup_arc->type_data.arc.color = color;
-    lv_meter_set_indicator_end_value(wifi_setup_meter, wifi_setup_arc, fill);
-    lv_obj_invalidate(wifi_setup_meter);
+    const char *pill_txt = "ADVERTISING";
+    const char *headline = "Waiting for phone";
+    char sub1[48] = "Open Avalon Life";
+    char sub2[48] = "";
 
-    char full_detail[120];
-    if (detail_buf[0]) snprintf(full_detail, sizeof(full_detail), "%s\n%s", sentence, detail_buf);
-    else snprintf(full_detail, sizeof(full_detail), "%s", sentence);
-    lv_label_set_text(wifi_setup_detail, full_detail);
-    lv_scr_load(scr_wifi_setup);
+    int st_kind = 0; /* 0=advertising/active, 1=connected/ok, 2=failed */
+    float progress = 0.25f;
+    if (strcmp(cached_state, "client_connected") == 0) {
+        pill_txt = "LINKED";
+        headline = "Phone connected";
+        snprintf(sub1, sizeof(sub1), "Awaiting WiFi config");
+        progress = 0.45f;
+    } else if (strcmp(cached_state, "credentials_received") == 0) {
+        pill_txt = "SAVED";
+        headline = "WiFi info received";
+        snprintf(sub1, sizeof(sub1), "%s", cached_detail[0] ? cached_detail : "Credentials saved");
+        progress = 0.65f;
+    } else if (strcmp(cached_state, "connecting") == 0) {
+        pill_txt = "CONNECTING";
+        headline = "Connecting...";
+        snprintf(sub1, sizeof(sub1), "%s", cached_detail[0] ? cached_detail : "Associating WLAN0");
+        progress = 0.85f;
+    } else if (strcmp(cached_state, "connected") == 0) {
+        st_kind = 1;
+        pill_txt = "ONLINE";
+        headline = "WiFi connected!";
+        if (cached_detail[0]) snprintf(sub1, sizeof(sub1), "IP %s", cached_detail);
+        else snprintf(sub1, sizeof(sub1), "WLAN0 bound");
+        progress = 1.0f;
+    } else if (strcmp(cached_state, "failed") == 0) {
+        st_kind = 2;
+        pill_txt = "FAILED";
+        headline = "Setup failed";
+        snprintf(sub1, sizeof(sub1), "Check password,");
+        snprintf(sub2, sizeof(sub2), "try again");
+        progress = 1.0f;
+    } else {
+        pill_txt = "ADVERTISING";
+        headline = "Waiting for phone";
+        snprintf(sub1, sizeof(sub1), "Open Avalon Life");
+        if (cached_detail[0]) snprintf(sub2, sizeof(sub2), "Look for %s", cached_detail);
+        progress = 0.25f;
+    }
+
+    float t = (float)(ms % 120000u) * 0.001f;
+
+    if (theme == THEME_MINIMAL) {
+        uint16_t acc_col = (st_kind == 1) ? COL_MIN_MINT : (st_kind == 2 ? COL_MIN_HOT : COL_MIN_ROYAL);
+        uint16_t wave1 = (st_kind == 1) ? COL_MIN_MINT : (st_kind == 2 ? COL_MIN_WARM : COL_MIN_SKY);
+        uint16_t wave2 = (st_kind == 1) ? COL_MIN_MINT_BRT : (st_kind == 2 ? COL_MIN_HOT : COL_MIN_BLUE);
+        float rot = fmodf(t * 36.0f, 360.0f);
+        ui_draw_smooth_arc(107.0f, -90.0f, 360.0f * progress, 6.0f, acc_col, wave1, 140);
+        ui_draw_smooth_arc(107.0f, rot, 95.0f, 6.0f, acc_col, wave1, 255);
+        ui_draw_smooth_arc(107.0f, rot + 180.0f, 70.0f, 6.0f, COL_MIN_MINT, COL_MIN_MINT_BRT, 220);
+
+        ui_draw_bt_symbol(120.0f, 63.0f, 0.92f, acc_col, acc_col, wave1, wave2, t);
+
+        char pill_buf[40];
+        snprintf(pill_buf, sizeof(pill_buf), "BLE \xe2\x80\xa2 %s", pill_txt);
+        int pw = measure_text_px(&font_segoe_8, pill_buf) + 22;
+        if (pw < 98) pw = 98;
+        int px = 120 - pw / 2;
+        ui_fill_rect(px, 95, pw, 16, RGB565(250, 252, 255));
+        ui_draw_rect_outline(px, 95, pw, 16, 1, COL_WHITE);
+        ui_fill_circle((float)(px + 9), 103.0f, 2.8f, acc_col, 255);
+        draw_text_xy(&font_segoe_8, px + 16, 97, pill_buf, COL_MIN_INK);
+
+        const ui_font_t *hf = fit_font_or_fallback(&font_bahn_13, &font_segoe_8, 146, headline);
+        draw_text_centered(hf, 120, 123, headline, acc_col);
+        draw_text_centered(&font_segoe_8, 120, 144, sub1, COL_MIN_INK);
+        if (sub2[0]) draw_text_centered(&font_segoe_8, 120, 158, sub2, COL_MIN_SUB);
+        draw_text_centered(&font_segoe_8, 120, 184, "WiFi Provisioning", COL_MIN_SUB);
+    } else if (theme == THEME_PARASITE) {
+        uint16_t acc_col = (st_kind == 2) ? COL_PARA_RED : COL_WHITE;
+        float rot_ticks = fmodf(t * 20.0f, 360.0f);
+        float rot_scan = fmodf(-t * 52.0f, 360.0f);
+        int active_n = (int)roundf(progress * 36.0f);
+        ui_draw_radial_ticks(36, rot_ticks, 360.0f, 106.0f, 102.5f, 111.5f, 3, active_n,
+                             COL_WHITE, COL_PARA_RED, (st_kind == 2) ? 0 : 28, COL_PARA_DARK, 1.0f, 0.6f);
+        ui_draw_wedge_arc(98.5f, rot_scan, 52.0f, 2.6f, COL_WHITE, 255);
+        ui_draw_wedge_arc(98.5f, rot_scan + 180.0f, 52.0f, 2.6f, COL_PARA_RED, 255);
+
+        ui_draw_bt_symbol(120.0f, 62.0f, 0.95f, acc_col, acc_col, COL_WHITE, COL_PARA_RED, t);
+
+        char pill_buf[40], head_up[40];
+        snprintf(pill_buf, sizeof(pill_buf), "BLE // %s", pill_txt);
+        uppercase_str(head_up, sizeof(head_up), headline);
+        ui_fill_rect(54, 95, 132, 15, (st_kind == 2) ? COL_PARA_RED : COL_WHITE);
+        draw_text_centered(&font_courier_8, 120, 98, pill_buf, COL_BLACK);
+
+        const ui_font_t *hf = fit_font_or_fallback(&font_courier_13, &font_courier_8, 150, head_up);
+        draw_text_centered(hf, 120, 123, head_up, acc_col);
+        draw_text_centered(&font_courier_8, 120, 144, sub1, COL_WHITE);
+        if (sub2[0]) draw_text_centered(&font_courier_8, 120, 158, sub2, COL_PARA_DIM);
+        draw_text_centered(&font_courier_8, 120, 184, "[ BLE_PROV // INIT ]", COL_PARA_DIM);
+    } else {
+        /* THEME_CYBERPUNK */
+        uint16_t acc_col = (st_kind == 1) ? COL_CYBER_GREEN : (st_kind == 2 ? COL_HOT_RED : COL_CYAN);
+        uint16_t wave2 = (st_kind == 1) ? COL_CYAN : (st_kind == 2 ? COL_AMBER : COL_MAG);
+        float rot1 = fmodf(t * 45.0f, 360.0f);
+        float rot2 = fmodf(-t * 30.0f, 360.0f);
+        ui_draw_wedge_arc(109.0f, rot1 + 20.0f, 52.0f, 5.5f, acc_col, 255);
+        ui_draw_wedge_arc(109.0f, rot1 + 108.0f, 52.0f, 5.5f, acc_col, 255);
+        ui_draw_wedge_arc(109.0f, rot1 + 200.0f, 52.0f, 5.5f, acc_col, 255);
+        ui_draw_wedge_arc(109.0f, rot1 + 288.0f, 52.0f, 5.5f, acc_col, 255);
+        ui_draw_wedge_arc(109.0f, rot1 + 78.0f, 24.0f, 5.5f, wave2, 255);
+        ui_draw_wedge_arc(109.0f, rot1 + 258.0f, 24.0f, 5.5f, wave2, 255);
+        ui_draw_radial_ticks(4, rot2, 360.0f, 94.0f, 94.0f, 102.5f, 1, 4, acc_col, acc_col, -1, acc_col, 1.0f, 1.0f);
+
+        ui_draw_bt_symbol(120.0f, 62.0f, 0.95f, COL_WHITE, acc_col, acc_col, wave2, t);
+
+        char pill_buf[40], head_up[40];
+        snprintf(pill_buf, sizeof(pill_buf), "BLE // %s", pill_txt);
+        uppercase_str(head_up, sizeof(head_up), headline);
+        ui_draw_chamfer_pill(56, 95, 128, 16, (st_kind == 2) ? COL_CYBER_WARN : COL_CYBER_PILL, acc_col);
+        ui_fill_circle(65.0f, 103.0f, 2.5f, acc_col, 255);
+        draw_text_xy(&font_space_8, 72, 98, pill_buf, acc_col);
+
+        const ui_font_t *hf = fit_font_or_fallback(&font_orbitron_12, &font_space_8, 150, head_up);
+        draw_text_centered(hf, 120, 123, head_up, COL_WHITE);
+        draw_text_centered(&font_space_8, 120, 144, sub1, COL_CYBER_LIGHT);
+        if (sub2[0]) draw_text_centered(&font_space_8, 120, 158, sub2, acc_col);
+        draw_text_centered(&font_space_8, 120, 185, "BLE WIFI SETUP", COL_CYBER_DIM);
+    }
+
+    blit_ui_fb(ui_fb);
 }
 
 static void refresh_pizza(void) {
@@ -1625,6 +1874,15 @@ static void run_event_loop(void) {
             continue;
         }
 
+        if (pg == PG_WIFI_SETUP) {
+            refresh_wifi_setup_themed(theme, now);
+            strcpy(last_page, page);
+            last_theme = theme;
+            was_lvgl = 0;
+            usleep(50 * 1000); /* 20 FPS animated Bluetooth setup */
+            continue;
+        }
+
         if (page_changed || theme_changed || now - last_refresh >= REFRESH_INTERVAL_MS) {
             strcpy(last_page, page);
             last_theme = theme;
@@ -1636,12 +1894,6 @@ static void run_event_loop(void) {
             } else if (pg == PG_PIZZA) {
                 if (page_changed) refresh_pizza();
                 was_lvgl = 0;
-            } else if (pg == PG_WIFI_SETUP) {
-                if (!was_lvgl) {
-                    lv_obj_invalidate(scr_wifi_setup);
-                }
-                refresh_wifi_setup();
-                was_lvgl = 1;
             } else if (read_kv_file(NANO3S_LIVE_FILE)) {
                 if (pg == PG_TUNER) refresh_tuner_themed(theme);
                 else refresh_live_themed(theme);

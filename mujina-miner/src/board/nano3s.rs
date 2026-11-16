@@ -613,6 +613,11 @@ mod companion_binaries {
         "/../deploy/mujina_display_startup.sh"
     ));
 
+    const EMBEDDED_BLE_SETUP: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../target/riscv64gc-unknown-linux-gnu/release/ble_setup.stripped"
+    ));
+
     pub fn sync_companion_binaries() {
         sync_one("/data/nano3s_ui", EMBEDDED_NANO3S_UI, Some("nano3s_ui"));
         sync_one("/mntapp/release/linux/app/fb_button", EMBEDDED_FB_BUTTON, Some("fb_button"));
@@ -621,6 +626,12 @@ mod companion_binaries {
             EMBEDDED_STARTUP_SH,
             None,
         );
+        sync_one("/data/ble_setup", EMBEDDED_BLE_SETUP, Some("ble_setup"));
+        if let Ok(curr_page) = fs::read_to_string("/mntapp/release/linux/app/fb_page")
+            && curr_page.trim() == "wifi-setup"
+        {
+            let _ = fs::write("/mntapp/release/linux/app/fb_page", "nano3s");
+        }
         if sync_one("/mntapp/release/rtt/rtos_core.elf", EMBEDDED_RTOS_CORE, None) {
             info!("Updated /mntapp/release/rtt/rtos_core.elf; rebooting to load updated Core 1 firmware...");
             let _ = fs::write("/sharefs/reboot_request", "rtos_core_updated\n");

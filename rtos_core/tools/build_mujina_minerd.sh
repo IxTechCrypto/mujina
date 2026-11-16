@@ -27,8 +27,15 @@ cd "$WORKSPACE_ROOT/fb_hijack"
 cargo build --release --target riscv64gc-unknown-linux-gnu --bin fb_button
 riscv64-linux-gnu-strip --strip-all "$WORKSPACE_ROOT/fb_hijack/target/riscv64gc-unknown-linux-gnu/release/fb_button"
 
+echo "[*] Building companion binary: ble_setup..."
 cd "$WORKSPACE_ROOT/mujina-miner"
-cargo build --release --target riscv64gc-unknown-linux-gnu --features nano3s --bin mujina-minerd --bin ble_setup
+cargo build --release --target riscv64gc-unknown-linux-gnu --bin ble_setup
+BLE_BIN="$WORKSPACE_ROOT/target/riscv64gc-unknown-linux-gnu/release/ble_setup"
+riscv64-linux-gnu-strip --strip-all -o "$BLE_BIN.stripped" "$BLE_BIN"
+ls -lh "$BLE_BIN.stripped"
+echo "[+] Built $BLE_BIN.stripped"
+
+cargo build --release --target riscv64gc-unknown-linux-gnu --features nano3s --bin mujina-minerd
 # Built binary path (workspace-rooted target dir).
 BIN="$WORKSPACE_ROOT/target/riscv64gc-unknown-linux-gnu/release/mujina-minerd"
 echo "[*] Verifying nano3s symbols are linked in..."
@@ -37,8 +44,3 @@ ls -lh "$BIN"
 riscv64-linux-gnu-strip --strip-all -o "$BIN.stripped" "$BIN"
 ls -lh "$BIN.stripped"
 echo "[+] Built $BIN.stripped"
-
-BLE_BIN="$WORKSPACE_ROOT/target/riscv64gc-unknown-linux-gnu/release/ble_setup"
-riscv64-linux-gnu-strip --strip-all -o "$BLE_BIN.stripped" "$BLE_BIN"
-ls -lh "$BLE_BIN.stripped"
-echo "[+] Built $BLE_BIN.stripped"

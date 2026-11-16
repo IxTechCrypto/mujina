@@ -25,6 +25,8 @@
   - Re-themed all `240x240` circular LCD screens (`mujina-logo` splash, `nano3s` main mining stats, `nano3s-tuner` 12-chip thermal corona, `ip` network/RSSI screen, Parasite-only `parasite-logo` screen after `ip`, and shared `plasma` Bitcoin Plasma disk across all themes; removed `nano3s-diag` and `pizza`).
   - Added 25 FPS animated perimeter rings on `mujina-logo` and `parasite-logo` and single-border `Parasite.space` dial arcs/cards.
   - Optimized `ui_draw_radial_ticks` to a single-pass `O(ring_lut_len)` LUT traversal and added early radial bounds rejection in `ui_draw_smooth_arc`, cutting 25 FPS splash CPU load in half on K230.
+  - Replaced the legacy LVGL `wifi-setup` screen in `nano3s_ui` with a 20 FPS theme-synced (`cyberpunk`, `minimal`, `parasite`) screen featuring an anti-aliased animated Bluetooth symbol and expanding radio wave arcs.
+  - Fixed the `ble_setup` `"wifi-setup"` display page respawn loop (`ble_setup.rs`, `mujina_display_startup.sh`, and `companion_binaries` auto-sync of `/data/ble_setup`) so provisioned units wait for `wlan0` IP before starting BLE setup and restore `fb_page` to `nano3s` rather than overwriting the screen back to `"wifi-setup"`.
   - Committed standalone asset generator `nano3s_ui/tools/generate_firmware_ui_assets.py` (`numpy`, `pymupdf`, `Pillow`) and `nano3s_ui/tools/assets/parasite_logo.png`.
 
 ## v5.0.8 (2026-11-13)

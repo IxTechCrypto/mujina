@@ -13,6 +13,10 @@ APP=/mntapp/release/linux/app
 # Logging to /tmp prevents high-frequency wear on SPI NAND flash (/mntapp UBIFS).
 mkdir -p /tmp
 
+if [ "$(cat $APP/fb_page 2>/dev/null)" = "wifi-setup" ]; then
+    echo "mujina-logo" > $APP/fb_page
+fi
+
 # [1] Start UI & Front Panel buttons IMMEDIATELY so the display illuminates
 # and accepts user input without waiting for network/DHCP.
 (
@@ -57,6 +61,9 @@ mkdir -p /tmp
     while true; do
         ip=$(ifconfig wlan0 2>/dev/null | grep 'inet addr:' | cut -d: -f2 | cut -d' ' -f1)
         if [ -n "$ip" ]; then
+            if [ "$(cat $APP/fb_page 2>/dev/null)" = "wifi-setup" ]; then
+                echo "nano3s" > $APP/fb_page
+            fi
             break
         fi
         sleep 2
