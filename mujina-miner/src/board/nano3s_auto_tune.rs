@@ -816,6 +816,8 @@ pub(crate) enum AutoTuneCmd {
     FanManual(u8),
     /// Power-cycle and re-enumerate the hash chain after a persistent stall.
     ReinitChain,
+    /// Escalate to a rate-limited hardware reboot after unrecoverable stall.
+    RebootRecovery,
 }
 
 /// Maps a tuner action to hardware commands. Fan actions map to nothing here:
@@ -825,6 +827,7 @@ pub(crate) fn action_to_cmds(action: TuneAction) -> Vec<AutoTuneCmd> {
         TuneAction::SetFrequency(base) => vec![AutoTuneCmd::SetMode(domain_freqs(base))],
         TuneAction::SetVoltage(mv) => vec![AutoTuneCmd::SetVoltage(snap_voltage_mv(mv as i64) as i32)],
         TuneAction::ReinitChain => vec![AutoTuneCmd::ReinitChain],
+        TuneAction::RebootRecovery => vec![AutoTuneCmd::RebootRecovery],
         // Fan actions are routed through the fan loop (`AutoTune`), which
         // owns the fan while the autotuner is on.
         TuneAction::SetFanFull | TuneAction::RestoreFanAuto | TuneAction::SetFanMinPercent(_) => vec![],
@@ -2005,6 +2008,7 @@ mod tests {
     #[test]
     fn reinit_chain_cmd_and_cali_recovery_point_selection() {
         assert_eq!(action_to_cmds(TuneAction::ReinitChain), vec![AutoTuneCmd::ReinitChain]);
+        assert_eq!(action_to_cmds(TuneAction::RebootRecovery), vec![AutoTuneCmd::RebootRecovery]);
 
         let cali = parse_cali(SAMPLE_CALI).unwrap();
         let env = envelope_from_cali(&cali);

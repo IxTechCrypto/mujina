@@ -415,6 +415,9 @@ pub enum TuneAction {
     /// Power-cycle and re-enumerate the hash chain after a persistent
     /// zero-hashrate stall did not clear on setpoint revert.
     ReinitChain,
+    /// Escalate to a rate-limited hardware reboot after persistent warmup stalls
+    /// failed to clear on setpoint reverts and chain re-inits.
+    RebootRecovery,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1595,6 +1598,7 @@ impl AutoTuner {
                         );
                         return Some(Some(TuneAction::ReinitChain));
                     }
+                    self.stall_ticks = 0;
                     self.stall_stage = StallStage::GaveUp;
                     self.log_event("warmup stall unresolved after 2 re-inits", m);
                 }
@@ -1603,6 +1607,11 @@ impl AutoTuner {
             }
             StallStage::GaveUp => {
                 self.phase = TunePhase::Warmup;
+                if self.stall_ticks >= WARMUP_STALL_TIMEOUT_TICKS {
+                    self.stall_ticks = 0;
+                    self.log_event("warmup stall unresolved after 2 re-inits: escalating to recovery reboot", m);
+                    return Some(Some(TuneAction::RebootRecovery));
+                }
                 Some(None)
             }
         }
@@ -3560,11 +3569,21 @@ mod tests {
         }
         assert_eq!(reinit_2, Some(TuneAction::ReinitChain));
 
-        // After 2 failed re-inits expire, tuner logs once and holds Warmup quietly.
-        for _ in 0..(WARMUP_STALL_TIMEOUT_TICKS + 5) {
+        // Attempt 2 re-init failure: expires after timeout and transitions to GaveUp.
+        for _ in 0..WARMUP_STALL_TIMEOUT_TICKS {
+            assert_eq!(t.evaluate(&tm(40.0, 0.0, 420.0, 1150, Some(0.0))), None);
+        }
+        assert_eq!(t.stall_stage, StallStage::GaveUp);
+
+        // In GaveUp, holds Warmup until timeout, then escalates to recovery reboot.
+        for _ in 0..(WARMUP_STALL_TIMEOUT_TICKS - 1) {
             assert_eq!(t.evaluate(&tm(40.0, 0.0, 420.0, 1150, Some(0.0))), None);
             assert_eq!(t.phase(), TunePhase::Warmup);
         }
+        assert_eq!(
+            t.evaluate(&tm(40.0, 0.0, 420.0, 1150, Some(0.0))),
+            Some(TuneAction::RebootRecovery)
+        );
         let gave_up_count = t
             .log
             .iter()

@@ -110,6 +110,17 @@ int nano3s_ipc_poll_nonce(nano3s_nonce_t *out);
 int nano3s_ipc_get_status(nano3s_status_t *out);
 
 /*
+ * Returns 1 if at least one status has ever been received from rtos_core, 0 otherwise.
+ */
+int nano3s_ipc_has_received_status(void);
+
+/*
+ * Returns the elapsed milliseconds since the last IPC_MSG_STATUS was received,
+ * or UINT64_MAX if no status has been received yet.
+ */
+uint64_t nano3s_ipc_status_age_ms(void);
+
+/*
  * Fire-and-forget pause/resume (IPC_MSG_PAUSE/IPC_MSG_RESUME). PAUSE
  * asserts RST on the RTOS side only; cutting power/fan is handled
  * elsewhere. Both send a 1-byte dummy payload rather than a zero-length

@@ -33,8 +33,20 @@ const HCI_DEV_ID: u16 = 0; // hci0
 const PAGE_FILE: &str = "/mntapp/release/linux/app/fb_page";
 const BLE_WIFI_STATUS_FILE: &str = "/tmp/ble_wifi_status.txt";
 
+fn atomic_write_str(path: &str, content: &str) -> std::io::Result<()> {
+    let p = std::path::Path::new(path);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp_path = format!("{path}.tmp");
+    let mut f = std::fs::File::create(&tmp_path)?;
+    std::io::Write::write_all(&mut f, content.as_bytes())?;
+    let _ = f.sync_all();
+    std::fs::rename(&tmp_path, p)
+}
+
 fn set_display_page(page: &str) {
-    if let Err(e) = std::fs::write(PAGE_FILE, page) {
+    if let Err(e) = atomic_write_str(PAGE_FILE, page) {
         eprintln!("step: failed to write {PAGE_FILE}: {e}");
     }
 }
@@ -42,7 +54,7 @@ fn set_display_page(page: &str) {
 fn restore_display_page_in_file(path: &str) -> bool {
     match std::fs::read_to_string(path) {
         Ok(curr) if curr.trim() == "wifi-setup" => {
-            if let Err(e) = std::fs::write(path, "nano3s") {
+            if let Err(e) = atomic_write_str(path, "nano3s") {
                 eprintln!("step: failed to restore {path}: {e}");
                 false
             } else {
@@ -71,7 +83,7 @@ fn has_configured_wifi() -> bool {
 /// refresh_wifi_setup() for exactly how each maps to on-screen text).
 fn write_wifi_status(state: &str, detail: &str) {
     let body = format!("state={state}\ndetail={detail}\n");
-    if let Err(e) = std::fs::write(BLE_WIFI_STATUS_FILE, body) {
+    if let Err(e) = atomic_write_str(BLE_WIFI_STATUS_FILE, &body) {
         eprintln!("step: failed to write {BLE_WIFI_STATUS_FILE}: {e}");
     }
 }

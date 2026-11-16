@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "sdk/k_ipcmsg.h"
 #include "ipc_protocol.h"
@@ -35,6 +36,7 @@ static size_t g_nonce_count = 0; /* number queued */
 
 static nano3s_status_t g_last_status;
 static int g_have_status = 0;
+static struct timespec g_last_status_ts = {0, 0};
 
 static int send_only(k_s32 id, uint16_t cmd, const void *payload, uint16_t len)
 {
@@ -125,6 +127,7 @@ static void handle_ipc_message(k_s32 s32Id, k_ipcmsg_message_t *msg)
 		pthread_mutex_lock(&g_lock);
 		g_last_status = out;
 		g_have_status = 1;
+		clock_gettime(CLOCK_MONOTONIC, &g_last_status_ts);
 		pthread_mutex_unlock(&g_lock);
 	} else if (msg->u32CMD == IPC_MSG_SET_VOLTAGE && msg->u32BodyLen == sizeof(struct ipc_set_voltage) && msg->pBody) {
 		/* Converts target_mv to a DC/DC step code and applies it via i2cset. */
@@ -315,6 +318,33 @@ int nano3s_ipc_get_status(nano3s_status_t *out)
 		*out = g_last_status;
 	pthread_mutex_unlock(&g_lock);
 	return have;
+}
+
+int nano3s_ipc_has_received_status(void)
+{
+	int have;
+
+	pthread_mutex_lock(&g_lock);
+	have = g_have_status;
+	pthread_mutex_unlock(&g_lock);
+	return have;
+}
+
+uint64_t nano3s_ipc_status_age_ms(void)
+{
+	uint64_t age = (uint64_t)-1;
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	pthread_mutex_lock(&g_lock);
+	if (g_have_status) {
+		int64_t sec_diff = (int64_t)(now.tv_sec - g_last_status_ts.tv_sec);
+		int64_t nsec_diff = (int64_t)(now.tv_nsec - g_last_status_ts.tv_nsec);
+		int64_t ms = (sec_diff * 1000) + (nsec_diff / 1000000);
+		age = (ms >= 0) ? (uint64_t)ms : 0;
+	}
+	pthread_mutex_unlock(&g_lock);
+	return age;
 }
 
 int nano3s_ipc_pause(void)

@@ -36,19 +36,43 @@ fn main() {
         return;
     }
 
-    // rtos_core lives two levels up from this crate
-    // (mujina-upstream/mujina-miner -> mujina-upstream -> nano3s -> rtos_core).
+    // rtos_core lives alongside mujina-miner in this repository
+    // (with fallback to two levels up for legacy out-of-tree trees).
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let rtos_core = manifest_dir
-        .parent()
-        .expect("mujina-miner has a parent dir")
-        .parent()
-        .expect("mujina-upstream has a parent dir")
-        .join("rtos_core");
+    let rtos_core = {
+        let direct_rtos = manifest_dir
+            .parent()
+            .expect("mujina-miner has a parent dir")
+            .join("rtos_core");
+        if direct_rtos.exists() {
+            direct_rtos
+        } else {
+            manifest_dir
+                .parent()
+                .expect("mujina-miner has a parent dir")
+                .parent()
+                .expect("mujina-upstream has a parent dir")
+                .join("rtos_core")
+        }
+    };
 
     let tools = rtos_core.join("tools");
     let include = rtos_core.join("include");
-    let sdk_libs = rtos_core.join("vendor").join("sdk_libs");
+    let sdk_libs = {
+        let local_libs = rtos_core.join("vendor").join("sdk_libs");
+        if local_libs.exists() {
+            local_libs
+        } else {
+            manifest_dir
+                .parent()
+                .expect("mujina-miner has a parent dir")
+                .parent()
+                .expect("mujina-upstream has a parent dir")
+                .join("rtos_core")
+                .join("vendor")
+                .join("sdk_libs")
+        }
+    };
 
     println!("cargo:rerun-if-changed={}", tools.join("nano3s_ipc_shim.c").display());
     println!("cargo:rerun-if-changed={}", tools.join("nano3s_ipc_shim.h").display());
