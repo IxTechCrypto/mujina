@@ -17,34 +17,36 @@ def run_cmd(cmd, cwd=None):
 print("=== MUJINA FIRMWARE RELEASE BUILD (v5.1.0) ===")
 print("[1] Updating staged binaries for data and app partitions...")
 
+WORKSPACE_ROOT = os.path.dirname(os.path.abspath(__file__))
+
 # Data binaries
-src_minerd = "/home/grant/nano3s-build/nano-mujina/target/riscv64gc-unknown-linux-gnu/release/mujina-minerd.stripped"
+src_minerd = os.path.join(WORKSPACE_ROOT, "target/riscv64gc-unknown-linux-gnu/release/mujina-minerd.stripped")
 dst_minerd = "/home/grant/udisk_build/data_extracted/590221451/ubi_data_part/mujina-minerd"
 shutil.copy2(src_minerd, dst_minerd)
 os.chmod(dst_minerd, 0o755)
 
-src_ble = "/home/grant/nano3s-build/nano-mujina/target/riscv64gc-unknown-linux-gnu/release/ble_setup.stripped"
+src_ble = os.path.join(WORKSPACE_ROOT, "target/riscv64gc-unknown-linux-gnu/release/ble_setup.stripped")
 dst_ble = "/home/grant/udisk_build/data_extracted/590221451/ubi_data_part/ble_setup"
 shutil.copy2(src_ble, dst_ble)
 os.chmod(dst_ble, 0o755)
 
-src_ui = "/home/grant/nano3s-build/nano-mujina/nano3s_ui/target/riscv64gc-unknown-linux-gnu/release/nano3s_ui"
+src_ui = os.path.join(WORKSPACE_ROOT, "nano3s_ui/target/riscv64gc-unknown-linux-gnu/release/nano3s_ui")
 dst_ui = "/home/grant/udisk_build/data_extracted/590221451/ubi_data_part/nano3s_ui"
 shutil.copy2(src_ui, dst_ui)
 os.chmod(dst_ui, 0o755)
 
 # App binaries (Core 1 RTOS + Display startup watchdog + Button handler)
-src_rtos = "/home/grant/nano3s-build/nano-mujina/rtos_core/build/rtos_core.elf"
+src_rtos = os.path.join(WORKSPACE_ROOT, "rtos_core/build/rtos_core.elf")
 dst_rtos = "/home/grant/udisk_build/rootfs_extracted/248013053/ubi_app_part/release/rtt/rtos_core.elf"
 shutil.copy2(src_rtos, dst_rtos)
 os.chmod(dst_rtos, 0o755)
 
-src_startup = "/home/grant/nano3s-build/nano-mujina/deploy/mujina_display_startup.sh"
+src_startup = os.path.join(WORKSPACE_ROOT, "deploy/mujina_display_startup.sh")
 dst_startup = "/home/grant/udisk_build/rootfs_extracted/248013053/ubi_app_part/release/linux/app/mujina_display_startup.sh"
 shutil.copy2(src_startup, dst_startup)
 os.chmod(dst_startup, 0o755)
 
-src_button = "/home/grant/nano3s-build/nano-mujina/fb_hijack/target/riscv64gc-unknown-linux-gnu/release/fb_button"
+src_button = os.path.join(WORKSPACE_ROOT, "fb_hijack/target/riscv64gc-unknown-linux-gnu/release/fb_button")
 dst_button = "/home/grant/udisk_build/rootfs_extracted/248013053/ubi_app_part/release/linux/app/fb_button"
 shutil.copy2(src_button, dst_button)
 os.chmod(dst_button, 0o755)

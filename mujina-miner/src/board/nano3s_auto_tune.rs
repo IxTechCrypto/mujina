@@ -736,10 +736,13 @@ pub(crate) fn backstop_freqs(cur: [u32; 4]) -> [u32; 4] {
     out
 }
 
-/// Builds tuner [`Metrics`] from the worker's readings. `None` when the chain
-/// reports no usable temperature or power (not hashing yet), so the tuner is
-/// not fed zeros. `ghsspd_gh` is GH/s; `fail_rate_pct` is `spd_dh` passed
-/// through.
+/// Builds tuner [`Metrics`] from the worker's readings. Returns `None` when
+/// power is absent (`<= 0`), or when hashing (`ghsspd_gh > 0`) without a valid
+/// temperature (`<= 0`). When the chain is stalled (`ghsspd_gh == 0`, e.g.
+/// UART brown-out reporting `0.0 C`) with valid power, emits `0.0 TH/s`
+/// metrics so `AutoTuner` can count stall ticks and recover instead of
+/// freezing at `AVG 0/20`. `ghsspd_gh` is GH/s; `fail_rate_pct` is `spd_dh`
+/// passed through.
 pub(crate) fn metrics_from_readings(
     temp_max_c: f32,
     power_w: f64,
@@ -748,11 +751,22 @@ pub(crate) fn metrics_from_readings(
     voltage_mv: u32,
     fail_rate_pct: f32,
 ) -> Option<Metrics> {
-    if !(temp_max_c > 0.0) || !(power_w > 0.0) {
+    if !(power_w > 0.0) {
         return None;
     }
+    let asic_temp_c = if ghsspd_gh > 0 {
+        if !(temp_max_c > 0.0) {
+            return None;
+        }
+        temp_max_c
+    } else {
+        if !temp_max_c.is_finite() {
+            return None;
+        }
+        temp_max_c.max(0.0)
+    };
     Some(Metrics {
-        asic_temp_c: temp_max_c,
+        asic_temp_c,
         power_w: power_w as f32,
         hashrate_ths: ghsspd_gh as f32 / 1000.0,
         frequency_mhz: freq0_mhz as f32,
@@ -1941,5 +1955,54 @@ mod tests {
 
         let t = cali_recovery_point(TuneChoice::Target(TuneTarget::Power(140.0)), &env, Some(&cali)).unwrap();
         assert_eq!(t.frequency_mhz, cali[2].mhz as f32);
+    }
+
+    #[test]
+    fn metrics_allow_stalled_chain_zero_temp_and_recover_from_undervolt_collapse() {
+        // Stalled chain (0 GH/s) with 0.0 C (UART brown-out) and valid power
+        // still builds 0.0 TH/s metrics so the tuner can advance AVG ticks.
+        let stalled = metrics_from_readings(0.0, 55.0, 0, 338, 3522, 0.0).unwrap();
+        assert_eq!(stalled.hashrate_ths, 0.0);
+        assert_eq!(stalled.asic_temp_c, 0.0);
+        assert_eq!(stalled.power_w, 55.0);
+
+        // Hashing (ghsspd_gh > 0) without a valid temp, or non-finite temp, stays None.
+        assert!(metrics_from_readings(0.0, 55.0, 4000, 338, 3522, 0.0).is_none());
+        assert!(metrics_from_readings(f32::NAN, 55.0, 0, 338, 3522, 0.0).is_none());
+
+        // Establish `best` at 338 MHz @ 3626 mV under Efficient, triggering a trim step down.
+        let mut o = AutoTune::new();
+        o.enable(TuneProfile::Efficient);
+        let good = metrics_from_readings(60.0, 80.0, 4500, 338, 3626, 2.0).unwrap();
+        let mut trim_mv = None;
+        for _ in 0..AUTO_TUNE_SETTLE_CYCLES {
+            for cmd in o.evaluate(&good) {
+                if let AutoTuneCmd::SetVoltage(mv) = cmd {
+                    trim_mv = Some(mv as u32);
+                }
+            }
+        }
+        let trim_mv = trim_mv.expect("Efficient should trim voltage after recording best");
+        assert!(trim_mv < 3626);
+
+        // Undervolt collapse drops UART telemetry (temp_max_c = 0.0, ghsspd_gh = 0):
+        // averaging_progress must advance rather than freeze at 0/20, and revert
+        // to best (3626 mV) after one settle window.
+        let collapse = metrics_from_readings(0.0, 55.0, 0, 338, trim_mv, 0.0).unwrap();
+        let mut reverted = None;
+        for tick in 1..=AUTO_TUNE_SETTLE_CYCLES {
+            for cmd in o.evaluate(&collapse) {
+                if let AutoTuneCmd::SetVoltage(mv) = cmd {
+                    reverted = Some(mv);
+                }
+            }
+            if tick < AUTO_TUNE_SETTLE_CYCLES {
+                o.publish(None);
+                let prog = read_status().averaging_progress.unwrap();
+                assert_eq!(prog.ticks, tick);
+                assert_eq!(prog.needed, AUTO_TUNE_SETTLE_CYCLES);
+            }
+        }
+        assert_eq!(reverted, Some(3626));
     }
 }

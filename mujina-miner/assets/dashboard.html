@@ -2840,8 +2840,7 @@ async function applyOwner() {
     profile: enabled ? v : null,
     board_name: name
   };
-    if (enabled) {
-    body.per_chip = true; // Profiles inherently include per-chip tuning
+  if (enabled) {
     body.continuous = newContinuous;
   }
 

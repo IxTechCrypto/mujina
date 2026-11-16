@@ -588,6 +588,7 @@ fn env_enabled() -> bool {
 #[cfg(all(feature = "nano3s", target_arch = "riscv64"))]
 mod companion_binaries {
     use std::fs;
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     use tracing::{error, info, warn};
@@ -602,14 +603,35 @@ mod companion_binaries {
         "/../fb_hijack/target/riscv64gc-unknown-linux-gnu/release/fb_button"
     ));
 
+    const EMBEDDED_RTOS_CORE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../rtos_core/build/rtos_core.elf"
+    ));
+
+    const EMBEDDED_STARTUP_SH: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../deploy/mujina_display_startup.sh"
+    ));
+
     pub fn sync_companion_binaries() {
-        sync_one("/data/nano3s_ui", EMBEDDED_NANO3S_UI, "nano3s_ui");
-        sync_one("/mntapp/release/linux/app/fb_button", EMBEDDED_FB_BUTTON, "fb_button");
+        sync_one("/data/nano3s_ui", EMBEDDED_NANO3S_UI, Some("nano3s_ui"));
+        sync_one("/mntapp/release/linux/app/fb_button", EMBEDDED_FB_BUTTON, Some("fb_button"));
+        sync_one(
+            "/mntapp/release/linux/app/mujina_display_startup.sh",
+            EMBEDDED_STARTUP_SH,
+            None,
+        );
+        if sync_one("/mntapp/release/rtt/rtos_core.elf", EMBEDDED_RTOS_CORE, None) {
+            info!("Updated /mntapp/release/rtt/rtos_core.elf; rebooting to load updated Core 1 firmware...");
+            let _ = fs::write("/sharefs/reboot_request", "rtos_core_updated\n");
+            let _ = Command::new("sync").status();
+            let _ = Command::new("/sbin/reboot").arg("-f").status();
+        }
     }
 
-    fn sync_one(live_path: &str, embedded: &[u8], proc_name: &str) {
+    fn sync_one(live_path: &str, embedded: &[u8], proc_name: Option<&str>) -> bool {
         if embedded.is_empty() {
-            return;
+            return false;
         }
         let needs_update = match fs::read(live_path) {
             Ok(existing) => existing != embedded,
@@ -617,15 +639,22 @@ mod companion_binaries {
         };
 
         if !needs_update {
-            return;
+            return false;
         }
 
         info!("Companion binary {} needs update ({} bytes). Staging...", live_path, embedded.len());
         let staged_path = format!("{}.new", live_path);
-        if let Err(e) = fs::write(&staged_path, embedded) {
-            error!("Failed to write staged {}: {}", staged_path, e);
+        let write_res = (|| -> std::io::Result<()> {
+            let mut file = fs::File::create(&staged_path)?;
+            file.write_all(embedded)?;
+            file.flush()?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            error!("Failed to write/sync staged {}: {}", staged_path, e);
             let _ = fs::remove_file(&staged_path);
-            return;
+            return false;
         }
 
         if let Err(e) = fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o755)) {
@@ -635,13 +664,18 @@ mod companion_binaries {
         if let Err(e) = fs::rename(&staged_path, live_path) {
             error!("Failed to rename {} to {}: {}", staged_path, live_path, e);
             let _ = fs::remove_file(&staged_path);
-            return;
+            return false;
         }
 
-        info!("Successfully installed new companion binary at {}. Restarting process...", live_path);
-        // Kill existing process so supervisor restarts it with the new binary
-        let _ = Command::new("killall").arg("-9").arg(proc_name).status();
-        let _ = Command::new("pkill").arg("-9").arg("-f").arg(proc_name).status();
+        if let Some(proc_name) = proc_name {
+            info!("Successfully installed new companion binary at {}. Restarting process...", live_path);
+            // Kill existing process so supervisor restarts it with the new binary
+            let _ = Command::new("killall").arg("-9").arg(proc_name).status();
+            let _ = Command::new("pkill").arg("-9").arg("-f").arg(proc_name).status();
+        } else {
+            info!("Successfully installed new companion file at {}.", live_path);
+        }
+        true
     }
 }
 
@@ -1692,15 +1726,55 @@ fn persist_auto_tune_profile(profile: Option<TuneChoice>) {
     update_tuning_conf(|cfg| cfg.auto_tune_profile = profile);
 }
 
+/// Stops any active per-chip tuner, zeroes per-chip clock offsets in
+/// firmware and `tuning.conf`, and clears per-chip tuner UI state.
+fn reset_chip_tuning_to_zero(
+    auto_tuner: &mut AutoTune,
+    chip_tuner: &mut Option<ChipTuner>,
+    chip_offset_mhz: &mut [i16; CHIP_COUNT],
+    persisted_chip_offsets: &mut [i16; CHIP_COUNT],
+    persisted_tuning: &mut PersistedTuning,
+    why: &str,
+) {
+    if let Some(mut ct) = chip_tuner.take() {
+        ct.interrupt();
+    }
+    let zeros = [0i16; CHIP_COUNT];
+    send_chip_offsets(zeros, chip_offset_mhz, why);
+    *persisted_chip_offsets = zeros;
+    persisted_tuning.chip_tune = false;
+    auto_tuner.set_chip_status(None);
+    update_tuning_conf(|cfg| {
+        cfg.chip_offset_mhz = None;
+        cfg.chip_tune = false;
+    });
+}
+
 /// Turns the AutoTune off because a manual/aadhi control took over.
-/// Hands the fan back to auto if the tuner had forced it to 100 %.
-fn disable_auto_tune_for_manual(auto_tuner: &mut AutoTune, why: &str) {
+/// Hands the fan back to auto if the tuner had forced it to 100 %,
+/// and clears any per-chip offsets / chip tuning state.
+fn disable_auto_tune_for_manual(
+    auto_tuner: &mut AutoTune,
+    chip_tuner: &mut Option<ChipTuner>,
+    chip_offset_mhz: &mut [i16; CHIP_COUNT],
+    persisted_chip_offsets: &mut [i16; CHIP_COUNT],
+    persisted_tuning: &mut PersistedTuning,
+    why: &str,
+) {
     if !auto_tuner.is_enabled() {
         return;
     }
     if let Some(AutoTuneCmd::Fan(t)) = auto_tuner.disable() {
         write_harness_control(t);
     }
+    reset_chip_tuning_to_zero(
+        auto_tuner,
+        chip_tuner,
+        chip_offset_mhz,
+        persisted_chip_offsets,
+        persisted_tuning,
+        why,
+    );
     persist_auto_tune_profile(None);
     auto_tuner.publish(None);
     eprintln!("[nano3s] auto-tune: disabled by {why}");
@@ -1752,6 +1826,7 @@ fn apply_auto_tune_directive_to_conf(cfg: &mut PersistedTuning, d: &auto_tune::A
         Some(None) => {
             cfg.auto_tune_profile = None;
             cfg.chip_tune = false;
+            cfg.chip_offset_mhz = None;
         }
         None => {}
     }
@@ -3361,13 +3436,14 @@ fn run_worker(
                         if let Some(AutoTuneCmd::Fan(t)) = auto_tuner.disable() {
                             write_harness_control(t);
                         }
-                        if let Some(ct) = chip_tuner.take() {
-                            let start = stop_chip_tuner(ct, &mut chip_offset_mhz);
-                            persisted_chip_offsets = start;
-                        }
-                        persist_chip_tune(false);
-                        persisted_tuning.chip_tune = false;
-                        auto_tuner.set_chip_status(None);
+                        reset_chip_tuning_to_zero(
+                            &mut auto_tuner,
+                            &mut chip_tuner,
+                            &mut chip_offset_mhz,
+                            &mut persisted_chip_offsets,
+                            &mut persisted_tuning,
+                            "auto-tune disabled",
+                        );
                         persist_auto_tune_profile(None);
                         auto_tuner.publish(None);
                         eprintln!("[nano3s] auto-tune: disabled via dashboard/API");
@@ -3384,7 +3460,14 @@ fn run_worker(
                     persist_autotune_hashrate_target(None);
                     eprintln!("[nano3s] autotune: disabled by manual tune command");
                 }
-                disable_auto_tune_for_manual(&mut auto_tuner, "manual tune command");
+                disable_auto_tune_for_manual(
+                    &mut auto_tuner,
+                    &mut chip_tuner,
+                    &mut chip_offset_mhz,
+                    &mut persisted_chip_offsets,
+                    &mut persisted_tuning,
+                    "manual tune command",
+                );
                 // See write_tuning_command()'s doc comment for the exact
                 // "always 7 fields" wire format this expects.
                 let fields: Vec<&str> = s["tune:".len()..].split(',').collect();
@@ -3467,7 +3550,14 @@ fn run_worker(
                             // rather than waiting out the old interval.
                             next_power_check = std::time::Instant::now();
                             eprintln!("[nano3s] power-target: live target set to {w:.1}W via dashboard/API");
-                            disable_auto_tune_for_manual(&mut auto_tuner, "manual power-target command");
+                            disable_auto_tune_for_manual(
+                                &mut auto_tuner,
+                                &mut chip_tuner,
+                                &mut chip_offset_mhz,
+                                &mut persisted_chip_offsets,
+                                &mut persisted_tuning,
+                                "manual power-target command",
+                            );
                         }
                         Err(_) => eprintln!("[nano3s] malformed power_target directive: {s}"),
                     }
@@ -3508,7 +3598,14 @@ fn run_worker(
                             }
                             temp_target_c = Some(c);
                             eprintln!("[nano3s] temp-target: live target set to {c:.1}C via dashboard/API");
-                            disable_auto_tune_for_manual(&mut auto_tuner, "manual temp-target command");
+                            disable_auto_tune_for_manual(
+                                &mut auto_tuner,
+                                &mut chip_tuner,
+                                &mut chip_offset_mhz,
+                                &mut persisted_chip_offsets,
+                                &mut persisted_tuning,
+                                "manual temp-target command",
+                            );
                         }
                         Err(_) => eprintln!("[nano3s] malformed temp_target directive: {s}"),
                     }
@@ -3534,7 +3631,14 @@ fn run_worker(
                             // that the manual-command guard mistook for
                             // a real user command and used to disable
                             // autotune again.
-                            disable_auto_tune_for_manual(&mut auto_tuner, "manual autotune-hashrate command");
+                            disable_auto_tune_for_manual(
+                                &mut auto_tuner,
+                                &mut chip_tuner,
+                                &mut chip_offset_mhz,
+                                &mut persisted_chip_offsets,
+                                &mut persisted_tuning,
+                                "manual autotune-hashrate command",
+                            );
                             power_target_w = None;
                             temp_target_c = None;
                             persist_tuning_clear_power_target();
@@ -4752,6 +4856,20 @@ mod tests {
                 .expect("valid target directive");
         apply_auto_tune_directive_to_conf(&mut cfg, &parsed_target);
         assert_eq!(cfg.auto_tune_profile, Some(TuneChoice::Target(TuneTarget::Power(140.0))));
+        assert!(!cfg.chip_tune);
+        assert_eq!(cfg.chip_offset_mhz, None);
+
+        // Disabling AutoTune (`auto_tune:off`) also clears persisted chip offsets
+        // and disables per-chip tuning so a restart cannot send cmd=12.
+        cfg.chip_offset_mhz = Some([-30; CHIP_COUNT]);
+        cfg.chip_tune = true;
+        let off_line = build_auto_tune_directive(Some(None), None, None, None);
+        assert_eq!(off_line, "auto_tune:off;chip=off");
+        let parsed_off =
+            auto_tune::parse_auto_tune_directive(off_line.strip_prefix("auto_tune:").unwrap())
+                .expect("valid off directive");
+        apply_auto_tune_directive_to_conf(&mut cfg, &parsed_off);
+        assert_eq!(cfg.auto_tune_profile, None);
         assert!(!cfg.chip_tune);
         assert_eq!(cfg.chip_offset_mhz, None);
     }
