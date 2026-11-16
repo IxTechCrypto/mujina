@@ -627,11 +627,6 @@ mod companion_binaries {
             None,
         );
         sync_one("/data/ble_setup", EMBEDDED_BLE_SETUP, Some("ble_setup"));
-        if let Ok(curr_page) = fs::read_to_string("/mntapp/release/linux/app/fb_page")
-            && curr_page.trim() == "wifi-setup"
-        {
-            let _ = fs::write("/mntapp/release/linux/app/fb_page", "nano3s");
-        }
         if sync_one("/mntapp/release/rtt/rtos_core.elf", EMBEDDED_RTOS_CORE, None) {
             info!("Updated /mntapp/release/rtt/rtos_core.elf; rebooting to load updated Core 1 firmware...");
             let _ = fs::write("/sharefs/reboot_request", "rtos_core_updated\n");
