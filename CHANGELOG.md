@@ -6,6 +6,9 @@
   - Scaled the instantaneous PSU safety trip per mode (`min(caps.power_w * 1.03, power_safety_w)`) and added window-mean over-cap backoff so warmup spikes do not prematurely throttle clocks while preserving per-profile limits on `Balanced`/`Quiet`.
   - Automatically resets all 12 per-chip frequency offsets (`[0; 12]`) and defaults `per_chip` tuning (`chip_tune`) to `OFF` whenever switching profiles or targets, with per-tick IPC retry until hardware acknowledges zeroed offsets.
   - Added a one-time `'warmup stall unresolved after 2 re-inits'` event when the chain stays stalled after two `ReinitChain` attempts.
+  - Allowed stalled chain telemetry (`0 GH/s`, valid power, `temp_max = 0.0°C` during UART brown-outs) to emit `0.0 TH/s` metrics so `AutoTuner` advances `AVG x/20`, reverts to best, and triggers `ReinitChain` instead of freezing at `AVG 0/20`.
+  - Cleared persisted `chip_offset_mhz` and `chip_tune` when disabling AutoTune (`auto_tune:off`) or switching to manual tuning (`tune:` / power-target / temp-target / autotune-hashrate).
+  - Embedded and auto-provisioned `rtos_core.elf` (`sha256: 2e88ff5f2b58acbe3761a1ab083ad3c46b89b296f7491f05ca1e0970717299d1`, built from `86a64eb`) and `deploy/mujina_display_startup.sh` in `companion_binaries::sync_companion_binaries()` with `sync_all()` and a one-time reboot (`/sharefs/reboot_request` + `/sbin/reboot -f`) when `rtos_core.elf` is updated on disk during OTA bundle upgrades.
 - **Manual Fan Arbitration & Thermal Breach Safety (`nano3s.rs`, `nano3s_auto_tune.rs`)**:
   - `PATCH /api/v0/boards/{name}/fan` with `mode: "manual"` pauses the AutoTune chip-temp fan PI loop below the thermal cap so it no longer clobbers manual fan settings on `/tmp/harness_control`.
   - Closed the loop-top race between concurrent API fan writes and `fan_tick()` by syncing `MANUAL_FAN_DUTY` at loop top and before `fan_tick()` and re-asserting `fan:manual,<duty>` on changes.
@@ -14,6 +17,8 @@
   - Raised manual tuning bounds in `PATCH /api/v0/boards/{name}/tuning` to match `NANO3S_ENVELOPE` (`3912 mV` max voltage, `580 MHz` max PLL domain) and rejected the forbidden `3600 mV` grid point.
   - Added `autocomplete="off"` and non-email `name` attributes to numeric tuning inputs in `dashboard.html`.
   - Redesigned `body.theme-parasite` CSS in `dashboard.html` to single `1px solid #d4d4d4` borders matching `Parasite.space`.
+  - Removed unconditional `body.per_chip = true` from `applyOwner()` in `dashboard.html` so profile switches honor the backend `per_chip: false` default.
+  - Updated empty tuner event log placeholder in `dashboard.html` (`warmupText`) to explain why the chain is not hashing (`"No status from the hash chain..."` when Core 1 `input_v` is missing on Nano 3S, `"Not hashing (0 GH/s)..."` at `0 GH/s`, or `"Warming up…"`).
 - **Direction A Theme-Synced Circular LCD UI & Live Display API (`api/v0.rs`, `nano3s.rs`, `fb_button.rs`, `nano3s_ui`)**:
   - Added `GET /api/v0/display` and `PATCH /api/v0/display` (returning `400 Bad Request` vs `500 Internal Server Error`, atomically persisted with `sync_all()` to `/data/userconfig/theme.conf` and `/tmp/ui_theme`) synced live with the dashboard `#uitheme` selector (`cyberpunk`, `minimal`, `parasite`).
   - Re-themed all `240x240` circular LCD screens (`mujina-logo` splash, `nano3s` main mining stats, `nano3s-tuner` 12-chip thermal corona, `ip` network/RSSI screen, Parasite-only `parasite-logo` screen after `ip`, and shared `plasma` Bitcoin Plasma disk across all themes; removed `nano3s-diag` and `pizza`).
