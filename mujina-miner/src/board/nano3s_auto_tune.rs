@@ -502,6 +502,12 @@ pub(crate) const FAN_KD: f32 = 1.5;
 pub(crate) const FAN_MIN_WRITE_DELTA: u8 = 3;
 /// A forced-full episode ends only once the die is this far under the cap.
 pub(crate) const FAN_RELEASE_C: f32 = 5.0;
+/// Degrees C above `cap` before `fan_step` and `AutoTune::evaluate` latch
+/// an immediate 100 % emergency fan blast (`hold_full` / `SetFanFull`).
+/// Between `cap` and `cap + FAN_FULL_OVER_CAP_C` (e.g. 90.0..93.0 C on
+/// Balanced), the fan steps up proportionally (+5 % min per tick) instead
+/// of jumping straight from ~28 % to 100 %.
+pub(crate) const FAN_FULL_OVER_CAP_C: f32 = 3.0;
 /// Default target = profile temp cap minus this.
 pub(crate) const FAN_TARGET_BELOW_CAP_C: f32 = 5.0;
 const TEMP_PLAUSIBLE_MAX_C: f32 = 150.0;
@@ -574,14 +580,17 @@ fn plausible(temp: Option<f32>) -> Option<f32> {
 ///
 /// Safety rules, in priority order:
 /// - temp missing or implausible (<= 0, > 150, NaN): 100 %.
-/// - `force_full` (tuner SetFanFull) or temp >= `cap`: 100 % and held there
-///   until temp < `cap` - 5 C, then resumes at `pre_full_duty + 8 %` (clamped
-///   35..80 %) to avoid over-cooling the die by 20 C.
+/// - `force_full` (tuner SetFanFull) or temp >= `cap + FAN_FULL_OVER_CAP_C`:
+///   100 % and held there until temp < `cap` - 5 C, then resumes at
+///   `pre_full_duty + 8 %` (clamped 35..80 %) to avoid over-cooling the die by 20 C.
 /// - otherwise PD/I control with dT/dt damping:
-///   - When temperature is rising rapidly (`dt > 0.5 C`) within 6 C of target,
-///     inhibits downward fan steps and adds `FAN_KD * dt` pre-boost.
-///   - Within `10 C` below target, caps downward step rate to `-6 %` per tick
-///     so the fan settles into steady-state equilibrium instead of crashing to 20 %.
+///   - Between `cap` and `cap + FAN_FULL_OVER_CAP_C`, boosts proportionally
+///     (minimum +5 % per tick, capped +20 %/tick) rather than jumping to 100 %.
+///   - When temperature is rising (`dt > 0.25 C/tick`) within 6 C of target,
+///     inhibits downward fan steps and adds proactive pre-ramp boost.
+///   - Within `4.5 C` below target, caps downward step rate to `-3 %` per tick
+///     and holds a `28 %` floor (when target >= 80 C) so the fan settles at
+///     equilibrium instead of dumping to 20 % and bouncing over cap.
 pub(crate) fn fan_step(st: &mut FanState, temp: Option<f32>, cap: f32, target: f32, force_full: bool) -> Option<u8> {
     let t = plausible(temp);
     if force_full && !st.hold_full {
@@ -599,7 +608,7 @@ pub(crate) fn fan_step(st: &mut FanState, temp: Option<f32>, cap: f32, target: f
             let dt = st.prev_temp.map_or(0.0, |prev| t - prev);
             st.prev_temp = Some(t);
 
-            if t >= cap {
+            if t >= cap + FAN_FULL_OVER_CAP_C {
                 if !st.hold_full && st.sent.is_some() && st.duty < 95.0 {
                     st.pre_full_duty = Some(st.duty);
                 }
@@ -613,30 +622,45 @@ pub(crate) fn fan_step(st: &mut FanState, temp: Option<f32>, cap: f32, target: f
             if st.hold_full {
                 st.duty = 100.0;
             } else if t >= cap - 2.0 {
-                // Pre-emptive boost: within 2 C of thermal cap, ramp fan duty aggressively
-                // plus derivative rate-of-rise damping to arrest temperature before hitting cap.
+                // Pre-emptive boost: within 2 C of thermal cap (and up to
+                // cap + FAN_FULL_OVER_CAP_C), ramp fan duty proportionally plus
+                // derivative rate-of-rise damping instead of slamming 100 %.
                 let d_boost = if dt > 0.0 { FAN_KD * dt } else { 0.0 };
-                st.duty = (st.duty + FAN_KP * 2.5 * (t - target) + d_boost).clamp(FAN_DUTY_MIN, 100.0);
+                let raw_boost = FAN_KP * 2.5 * (t - target).max(0.0) + d_boost;
+                let step = if t >= cap {
+                    raw_boost.clamp(5.0, 20.0)
+                } else {
+                    raw_boost.min(15.0)
+                };
+                st.duty = (st.duty + step).clamp(FAN_DUTY_MIN, 100.0);
             } else if t >= target {
                 let d_boost = if dt > 0.0 { FAN_KD * dt } else { 0.0 };
                 st.duty = (st.duty + FAN_KP * (t - target) + d_boost).clamp(FAN_DUTY_MIN, 100.0);
-            } else if dt > 0.5 && t >= target - 6.0 {
-                // Temperature is below target but actively rising toward it: hold/pre-ramp
-                // rather than cutting airflow right into a rising thermal wave.
-                st.duty = (st.duty + FAN_KD * dt).clamp(FAN_DUTY_MIN, 100.0);
+            } else if dt > 0.25 && t >= target - 6.0 {
+                // Temperature is below target but actively rising toward it: pre-ramp
+                // proportionally to dT/dt so the fan catches the thermal wave before
+                // overshooting target.
+                let step = if dt > 0.5 { FAN_KD * dt } else { (FAN_KD * dt).max(1.5) };
+                st.duty = (st.duty + step).clamp(FAN_DUTY_MIN, 100.0);
             } else if dt > 0.05 {
-                // Temperature is rising (slowly near target or rebounding after cool-down):
-                // never cut fan duty into a positive dT/dt wave; pre-ramp if rebounding fast.
+                // Slowly rising (or rebounding far below target): hold duty (never
+                // cut airflow into a positive dT/dt wave); pre-ramp if rebounding fast.
                 if dt > 1.5 {
                     st.duty = (st.duty + 0.5 * FAN_KD * dt).clamp(FAN_DUTY_MIN, 100.0);
                 }
             } else {
-                // Cooling or flat below target: cap step-down rate when within 8 C of target
+                // Cooling or flat below target: cap step-down rate near target
                 // so the fan settles at steady-state equilibrium instead of crashing to 20 %.
-                // Maintain a 28 % floor when within 2.5 C of a high target (>= 80 C).
+                // Maintain a 28 % floor when within 4.5 C of a high target (>= 80 C).
                 let raw_step = FAN_KP * (t - target);
-                let step = if t > target - 8.0 { raw_step.max(-6.0) } else { raw_step };
-                let floor = if target >= 80.0 && t >= target - 2.5 {
+                let step = if t >= target - 4.5 {
+                    raw_step.max(-3.0)
+                } else if t > target - 8.0 {
+                    raw_step.max(-6.0)
+                } else {
+                    raw_step
+                };
+                let floor = if target >= 80.0 && t >= target - 4.5 {
                     28.0_f32.min(st.duty)
                 } else {
                     FAN_DUTY_MIN
@@ -1190,8 +1214,18 @@ impl AutoTune {
     }
 
     pub(crate) fn evaluate(&mut self, m: &Metrics) -> Vec<AutoTuneCmd> {
-        let action = self.tuner.evaluate(m);
+        let mut adjusted = *m;
+        if self.manual_fan_duty.is_none()
+            && m.asic_temp_c < self.tuner.temp_cap_c() + FAN_FULL_OVER_CAP_C
+        {
+            adjusted.fan_auto = Some(true);
+            adjusted.fan_min_percent = Some(self.fan.duty_percent());
+        }
+        let action = self.tuner.evaluate(&adjusted);
         match action {
+            Some(TuneAction::SetFanMinPercent(pct)) => {
+                self.fan.duty = self.fan.duty.max(pct as f32);
+            }
             Some(TuneAction::SetFanFull) => self.fan_force_pending = true,
             Some(TuneAction::RestoreFanAuto) => self.fan_restore_pending = true,
             _ => {}
@@ -1540,17 +1574,20 @@ mod tests {
     #[test]
     fn fan_hot_sample_goes_to_100_and_holds_until_cap_minus_5() {
         let mut st = st_at(40.0);
-        assert_eq!(fan_step(&mut st, Some(85.0), 85.0, 80.0, false), Some(100)); // temp >= cap, saves pre_full_duty=40
+        // Mild over-cap (85.5 < 85 + 3): steps up proportionally (+20 capped) instead of jumping to 100 %.
+        assert_eq!(fan_step(&mut st, Some(85.5), 85.0, 80.0, false), Some(60));
+        // Severe over-cap (>= cap + 3.0 = 88.0): saves pre_full_duty=60 and latches 100 %.
+        assert_eq!(fan_step(&mut st, Some(88.0), 85.0, 80.0, false), Some(100));
         // Cooled to 82 (< cap but not < cap-5): still held at 100.
         assert_eq!(fan_step(&mut st, Some(82.0), 85.0, 80.0, false), None);
         assert_eq!(st.duty_percent(), 100);
-        // 79.0 < 80: released, resumes from pre_full_duty (40 + 8 = 48) - 2 = 46 instead of staying at 98!
-        assert_eq!(fan_step(&mut st, Some(79.0), 85.0, 80.0, false), Some(46));
-        assert_eq!(st.duty_percent(), 46);
-        // Further cooling to 75 (5 C below target, inside 8 C band) steps down by -6 % (capped) to 40 %.
-        assert_eq!(fan_step(&mut st, Some(75.0), 85.0, 80.0, false), Some(40));
-        // Rising temperature (75 -> 78, +3 C/tick inside 6 C below target) pre-boosts by +4.5 % to 45 %!
-        assert_eq!(fan_step(&mut st, Some(78.0), 85.0, 80.0, false), Some(45));
+        // 79.0 < 80: released, resumes from pre_full_duty (60 + 8 = 68) - 2 = 66 instead of staying at 98!
+        assert_eq!(fan_step(&mut st, Some(79.0), 85.0, 80.0, false), Some(66));
+        assert_eq!(st.duty_percent(), 66);
+        // Further cooling to 75 (5 C below target, inside 8 C band) steps down by -6 % (capped) to 60 %.
+        assert_eq!(fan_step(&mut st, Some(75.0), 85.0, 80.0, false), Some(60));
+        // Rising temperature (75 -> 78, +3 C/tick inside 6 C below target) pre-boosts by +4.5 % to 65 %!
+        assert_eq!(fan_step(&mut st, Some(78.0), 85.0, 80.0, false), Some(65));
     }
 
     #[test]
@@ -1631,20 +1668,46 @@ mod tests {
     #[test]
     fn tuner_temp_breach_routes_through_the_fan_loop() {
         let mut o = AutoTune::new();
-        o.enable(TuneProfile::Efficient); // temp cap 80
+        o.enable(TuneProfile::Efficient); // temp cap 80, full latch >= 83
         o.fan_tick(Some(70.0));
         o.fan.duty = 40.0;
         o.fan.sent = Some(40);
-        // 81 C breaches: the core asks for SetFanFull; no harness cmd from
-        // evaluate itself, the fan loop writes 100.
+        // Mild over-cap (81 C < 83 C): core asks for SetFanMinPercent(45),
+        // fan_tick ramps smoothly (< 100) instead of slamming 100 %.
         assert!(o.evaluate(&fan_metrics(81.0)).is_empty());
-        assert_eq!(o.fan_tick(Some(81.0)), Some(AutoTuneCmd::FanManual(100)));
+        assert!(matches!(
+            o.fan_tick(Some(81.0)),
+            Some(AutoTuneCmd::FanManual(d)) if d >= 45 && d < 100
+        ));
+        // Severe over-cap (83.5 C >= 83 C): forces 100 % and holds until < 75 C.
+        assert!(o.evaluate(&fan_metrics(83.5)).is_empty());
+        assert_eq!(o.fan_tick(Some(83.5)), Some(AutoTuneCmd::FanManual(100)));
         // 76 C: under the cap but inside the release band -> stays 100.
         assert_eq!(o.fan_tick(Some(76.0)), None);
         assert_eq!(o.fan.duty_percent(), 100);
         // 60 C: released, PI ramps down from 100 (target 68).
         o.fan_tick(Some(60.0));
         assert!(o.fan.duty_percent() < 100);
+    }
+
+    #[test]
+    fn fan_step_gradually_ramps_on_rising_temp_and_mild_cap_overshoot_without_100_jump() {
+        // Reproduces .37 Balanced (target 88.0 C, cap 90.0 C): a small cool dip
+        // must not dump duty below 28 %, rising temps below target must ramp up
+        // proactively, and 90.1 C must step up smoothly instead of hitting 100 %.
+        let mut st = st_at(30.0);
+        assert_eq!(fan_step(&mut st, Some(85.1), 90.0, 88.0, false), None);
+        assert_eq!(st.duty_percent(), 28);
+
+        assert_eq!(fan_step(&mut st, Some(85.8), 90.0, 88.0, false), None); // +1.05 -> 29.05
+        assert_eq!(fan_step(&mut st, Some(86.2), 90.0, 88.0, false), None); // +1.5  -> 30.55
+        assert_eq!(fan_step(&mut st, Some(86.6), 90.0, 88.0, false), None); // +1.5  -> 32.05
+        assert_eq!(fan_step(&mut st, Some(87.0), 90.0, 88.0, false), Some(34));
+        assert_eq!(fan_step(&mut st, Some(88.4), 90.0, 88.0, false), Some(38));
+
+        let at_90_1 = fan_step(&mut st, Some(90.1), 90.0, 88.0, false);
+        assert!(matches!(at_90_1, Some(d) if (45..80).contains(&d)), "got {at_90_1:?}");
+        assert_eq!(fan_step(&mut st, Some(93.0), 90.0, 88.0, false), Some(100));
     }
 
     #[test]
