@@ -20,6 +20,9 @@ const BEEPER_DEV: &str = "/dev/input/event1";
 const EV_SYN: u16 = 0x00;
 const EV_SND: u16 = 0x12;
 const SND_TONE: u16 = 0x02;
+/// Global playback slow-down (7/5 = 1.4x longer notes).
+const TEMPO_NUM: u32 = 7;
+const TEMPO_DEN: u32 = 5;
 
 /// List of built-in melodies available for playback and testing.
 pub const AVAILABLE_TUNES: &[&str] = &[
@@ -140,7 +143,7 @@ fn run_buzzer_worker(rx: Receiver<BuzzerCmd>) {
                     }
 
                     // Sleep in responsive 20ms slices so user stop/switch is instant
-                    let mut remaining = note.duration_ms;
+                    let mut remaining = note.duration_ms * TEMPO_NUM / TEMPO_DEN;
                     while remaining > 0 {
                         let slice = remaining.min(20);
                         thread::sleep(Duration::from_millis(slice as u64));
