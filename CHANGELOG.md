@@ -1,6 +1,13 @@
 # Changelog
 
-## v5.1.0 (Staging — 2026-11-15)
+## v5.1.0 (2026-11-17)
+- **Core 1 Freeze Recovery, Silence Escalation & Stall Resilience (`nano3s.rs`, `nano3s_tuner_core.rs`, `nano3s_ipc_shim`)**:
+  - Implemented Core 1 status age and absence monitoring (`nano3s_ipc_has_received_status`, `nano3s_ipc_status_age_ms`). When Core 1 stops sending telemetry (>60s) or has never sent status (>180s), Core 0 immediately forces fan to 100% and skips AutoTune iterations.
+  - After 5 minutes of total Core 1 silence or stale status, escalates to `request_recovery_reboot("core1_stale_status")` with a 1-hour minimum suppression backoff to protect flash storage (`/data/userdata/nano/last_recovery_reboot`).
+  - Added deadlock resolution for stuck paused chains: tracks consecutive paused ticks, retries `resume_from_idle()` at tick 8 (~2 min), and escalates to recovery reboot at tick 20 (~5 min).
+  - Escalated `StallStage::GaveUp` in `nano3s_tuner_core.rs` (`TuneAction::RebootRecovery`) to trigger recovery reboot after 40 consecutive stalled ticks following 2 failed chain re-inits.
+  - Added reboot suppression log throttling (at most once per 60s) and call-site throttling to prevent console flooding.
+  - Added fan state restoration: on recovery from a stale episode, invalidates AutoTune fan cache (`invalidate_fan_cache()`) so the next tick immediately applies calculated thermal duty or restores manual duty.
 - **Auto-Tuner & Power Envelope (`mujina-miner/src/board/`)**:
   - Restored persistent target mode (`power:<W>` / `hashrate:<TH/s>`) across power cycles and added warm boot recovery from the last converged `SearchMemory` setpoint (`target_memory` in `/data/userconfig/tuning.conf`) via atomic `fsync` + rename writes.
   - Scaled the instantaneous PSU safety trip per mode (`min(caps.power_w * 1.03, power_safety_w)`) and added window-mean over-cap backoff so warmup spikes do not prematurely throttle clocks while preserving per-profile limits on `Balanced`/`Quiet`.
