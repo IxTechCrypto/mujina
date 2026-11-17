@@ -33,6 +33,7 @@ pub const AVAILABLE_TUNES: &[&str] = &[
     "sonic",
     "street_fighter",
     "star_trek",
+    "marines_hymn",
 ];
 
 enum BuzzerCmd {
@@ -509,6 +510,78 @@ pub fn get_tune_notes(name: &str) -> Option<Vec<SoundNote>> {
             SoundNote { freq_hz: 587, duration_ms: 400 },  // D5
             SoundNote { freq_hz: 466, duration_ms: 200 },  // Bb4
             SoundNote { freq_hz: 523, duration_ms: 1400 }, // C5 (heroic resolution)
+        ]),
+
+        "marines_hymn" | "marine_corps_hymn" => Some(vec![
+            // The Marines' Hymn ("From the Halls of Montezuma")
+            // Traditional / Jacques Offenbach (Geneviève de Brabant)
+            // Phrase 1: "From the Halls of Montezuma to the shores of Tripoli"
+            SoundNote { freq_hz: 392, duration_ms: 110 }, // G4 (From)
+            SoundNote { freq_hz: 392, duration_ms: 110 }, // G4 (the)
+            SoundNote { freq_hz: 523, duration_ms: 210 }, // C5 (Halls)
+            SoundNote { freq_hz: 659, duration_ms: 210 }, // E5 (of)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (Mon-)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (-te-)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (-zu-)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (-ma)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (to)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (the)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (shores)
+            SoundNote { freq_hz: 880, duration_ms: 210 }, // A5 (of)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (Tri-)
+            SoundNote { freq_hz: 659, duration_ms: 210 }, // E5 (-po-)
+            SoundNote { freq_hz: 523, duration_ms: 650 }, // C5 (-li;)
+            SoundNote { freq_hz: 0,   duration_ms: 80 },  // rest
+
+            // Phrase 2: "We fight our country's battles in the air, on land, and sea"
+            SoundNote { freq_hz: 392, duration_ms: 210 }, // G4 (We)
+            SoundNote { freq_hz: 523, duration_ms: 210 }, // C5 (fight)
+            SoundNote { freq_hz: 659, duration_ms: 210 }, // E5 (our)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (coun-)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (-try's)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (bat-)
+            SoundNote { freq_hz: 880, duration_ms: 210 }, // A5 (-tles)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (in)
+            SoundNote { freq_hz: 659, duration_ms: 210 }, // E5 (the)
+            SoundNote { freq_hz: 587, duration_ms: 210 }, // D5 (air,)
+            SoundNote { freq_hz: 659, duration_ms: 210 }, // E5 (on)
+            SoundNote { freq_hz: 698, duration_ms: 210 }, // F5 (land,)
+            SoundNote { freq_hz: 587, duration_ms: 210 }, // D5 (and)
+            SoundNote { freq_hz: 523, duration_ms: 650 }, // C5 (sea;)
+            SoundNote { freq_hz: 0,   duration_ms: 80 },  // rest
+
+            // Phrase 3: "First to fight for right and freedom, and to keep our honor clean"
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (First)
+            SoundNote { freq_hz: 659, duration_ms: 210 }, // E5 (to)
+            SoundNote { freq_hz: 523, duration_ms: 210 }, // C5 (fight)
+            SoundNote { freq_hz: 659, duration_ms: 210 }, // E5 (for)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (right)
+            SoundNote { freq_hz: 659, duration_ms: 210 }, // E5 (and)
+            SoundNote { freq_hz: 523, duration_ms: 210 }, // C5 (free-)
+            SoundNote { freq_hz: 659, duration_ms: 210 }, // E5 (-dom,)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (and)
+            SoundNote { freq_hz: 880, duration_ms: 210 }, // A5 (to)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (keep)
+            SoundNote { freq_hz: 659, duration_ms: 210 }, // E5 (our)
+            SoundNote { freq_hz: 587, duration_ms: 650 }, // D5 (ho-nor clean;)
+            SoundNote { freq_hz: 0,   duration_ms: 80 },  // rest
+
+            // Phrase 4: "We are proud to claim the title of United States Marine"
+            SoundNote { freq_hz: 392, duration_ms: 110 }, // G4 (We)
+            SoundNote { freq_hz: 392, duration_ms: 110 }, // G4 (are)
+            SoundNote { freq_hz: 523, duration_ms: 210 }, // C5 (proud)
+            SoundNote { freq_hz: 659, duration_ms: 210 }, // E5 (to)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (claim)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (the)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (ti-)
+            SoundNote { freq_hz: 880, duration_ms: 210 }, // A5 (-tle)
+            SoundNote { freq_hz: 784, duration_ms: 210 }, // G5 (of)
+            SoundNote { freq_hz: 659, duration_ms: 210 }, // E5 (U-)
+            SoundNote { freq_hz: 587, duration_ms: 210 }, // D5 (-ni-)
+            SoundNote { freq_hz: 659, duration_ms: 210 }, // E5 (-ted)
+            SoundNote { freq_hz: 698, duration_ms: 210 }, // F5 (States)
+            SoundNote { freq_hz: 587, duration_ms: 210 }, // D5 (Ma-)
+            SoundNote { freq_hz: 523, duration_ms: 1000 }, // C5 (-rine!)
         ]),
 
         _ => None,
