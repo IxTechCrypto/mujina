@@ -27,7 +27,8 @@ use crate::api_client::types::{
     BoardChipClocksRequest, BoardLedState, BoardPauseRequest, BoardPowerTargetRequest, BoardTelemetry,
     BoardTempTargetRequest, BoardTuningRequest, FanCurvePoint, FanCurveRequest, FanCurveResponse,
     FirmwareBundleResponse, FirmwareUploadResponse, MinerPatchRequest, MinerTelemetry,
-    PoolConfigRequest, PoolConfigResponse, PsuOverrideRequest, PsuStatusResponse, SourceTelemetry,
+    PoolConfigRequest, PoolConfigResponse, PsuOverrideRequest, PsuStatusResponse, SoundActionResponse,
+    SoundPlayRequest, SoundState, SourceTelemetry,
 };
 
 /// Upper bound on a firmware upload body -- generous headroom over the
@@ -63,6 +64,10 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(patch_board_pause))
         .routes(routes!(get_board_led, patch_board_led))
         .routes(routes!(get_display, patch_display))
+        .routes(routes!(get_sound))
+        .routes(routes!(post_sound_play))
+        .routes(routes!(post_sound_stop))
+        .routes(routes!(post_sound_mute))
         .routes(routes!(post_reboot))
         .routes(routes!(get_pool, patch_pool))
         .routes(routes!(post_firmware_upload))
@@ -2078,6 +2083,90 @@ async fn get_source(
         .cloned()
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Return the current buzzer / sound engine state.
+#[utoipa::path(
+    get,
+    path = "/sound",
+    tag = "miner",
+    responses(
+        (status = OK, description = "Current sound state", body = SoundState),
+    ),
+)]
+async fn get_sound() -> Json<SoundState> {
+    Json(crate::peripheral::buzzer::get_sound_state())
+}
+
+/// Play a named tune or custom note sequence.
+#[utoipa::path(
+    post,
+    path = "/sound/play",
+    tag = "miner",
+    request_body = SoundPlayRequest,
+    responses(
+        (status = OK, description = "Playback started", body = SoundActionResponse),
+        (status = BAD_REQUEST, description = "Invalid tune name or empty notes"),
+    ),
+)]
+async fn post_sound_play(
+    Json(req): Json<SoundPlayRequest>,
+) -> Result<Json<SoundActionResponse>, (StatusCode, String)> {
+    if let Some(tune) = req.tune {
+        crate::peripheral::buzzer::play_tune(&tune).map_err(|e| {
+            (StatusCode::BAD_REQUEST, format!("cannot play tune '{tune}': {e}"))
+        })?;
+        return Ok(Json(SoundActionResponse {
+            ok: true,
+            message: format!("Playing tune '{tune}'"),
+        }));
+    }
+    if let Some(notes) = req.notes {
+        if notes.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "notes list is empty".to_string()));
+        }
+        crate::peripheral::buzzer::play_notes(None, notes);
+        return Ok(Json(SoundActionResponse {
+            ok: true,
+            message: "Playing custom note sequence".to_string(),
+        }));
+    }
+    Err((StatusCode::BAD_REQUEST, "must provide 'tune' or 'notes'".to_string()))
+}
+
+/// Stop playback and silence the buzzer immediately.
+#[utoipa::path(
+    post,
+    path = "/sound/stop",
+    tag = "miner",
+    responses(
+        (status = OK, description = "Sound stopped", body = SoundActionResponse),
+    ),
+)]
+async fn post_sound_stop() -> Json<SoundActionResponse> {
+    crate::peripheral::buzzer::stop_sound();
+    Json(SoundActionResponse {
+        ok: true,
+        message: "Sound stopped".to_string(),
+    })
+}
+
+/// Set mute state on the buzzer.
+#[utoipa::path(
+    post,
+    path = "/sound/mute",
+    tag = "miner",
+    request_body = bool,
+    responses(
+        (status = OK, description = "Mute state updated", body = SoundActionResponse),
+    ),
+)]
+async fn post_sound_mute(Json(muted): Json<bool>) -> Json<SoundActionResponse> {
+    crate::peripheral::buzzer::set_mute(muted);
+    Json(SoundActionResponse {
+        ok: true,
+        message: format!("Mute set to {muted}"),
+    })
 }
 
 #[cfg(test)]
