@@ -3040,11 +3040,24 @@ fn request_recovery_reboot(reason: &str) {
     if let Ok(content) = std::fs::read_to_string(RECOVERY_REBOOT_MARKER) {
         if let Ok(last_reboot) = content.trim().parse::<u64>() {
             if now_secs > 0 && last_reboot > 0 && now_secs < last_reboot + RECOVERY_REBOOT_MIN_INTERVAL_SECS {
-                eprintln!(
-                    "[nano3s] recovery reboot requested ({reason}), but rate-limited: last recovery reboot was {}s ago (min {}s). Suppressing reboot.",
-                    now_secs.saturating_sub(last_reboot),
-                    RECOVERY_REBOOT_MIN_INTERVAL_SECS
-                );
+                static LAST_SUPPRESSION_LOG: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+                let should_log = {
+                    let mut last_log = LAST_SUPPRESSION_LOG.lock().unwrap();
+                    match *last_log {
+                        Some(inst) if inst.elapsed() < Duration::from_secs(60) => false,
+                        _ => {
+                            *last_log = Some(std::time::Instant::now());
+                            true
+                        }
+                    }
+                };
+                if should_log {
+                    eprintln!(
+                        "[nano3s] recovery reboot requested ({reason}), but rate-limited: last recovery reboot was {}s ago (min {}s). Suppressing reboot.",
+                        now_secs.saturating_sub(last_reboot),
+                        RECOVERY_REBOOT_MIN_INTERVAL_SECS
+                    );
+                }
                 return;
             }
         }
@@ -3078,7 +3091,9 @@ fn run_worker(
     let mut anim = AnimState::new();
     let worker_startup_instant = std::time::Instant::now();
     let mut last_stale_warn = std::time::Instant::now() - Duration::from_secs(60);
+    let mut next_recovery_attempt = std::time::Instant::now();
     let mut consecutive_paused_ticks: u32 = 0;
+    let mut stale_fan_forced = false;
 
     // Loaded once, up front, so both the startup ramp below and the
     // loop-local state after it agree on the same values -- see
@@ -3813,31 +3828,64 @@ fn run_worker(
         let has_status = unsafe { nano3s_ipc_has_received_status() } == 1;
         let status_age_ms = unsafe { nano3s_ipc_status_age_ms() };
 
-        if !has_status {
-            if worker_startup_instant.elapsed() > Duration::from_secs(180) {
-                if last_stale_warn.elapsed() >= Duration::from_secs(15) {
-                    last_stale_warn = std::time::Instant::now();
+        let is_stale = if !has_status {
+            worker_startup_instant.elapsed() > Duration::from_secs(180)
+        } else {
+            status_age_ms > 60_000
+        };
+
+        if is_stale {
+            if !stale_fan_forced {
+                stale_fan_forced = true;
+                eprintln!("[nano3s] Core 1 status absent or stale: forcing fan to 100%");
+                write_harness_control("fan:manual,100");
+            } else if last_stale_warn.elapsed() >= Duration::from_secs(15) {
+                // Periodically re-assert fan:manual,100 while stale
+                write_harness_control("fan:manual,100");
+            }
+
+            if last_stale_warn.elapsed() >= Duration::from_secs(15) {
+                last_stale_warn = std::time::Instant::now();
+                if !has_status {
                     eprintln!(
                         "[nano3s] Core 1 has never reported STATUS after {}s! Forcing fan to 100%.",
                         worker_startup_instant.elapsed().as_secs()
                     );
-                }
-                write_harness_control("fan:manual,100");
-                if worker_startup_instant.elapsed() > Duration::from_secs(300) {
-                    request_recovery_reboot("no_core1_status_at_boot_5min");
+                } else {
+                    eprintln!(
+                        "[nano3s] Core 1 STATUS is stale (age: {}s > 60s)! Forcing fan to 100% and skipping tuner ticks.",
+                        status_age_ms / 1000
+                    );
                 }
             }
-        } else if status_age_ms > 60_000 {
-            if last_stale_warn.elapsed() >= Duration::from_secs(15) {
-                last_stale_warn = std::time::Instant::now();
-                eprintln!(
-                    "[nano3s] Core 1 STATUS is stale (age: {}s > 60s)! Forcing fan to 100% and skipping tuner ticks.",
-                    status_age_ms / 1000
-                );
+
+            let reboot_due = if !has_status {
+                worker_startup_instant.elapsed() > Duration::from_secs(300)
+            } else {
+                status_age_ms > 300_000
+            };
+
+            if reboot_due && std::time::Instant::now() >= next_recovery_attempt {
+                next_recovery_attempt = std::time::Instant::now() + Duration::from_secs(60);
+                let reason = if !has_status {
+                    "no_core1_status_at_boot_5min"
+                } else {
+                    "stale_core1_status_5min"
+                };
+                request_recovery_reboot(reason);
             }
-            write_harness_control("fan:manual,100");
-            if status_age_ms > 300_000 {
-                request_recovery_reboot("stale_core1_status_5min");
+        } else if stale_fan_forced {
+            stale_fan_forced = false;
+            eprintln!("[nano3s] Core 1 status recovered fresh: restoring fan control");
+            if auto_tuner.is_enabled() {
+                auto_tuner.invalidate_fan_cache();
+            } else {
+                let cur_manual_fan = *MANUAL_FAN_DUTY.lock().unwrap_or_else(|e| e.into_inner());
+                let cmd = match cur_manual_fan {
+                    Some(d) => format!("fan:manual,{d}"),
+                    None => "fan:auto,".to_string(),
+                };
+                write_harness_control(&cmd);
             }
         }
 
@@ -4231,11 +4279,14 @@ fn run_worker(
                             );
                             resume_from_idle();
                         } else if consecutive_paused_ticks >= 20 {
-                            eprintln!(
-                                "[nano3s] Core 1 permanently stuck paused ({} ticks, ~5 min) -- escalating to recovery reboot",
-                                consecutive_paused_ticks
-                            );
-                            request_recovery_reboot("core1_stuck_paused_5min");
+                            if std::time::Instant::now() >= next_recovery_attempt {
+                                next_recovery_attempt = std::time::Instant::now() + Duration::from_secs(60);
+                                eprintln!(
+                                    "[nano3s] Core 1 permanently stuck paused ({} ticks, ~5 min) -- escalating to recovery reboot",
+                                    consecutive_paused_ticks
+                                );
+                                request_recovery_reboot("core1_stuck_paused_5min");
+                            }
                         }
                     } else {
                         consecutive_paused_ticks = 0;
@@ -4334,8 +4385,11 @@ fn run_worker(
                                 eprintln!("[nano3s] auto-tune: chain re-init complete");
                             }
                             AutoTuneCmd::RebootRecovery => {
-                                eprintln!("[nano3s] auto-tune: unrecoverable warmup stall -- escalating to recovery reboot");
-                                request_recovery_reboot("warmup_stall_unresolved");
+                                if std::time::Instant::now() >= next_recovery_attempt {
+                                    next_recovery_attempt = std::time::Instant::now() + Duration::from_secs(60);
+                                    eprintln!("[nano3s] auto-tune: unrecoverable warmup stall -- escalating to recovery reboot");
+                                    request_recovery_reboot("warmup_stall_unresolved");
+                                }
                             }
                         }
                     }

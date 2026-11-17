@@ -1056,6 +1056,12 @@ impl AutoTune {
         }
     }
 
+    /// Invalidates the cached fan duty so the next fan_tick is guaranteed to
+    /// write to the harness (e.g. after recovering from emergency fan overrides).
+    pub(crate) fn invalidate_fan_cache(&mut self) {
+        self.fan.sent = None;
+    }
+
     /// One fan-loop step; at most one harness write per tick. `temp_max_c`
     /// is the raw hottest-chip reading (`None`/<=0 = missing -> 100 %).
     pub(crate) fn fan_tick(&mut self, temp_max_c: Option<f32>) -> Option<AutoTuneCmd> {
@@ -1767,6 +1773,22 @@ mod tests {
         // than leaving the harness stuck at the stale auto-tuner duty.
         assert_eq!(o.set_manual_fan(Some(100)), Some(AutoTuneCmd::FanManual(100)));
         assert_eq!(o.fan.sent, Some(100));
+        assert_eq!(o.fan_tick(Some(75.0)), None);
+    }
+
+    #[test]
+    fn invalidate_fan_cache_forces_resend_on_next_tick() {
+        let mut o = AutoTune::new();
+        o.enable(TuneProfile::Balanced);
+        assert_eq!(o.set_manual_fan(Some(50)), Some(AutoTuneCmd::FanManual(50)));
+        assert_eq!(o.fan.sent, Some(50));
+        // Same manual duty: fan_tick emits nothing.
+        assert_eq!(o.fan_tick(Some(75.0)), None);
+        // After emergency 100% override, invalidating the cache forces fan_tick to re-assert.
+        o.invalidate_fan_cache();
+        assert_eq!(o.fan.sent, None);
+        assert_eq!(o.fan_tick(Some(75.0)), Some(AutoTuneCmd::FanManual(50)));
+        assert_eq!(o.fan.sent, Some(50));
         assert_eq!(o.fan_tick(Some(75.0)), None);
     }
 
