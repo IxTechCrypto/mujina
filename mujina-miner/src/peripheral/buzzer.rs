@@ -32,6 +32,7 @@ pub const AVAILABLE_TUNES: &[&str] = &[
     "mario",
     "sonic",
     "street_fighter",
+    "star_trek",
 ];
 
 enum BuzzerCmd {
@@ -470,6 +471,44 @@ pub fn get_tune_notes(name: &str) -> Option<Vec<SoundNote>> {
             SoundNote { freq_hz: 659, duration_ms: 110 }, // E5
             SoundNote { freq_hz: 523, duration_ms: 350 }, // C5
             SoundNote { freq_hz: 587, duration_ms: 900 }, // D5
+        ]),
+
+        "star_trek" => Some(vec![
+            // Star Trek: The Next Generation Main Theme (Courage Fanfare & Goldsmith March)
+            // ── Alexander Courage Fanfare ("Space, the final frontier...") ──
+            SoundNote { freq_hz: 466, duration_ms: 300 },  // Bb4
+            SoundNote { freq_hz: 0,   duration_ms: 30 },
+            SoundNote { freq_hz: 622, duration_ms: 600 },  // Eb5
+            SoundNote { freq_hz: 587, duration_ms: 200 },  // D5
+            SoundNote { freq_hz: 466, duration_ms: 160 },  // Bb4
+            SoundNote { freq_hz: 392, duration_ms: 160 },  // G4
+            SoundNote { freq_hz: 523, duration_ms: 160 },  // C5
+            SoundNote { freq_hz: 698, duration_ms: 1400 }, // F5 (held)
+            SoundNote { freq_hz: 0,   duration_ms: 350 },  // dramatic pause
+            // ── Jerry Goldsmith Main March Theme ──
+            // Motif 1
+            SoundNote { freq_hz: 349, duration_ms: 500 },  // F4
+            SoundNote { freq_hz: 466, duration_ms: 180 },  // Bb4
+            SoundNote { freq_hz: 587, duration_ms: 180 },  // D5
+            SoundNote { freq_hz: 523, duration_ms: 650 },  // C5
+            SoundNote { freq_hz: 0,   duration_ms: 50 },
+            // Motif 2
+            SoundNote { freq_hz: 415, duration_ms: 180 },  // Ab4
+            SoundNote { freq_hz: 784, duration_ms: 180 },  // G5
+            SoundNote { freq_hz: 698, duration_ms: 900 },  // F5
+            SoundNote { freq_hz: 0,   duration_ms: 60 },
+            // Motif 3 - Climbing fanfare
+            SoundNote { freq_hz: 415, duration_ms: 160 },  // Ab4
+            SoundNote { freq_hz: 622, duration_ms: 160 },  // Eb5
+            SoundNote { freq_hz: 698, duration_ms: 160 },  // F5
+            SoundNote { freq_hz: 784, duration_ms: 160 },  // G5
+            SoundNote { freq_hz: 622, duration_ms: 160 },  // Eb5
+            // Descending brass resolution
+            SoundNote { freq_hz: 698, duration_ms: 400 },  // F5
+            SoundNote { freq_hz: 622, duration_ms: 400 },  // Eb5
+            SoundNote { freq_hz: 587, duration_ms: 400 },  // D5
+            SoundNote { freq_hz: 466, duration_ms: 200 },  // Bb4
+            SoundNote { freq_hz: 523, duration_ms: 1400 }, // C5 (heroic resolution)
         ]),
 
         _ => None,
