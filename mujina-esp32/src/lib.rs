@@ -260,6 +260,70 @@ mod tests {
     }
 
     #[test]
+    fn hud_rectangular_tdisplay_geometry_and_layouts() {
+        let g = DisplayGeometry::NERDQX_TDISPLAY_S3;
+        assert_eq!((g.width, g.height), (320, 170));
+        assert_eq!(g.shape, DisplayShape::Rectangular);
+        assert!(g.swap_xy && g.gap_y == 35);
+        assert_eq!(HEADER_RECT.bottom(), PAGE_BOUNDS.y);
+        assert_eq!(PAGE_BOUNDS.bottom(), FOOTER_RECT.y);
+        assert_eq!(FOOTER_RECT.bottom(), 170);
+
+        for screen in Screen::ALL {
+            match screen.layout() {
+                ScreenLayout::MainHud { hero_card, hero_power_bar, metrics_card, tuner_strip } => {
+                    for r in [hero_card, metrics_card, tuner_strip] {
+                        assert!(r.fits_in(PAGE_BOUNDS), "{screen:?} out of bounds: {r:?}");
+                    }
+                    assert!(hero_power_bar.fits_in(hero_card));
+                    assert!(!hero_card.overlaps(metrics_card));
+                    assert!(!hero_card.overlaps(tuner_strip));
+                    assert!(!metrics_card.overlaps(tuner_strip));
+                }
+                ScreenLayout::ChipDieGrid { cards, load_bars } => {
+                    for i in 0..4 {
+                        assert!(cards[i].fits_in(PAGE_BOUNDS));
+                        assert!(load_bars[i].fits_in(cards[i]));
+                        for j in (i + 1)..4 {
+                            assert!(!cards[i].overlaps(cards[j]));
+                        }
+                    }
+                }
+                ScreenLayout::TunerPsu { psu_card, power_bar, tuner_card } => {
+                    assert!(psu_card.fits_in(PAGE_BOUNDS));
+                    assert!(tuner_card.fits_in(PAGE_BOUNDS));
+                    assert!(power_bar.fits_in(psu_card));
+                    assert!(!psu_card.overlaps(tuner_card));
+                }
+                ScreenLayout::PoolShares { summary_bar, rows } => {
+                    assert!(summary_bar.fits_in(PAGE_BOUNDS));
+                    for i in 0..3 {
+                        assert!(rows[i].fits_in(PAGE_BOUNDS));
+                        assert!(!summary_bar.overlaps(rows[i]));
+                        for j in (i + 1)..3 {
+                            assert!(!rows[i].overlaps(rows[j]));
+                        }
+                    }
+                }
+                ScreenLayout::ClockBtc { clock_box, sec_bar, left_card, right_card } => {
+                    for r in [clock_box, sec_bar, left_card, right_card] {
+                        assert!(r.fits_in(PAGE_BOUNDS));
+                    }
+                    assert!(!clock_box.overlaps(sec_bar));
+                    assert!(!left_card.overlaps(right_card));
+                    assert!(!sec_bar.overlaps(left_card));
+                }
+                ScreenLayout::SystemQr { qr_box, info_card } => {
+                    assert_eq!(qr_box.w, qr_box.h); // QR stays square
+                    assert!(qr_box.fits_in(PAGE_BOUNDS));
+                    assert!(info_card.fits_in(PAGE_BOUNDS));
+                    assert!(!qr_box.overlaps(info_card));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hud_short_navigation() {
         let mut h = Hud::new();
         assert_eq!(tap(&mut h, Button::Btn1, 0), Some(HudAction::ScreenChanged(Screen::ChipDieGrid)));
