@@ -4,8 +4,8 @@
 //! is a 320x170 landscape rectangle (`gap_y = 35`, `swap_xy = true`) with full
 //! usable corners, a 22 px header strip, 140 px page body, and an 8 px footer.
 
-pub const LCD_WIDTH: u16 = 320;
-pub const LCD_HEIGHT: u16 = 170;
+use crate::hw_pins::{LCD_HEIGHT, LCD_WIDTH};
+
 pub const HEADER_HEIGHT: u16 = 22;
 pub const FOOTER_HEIGHT: u16 = 8;
 pub const PAGE_Y: u16 = HEADER_HEIGHT;
@@ -85,15 +85,57 @@ impl Rect {
 pub const HEADER_RECT: Rect = Rect::new(0, 0, LCD_WIDTH, HEADER_HEIGHT);
 pub const PAGE_BOUNDS: Rect = Rect::new(0, PAGE_Y, LCD_WIDTH, PAGE_HEIGHT);
 pub const FOOTER_RECT: Rect = Rect::new(0, PAGE_Y + PAGE_HEIGHT, LCD_WIDTH, FOOTER_HEIGHT);
+pub const SCREEN_BOUNDS: Rect = Rect::new(0, 0, LCD_WIDTH, LCD_HEIGHT);
 
-/// Screen-specific rectangular layout primitives inside `320x170` (`PAGE_BOUNDS`).
+/// Bottom-left cutoff circle geometry inspired by Nano 3S concentric dials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CutoffDial {
+    pub cx: i16,
+    pub cy: i16,
+    pub r_outer: u16,
+    pub r_mid: u16,
+    pub r_inner: u16,
+    pub ring_width: u16,
+}
+
+impl CutoffDial {
+    pub const MAIN_HUD: Self = Self {
+        cx: 64,
+        cy: 126,
+        r_outer: 86,
+        r_mid: 74,
+        r_inner: 62,
+        ring_width: 9,
+    };
+
+    pub const fn right_edge(self) -> i16 {
+        self.cx + (self.r_outer as i16)
+    }
+}
+
+/// Front-loading boot splash layout: Mujina raccoon mark + "MUJINA" + progress bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootSplashLayout {
+    pub raccoon_box: Rect,
+    pub title_box: Rect,
+    pub progress_bar: Rect,
+}
+
+pub const BOOT_SPLASH_LAYOUT: BootSplashLayout = BootSplashLayout {
+    raccoon_box: Rect::new(112, 13, 96, 78),
+    title_box: Rect::new(40, 96, 240, 24),
+    progress_bar: Rect::new(70, 138, 180, 5),
+};
+
+/// Screen-specific rectangular layout primitives inside `320x170`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScreenLayout {
     MainHud {
-        hero_card: Rect,
-        hero_power_bar: Rect,
-        metrics_card: Rect,
-        tuner_strip: Rect,
+        dial: CutoffDial,
+        preset_badge: Rect,
+        ip_badge: Rect,
+        /// Callout cards connected via 45-deg PCB traces: Chip Temp, VR Temp, Efficiency, Fan.
+        callout_cards: [Rect; 4],
     },
     ChipDieGrid {
         cards: [Rect; 4],
@@ -125,11 +167,15 @@ impl Screen {
     pub const fn layout(self) -> ScreenLayout {
         match self {
             Screen::MainHud => ScreenLayout::MainHud {
-                // Left widescreen hero rectangle + horizontal power bar (no round dial).
-                hero_card: Rect::new(4, PAGE_Y + 4, 134, 132),
-                hero_power_bar: Rect::new(12, PAGE_Y + 118, 118, 6),
-                metrics_card: Rect::new(142, PAGE_Y + 4, 174, 104),
-                tuner_strip: Rect::new(142, PAGE_Y + 112, 174, 24),
+                dial: CutoffDial::MAIN_HUD,
+                preset_badge: Rect::new(178, 4, 46, 15),
+                ip_badge: Rect::new(228, 4, 88, 15),
+                callout_cards: [
+                    Rect::new(186, 26, 128, 29),
+                    Rect::new(186, 59, 128, 29),
+                    Rect::new(186, 92, 128, 29),
+                    Rect::new(186, 125, 128, 29),
+                ],
             },
             Screen::ChipDieGrid => ScreenLayout::ChipDieGrid {
                 // 4 equal rectangular cards across 320 px (4 + 4*75 + 3*4 + 4 = 320).

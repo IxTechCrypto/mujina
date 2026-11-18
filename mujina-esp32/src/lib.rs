@@ -269,16 +269,27 @@ mod tests {
         assert_eq!(PAGE_BOUNDS.bottom(), FOOTER_RECT.y);
         assert_eq!(FOOTER_RECT.bottom(), 170);
 
+        assert!(BOOT_SPLASH_LAYOUT.raccoon_box.fits_in(SCREEN_BOUNDS));
+        assert!(BOOT_SPLASH_LAYOUT.title_box.fits_in(SCREEN_BOUNDS));
+        assert!(BOOT_SPLASH_LAYOUT.progress_bar.fits_in(SCREEN_BOUNDS));
+        assert!(!BOOT_SPLASH_LAYOUT.raccoon_box.overlaps(BOOT_SPLASH_LAYOUT.title_box));
+        assert!(!BOOT_SPLASH_LAYOUT.title_box.overlaps(BOOT_SPLASH_LAYOUT.progress_bar));
+
         for screen in Screen::ALL {
             match screen.layout() {
-                ScreenLayout::MainHud { hero_card, hero_power_bar, metrics_card, tuner_strip } => {
-                    for r in [hero_card, metrics_card, tuner_strip] {
-                        assert!(r.fits_in(PAGE_BOUNDS), "{screen:?} out of bounds: {r:?}");
+                ScreenLayout::MainHud { dial, preset_badge, ip_badge, callout_cards } => {
+                    assert!(dial.cx - (dial.r_outer as i16) < 0); // left cutoff
+                    assert!(dial.cy + (dial.r_outer as i16) > LCD_HEIGHT as i16); // bottom cutoff
+                    assert!(preset_badge.fits_in(HEADER_RECT));
+                    assert!(ip_badge.fits_in(HEADER_RECT));
+                    assert!(!preset_badge.overlaps(ip_badge));
+                    for i in 0..4 {
+                        assert!(callout_cards[i].fits_in(PAGE_BOUNDS));
+                        assert!(dial.right_edge() < callout_cards[i].x as i16);
+                        for j in (i + 1)..4 {
+                            assert!(!callout_cards[i].overlaps(callout_cards[j]));
+                        }
                     }
-                    assert!(hero_power_bar.fits_in(hero_card));
-                    assert!(!hero_card.overlaps(metrics_card));
-                    assert!(!hero_card.overlaps(tuner_strip));
-                    assert!(!metrics_card.overlaps(tuner_strip));
                 }
                 ScreenLayout::ChipDieGrid { cards, load_bars } => {
                     for i in 0..4 {
