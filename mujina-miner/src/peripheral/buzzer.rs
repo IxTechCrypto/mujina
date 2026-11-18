@@ -20,9 +20,9 @@ const BEEPER_DEV: &str = "/dev/input/event1";
 const EV_SYN: u16 = 0x00;
 const EV_SND: u16 = 0x12;
 const SND_TONE: u16 = 0x02;
-/// Global playback slow-down (6/5 = 1.2x longer notes).
-const TEMPO_NUM: u32 = 6;
-const TEMPO_DEN: u32 = 5;
+/// Global playback slow-down (11/10 = 1.1x longer notes).
+const TEMPO_NUM: u32 = 11;
+const TEMPO_DEN: u32 = 10;
 
 /// List of built-in melodies available for playback and testing.
 pub const AVAILABLE_TUNES: &[&str] = &[
