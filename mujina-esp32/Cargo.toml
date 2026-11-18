@@ -1,0 +1,17 @@
+[package]
+name = "mujina-esp32"
+version = "0.1.0"
+edition = "2021"
+description = "NerdQX (ESP32-S3R8) standalone embedded firmware: portable pins, power, tuner, HUD logic"
+publish = false
+
+# Standalone: not part of the parent mujina workspace.
+[workspace]
+
+[features]
+default = []
+# Enables the ESP-IDF target glue (needs the xtensa-esp32s3-espidf toolchain). Stub for Phase 2.
+esp32s3 = ["dep:esp-idf-svc"]
+
+[dependencies]
+esp-idf-svc = { version = "0.49", optional = true }

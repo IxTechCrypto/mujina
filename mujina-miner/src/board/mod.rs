@@ -8,6 +8,8 @@ pub(crate) mod nano3s_tuner_core;
 pub(crate) mod nano3s_chip_tuner;
 #[cfg(test)]
 pub(crate) mod nano3s_chain_sim;
+pub(crate) mod nerdqaxe_pp;
+pub(crate) mod nerdqx;
 pub mod pattern;
 
 use anyhow::Result;

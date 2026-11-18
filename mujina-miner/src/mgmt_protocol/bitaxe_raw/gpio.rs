@@ -23,6 +23,16 @@ impl BitaxeRawGpioController {
     pub fn new(channel: ControlChannel) -> Self {
         Self { channel }
     }
+
+    /// Select a multiplexer channel in one USB packet `[cmd_index, channel]`
+    /// (the firmware updates the two select pins sequentially, so the caller
+    /// must wait for the mux to settle before reading).
+    pub async fn set_mux_channel(&mut self, cmd_index: u8, channel: u8) -> Result<()> {
+        debug!(cmd_index, channel, "GPIO mux select");
+        let packet = Packet::new(Page::GPIO, cmd_index, vec![channel]);
+        self.channel.send_packet(packet).await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -113,5 +123,14 @@ mod tests {
         let packet = Packet::new(Page::GPIO, 5, vec![0x01]);
         let encoded = packet.encode();
         assert_eq!(encoded[5], 0x05); // command byte is pin 5
+    }
+
+    #[test]
+    fn mux_select_packet_encoding() {
+        // [cmd_index, channel] rides as the command byte plus one data byte.
+        let encoded = Packet::new(Page::GPIO, 0x06, vec![0x03]).encode();
+        assert_eq!(encoded[4], 0x06); // GPIO page
+        assert_eq!(encoded[5], 0x06); // TempMux command index
+        assert_eq!(encoded[6], 0x03); // channel 3
     }
 }
