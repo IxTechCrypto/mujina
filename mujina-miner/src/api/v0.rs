@@ -2010,6 +2010,18 @@ fn pool1_response() -> PoolConfigResponse {
     }
 }
 
+fn pool_link_state(weight: u16, connected: bool, failed: bool) -> &'static str {
+    if connected {
+        "connected"
+    } else if weight == 0 {
+        "standby"
+    } else if failed {
+        "down"
+    } else {
+        "connecting"
+    }
+}
+
 /// Every configured pool, plus live status. Passwords are never returned;
 /// `password_set` says whether one is stored.
 #[utoipa::path(
@@ -2026,12 +2038,13 @@ async fn get_pools(State(state): State<SharedState>) -> Json<PoolsResponse> {
         .into_iter()
         .map(|pool| {
             let live = telemetry.sources.iter().find(|s| s.url.as_deref() == Some(pool.url.as_str()));
+            let connected = live.map(|s| s.connected).unwrap_or(false);
             PoolStatus {
                 url: pool.url,
                 user: pool.user,
                 password_set: !pool.pass.is_empty(),
                 weight: pool.weight,
-                connected: live.map(|s| s.connected).unwrap_or(false),
+                connected,
                 difficulty: live.and_then(|s| s.difficulty),
                 accepted: live.map(|s| s.accepted).unwrap_or(0),
                 rejected: live.map(|s| s.rejected).unwrap_or(0),
@@ -2039,6 +2052,13 @@ async fn get_pools(State(state): State<SharedState>) -> Json<PoolsResponse> {
                 hashrate_1h: live.map(|s| s.hashrate_1h).unwrap_or(0),
                 reject_reasons: live.map(|s| s.reject_reasons.clone()).unwrap_or_default(),
                 shares_low_diff: live.map(|s| s.shares_low_diff).unwrap_or(0),
+                state: pool_link_state(
+                    pool.weight,
+                    connected,
+                    live.and_then(|s| s.last_error.as_ref()).is_some(),
+                )
+                .to_string(),
+                last_error: live.and_then(|s| s.last_error.clone()),
             }
         })
         .collect();

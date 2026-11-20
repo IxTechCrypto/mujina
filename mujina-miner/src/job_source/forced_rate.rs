@@ -155,6 +155,7 @@ impl ForcedRateSource {
                         }
                         SourceEvent::ClearJobs => SourceEvent::ClearJobs,
                         SourceEvent::PoolDifficulty(diff) => SourceEvent::PoolDifficulty(diff),
+                        SourceEvent::LinkError(error) => SourceEvent::LinkError(error),
                         SourceEvent::ShareResult { accepted, reason } => {
                             SourceEvent::ShareResult { accepted, reason }
                         }

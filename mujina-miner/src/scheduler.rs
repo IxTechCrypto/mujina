@@ -177,6 +177,9 @@ struct SourceEntry {
 
     /// Shares the chip found that were under `pool_difficulty`.
     low_diff: u64,
+
+    /// Last connect or handshake error. Cleared once the session is up.
+    last_error: Option<String>,
 }
 
 /// Whether to update alongside existing work or replace it.
@@ -342,6 +345,9 @@ impl Scheduler {
         let Some(source) = self.sources.get_mut(source_id) else {
             return false;
         };
+        if up {
+            source.last_error = None;
+        }
         if source.up == up {
             return false;
         }
@@ -382,6 +388,7 @@ impl Scheduler {
                         })
                     }),
                     shares_low_diff: s.low_diff,
+                    last_error: s.last_error.clone(),
                     connected: s.up,
                     weight: s.weight,
                     accepted: s.accepted,
@@ -476,6 +483,7 @@ impl Scheduler {
             samples: VecDeque::new(),
             pool_difficulty: None,
             low_diff: 0,
+            last_error: None,
         });
         source_events.insert(source_id, ReceiverStream::new(registration.event_rx));
         debug!(
@@ -1166,6 +1174,15 @@ impl Scheduler {
                                 }
                             }
                             debug!(difficulty = diff, "Pool difficulty applied to current jobs");
+                        }
+
+                        SourceEvent::LinkError(error) => {
+                            if let Some(source) = self.sources.get_mut(source_id) {
+                                source.last_error = error;
+                                if source.last_error.is_some() {
+                                    source.up = false;
+                                }
+                            }
                         }
 
                         SourceEvent::ShareResult { accepted, reason } => {

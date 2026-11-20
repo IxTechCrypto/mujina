@@ -601,6 +601,7 @@ impl StratumV1Source {
                             return ConnectOutcome::Fatal(e.into());
                         }
                         warn!(error = %e, "Failed to connect");
+                        let _ = self.event_tx.try_send(SourceEvent::LinkError(Some(e.to_string())));
                         return ConnectOutcome::Disconnected;
                     }
                 }

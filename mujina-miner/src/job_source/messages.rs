@@ -150,6 +150,9 @@ pub enum SourceEvent {
     /// `mining.set_difficulty` for this connection. Applies to the current
     /// job and to every job after it. Shares below this are not submitted.
     PoolDifficulty(f64),
+
+    /// Latest connect failure, or `None` once the socket is up.
+    LinkError(Option<String>),
 }
 
 /// Commands to sources (pull, coordinator-initiated).
