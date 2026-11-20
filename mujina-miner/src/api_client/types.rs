@@ -400,6 +400,9 @@ pub struct PoolStatus {
     pub hashrate_10m: u64,
     /// Effective hashrate, hashes/s, over the last hour.
     pub hashrate_1h: u64,
+    /// Shares found locally that were below this pool's difficulty.
+    #[serde(default)]
+    pub shares_low_diff: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -520,6 +523,9 @@ pub struct SourceTelemetry {
     /// Effective hashes/s over the last hour.
     #[serde(default)]
     pub hashrate_1h: u64,
+    /// Shares found locally that were below this pool's difficulty.
+    #[serde(default)]
+    pub shares_low_diff: u64,
 }
 
 /// Serialize an `Option<f64>` so that whole numbers appear without a

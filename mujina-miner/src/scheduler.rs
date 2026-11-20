@@ -45,6 +45,13 @@ use crate::types::{
     expected_time_to_share_from_target,
 };
 
+/// A share is submitted only when its difficulty is at least the pool's.
+///
+/// `mining.set_difficulty 94` plus a share of difficulty 10 does not submit.
+pub(crate) fn share_meets_pool_difficulty(pool: f64, share: f64) -> bool {
+    pool.is_finite() && share.is_finite() && pool > 0.0 && share + 1e-9 >= pool
+}
+
 /// Unique identifier for a job source, assigned by the scheduler.
 type SourceId = slotmap::DefaultKey;
 
@@ -163,6 +170,13 @@ struct SourceEntry {
     /// Measured chain hashrate while this pool held the chain, else 0.
     /// One sample per 10 s telemetry tick, oldest first. 360 samples is 1 h.
     samples: VecDeque<u64>,
+
+    /// Latest `mining.set_difficulty` for this connection. `None` until the
+    /// pool sends one. Shares below this are counted and not submitted.
+    pool_difficulty: Option<f64>,
+
+    /// Shares the chip found that were under `pool_difficulty`.
+    low_diff: u64,
 }
 
 /// Whether to update alongside existing work or replace it.
@@ -361,10 +375,13 @@ impl Scheduler {
                 .map(|s| SourceTelemetry {
                     name: s.name.clone(),
                     url: s.url.clone(),
-                    difficulty: s.last_job.as_ref().map(|j| {
-                        let d = Difficulty::from_target(j.share_target).as_f64();
-                        if d >= 10.0 { d.round() } else { d }
+                    difficulty: s.pool_difficulty.or_else(|| {
+                        s.last_job.as_ref().map(|j| {
+                            let d = Difficulty::from_target(j.share_target).as_f64();
+                            if d >= 10.0 { d.round() } else { d }
+                        })
                     }),
+                    shares_low_diff: s.low_diff,
                     connected: s.up,
                     weight: s.weight,
                     accepted: s.accepted,
@@ -457,6 +474,8 @@ impl Scheduler {
             rejected: 0,
             reject_reasons: Vec::new(),
             samples: VecDeque::new(),
+            pool_difficulty: None,
+            low_diff: 0,
         });
         source_events.insert(source_id, ReceiverStream::new(registration.event_rx));
         debug!(
@@ -667,6 +686,27 @@ impl Scheduler {
         // Feed share work to per-thread hashrate estimator
         if let Some(entry) = self.threads.get_mut(task_entry.thread_id) {
             entry.hashrate.record(share.expected_work);
+        }
+
+        // The job target can still be the old, easier one. The pool's latest
+        // mining.set_difficulty wins, per connection.
+        let need = self
+            .sources
+            .get(task_entry.source_id)
+            .and_then(|s| s.pool_difficulty);
+        let share_d = share_difficulty.as_f64();
+        if let Some(need) = need
+            && !share_meets_pool_difficulty(need, share_d)
+        {
+            if let Some(source) = self.sources.get_mut(task_entry.source_id) {
+                source.low_diff = source.low_diff.saturating_add(1);
+            }
+            trace!(
+                share_difficulty = share_d,
+                pool_difficulty = need,
+                "Share below pool difficulty (not submitted)"
+            );
+            return;
         }
 
         // Check if share meets source threshold
@@ -1108,6 +1148,26 @@ impl Scheduler {
                             }
                         }
 
+                        SourceEvent::PoolDifficulty(diff) => {
+                            if let Some(source) = self.sources.get_mut(source_id) {
+                                source.pool_difficulty = Some(diff);
+                                if let Some(job) = source.last_job.clone() {
+                                    let mut updated = (*job).clone();
+                                    updated.share_target = Difficulty::from_f64(diff).to_target();
+                                    source.last_job = Some(Arc::new(updated));
+                                }
+                            }
+                            let target = Difficulty::from_f64(diff).to_target();
+                            for (_id, task) in self.tasks.iter_mut() {
+                                if task.source_id == source_id {
+                                    let mut updated = (*task.template).clone();
+                                    updated.share_target = target;
+                                    task.template = Arc::new(updated);
+                                }
+                            }
+                            debug!(difficulty = diff, "Pool difficulty applied to current jobs");
+                        }
+
                         SourceEvent::ShareResult { accepted, reason } => {
                             if let Some(source) = self.sources.get_mut(source_id) {
                                 if accepted {
@@ -1437,6 +1497,13 @@ impl MiningStats {
 mod tests {
     use super::*;
     use crate::types::Difficulty;
+
+    #[test]
+    fn set_difficulty_94_does_not_submit_a_diff_10_share() {
+        assert!(!share_meets_pool_difficulty(94.0, 10.0));
+        assert!(share_meets_pool_difficulty(94.0, 94.0));
+        assert!(share_meets_pool_difficulty(94.0, 200.0));
+    }
 
     #[test]
     fn scheduler_target_zero_hashrate_passthrough() {

@@ -146,6 +146,10 @@ pub enum SourceEvent {
         accepted: bool,
         reason: Option<String>,
     },
+
+    /// `mining.set_difficulty` for this connection. Applies to the current
+    /// job and to every job after it. Shares below this are not submitted.
+    PoolDifficulty(f64),
 }
 
 /// Commands to sources (pull, coordinator-initiated).

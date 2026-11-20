@@ -320,6 +320,9 @@ impl StratumV1Source {
                 if let Some(state) = &mut self.state {
                     state.share_difficulty = Some(difficulty);
                 }
+                // The job already in the scheduler was built with the previous
+                // target. Tell it the new pool difficulty before the next notify.
+                let _ = self.event_tx.try_send(SourceEvent::PoolDifficulty(diff));
             }
 
             ClientEvent::VersionMaskSet(mask) => {

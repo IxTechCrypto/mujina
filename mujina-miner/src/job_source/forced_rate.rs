@@ -154,6 +154,7 @@ impl ForcedRateSource {
                             SourceEvent::ReplaceJob(self.modify_job(job))
                         }
                         SourceEvent::ClearJobs => SourceEvent::ClearJobs,
+                        SourceEvent::PoolDifficulty(diff) => SourceEvent::PoolDifficulty(diff),
                         SourceEvent::ShareResult { accepted, reason } => {
                             SourceEvent::ShareResult { accepted, reason }
                         }
