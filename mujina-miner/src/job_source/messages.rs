@@ -139,6 +139,9 @@ pub enum SourceEvent {
     /// Scheduler should cancel all work from this source and wait for new job.
     /// Used during pool disconnection or when awaiting new block.
     ClearJobs,
+
+    /// The pool accepted or rejected a share this source submitted.
+    ShareResult { accepted: bool },
 }
 
 /// Commands to sources (pull, coordinator-initiated).

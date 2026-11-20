@@ -142,6 +142,19 @@
   .kv { display: grid; grid-template-columns: auto 1fr; gap: 7px 16px; font-size: 12px; margin: 0; }
   .kv dt { color: var(--dim); }
   .kv dd { margin: 0; color: var(--ink); word-break: break-all; }
+  .pool { margin-bottom: 14px; }
+  .pool h3 { margin: 0 0 12px; font-family: 'Orbitron', sans-serif; font-size: 12px; letter-spacing: .12em; }
+  .weight { display: flex; align-items: center; gap: 12px; }
+  .weight input[type=range] { flex: 1; accent-color: var(--cyan); }
+  .weight output { min-width: 3ch; color: var(--cyan); }
+  .sum { font-size: 12px; color: var(--dim); }
+  .sum.bad { color: var(--red); }
+  .sum.ok { color: var(--green); }
+  .live { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-top: 12px; }
+  .live div { background: var(--panel2); border: 1px solid var(--line); padding: 8px; }
+  .live span { display: block; color: var(--dim); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+  .dot.on { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .dot.off { background: var(--red); box-shadow: 0 0 8px var(--red); }
 
   @media (max-width: 600px) {
     input[type=text],
@@ -305,140 +318,223 @@
     <a class="menubtn" href="/dashboard#tuning">Tuning</a>
     <a class="menubtn" href="/dashboard#fan">Fan</a>
     <a class="menubtn" href="/dashboard#curve">Fan Curve</a>
-    <a class="menubtn on" href="/dashboard#pool">Pool</a>
+    <a class="menubtn on" href="/pool">Pool</a>
     <a class="menubtn" href="/led">LED</a>
     <a class="menubtn" href="/firmware">Firmware</a>
     <a class="menubtn" href="/dashboard#display">Display</a>
     <a class="menubtn" href="/info">Info</a>
   </nav>
 
-  <div class="sec">Active Connection<span class="sec-sub">what the running daemon connected with at its last startup</span></div>
-  <div class="card">
-    <dl class="kv">
-      <dt>Source</dt><dd id="activeName">—</dd>
-      <dt>URL</dt><dd id="activeUrl">—</dd>
-      <dt>Difficulty</dt><dd id="activeDiff">—</dd>
-    </dl>
+  <div class="sec">Pools<span class="sec-sub">up to 4 · weights are percent of hash time · applied live</span></div>
+  <p class="hint">The Nano 3S has one chain, so a weight is a share of time, in 60 second slots. A weight of 0 keeps the pool connected as a failover backup. A down pool's time goes to the live pools in proportion. Saving applies immediately. No reboot, and no process restart.</p>
+  <div id="poolList"></div>
+  <div class="actions">
+    <button class="btn" id="addPool" type="button">Add pool</button>
+    <button class="btn pri" id="savePools" type="button">Save and apply</button>
+    <span class="sum" id="weightSum">weights 0 / 100</span>
   </div>
-
-  <div class="sec">Pool Configuration<span class="sec-sub">saved immediately, applied on next restart</span></div>
-  <div class="card">
-    <div class="row">
-      <label for="poolUrl">Pool URL</label>
-      <input type="text" id="poolUrl" placeholder="stratum+tcp://pool.example.com:3333" autocomplete="off">
-    </div>
-    <div class="row">
-      <label for="poolUser">Worker <small>(usually address.workername)</small></label>
-      <input type="text" id="poolUser" placeholder="bc1q....worker1" autocomplete="off">
-    </div>
-    <div class="row">
-      <label for="poolPass">Password <small>(leave blank to keep current; most pools ignore this)</small></label>
-      <input type="password" id="poolPass" placeholder="unchanged" autocomplete="new-password">
-    </div>
-    <div class="actions">
-      <button class="btn pri" id="poolSave">Save</button>
-      <span class="badge" id="restartBadge" style="display:none">reboot required to apply</span>
-    </div>
-    <div class="msg" id="poolMsg"></div>
-  </div>
-
-  <div class="sec">Apply Changes</div>
-  <div class="card">
-    <p class="hint">The stratum connection is only read at startup — saving new pool settings above does not reconnect the running miner by itself. Applying a change needs a full device reboot (not just a process restart — the ASIC core's IPC link goes stale otherwise). Mining stops for a couple of minutes while it comes back up.</p>
-    <button class="btn danger" id="restartBtn">Reboot Device to Apply</button>
-    <div class="msg" id="restartMsg"></div>
-  </div>
+  <div class="msg" id="poolMsg"></div>
 </div>
 
 <script>
 function $(id) { return document.getElementById(id); }
+let pools = [];
+let editing = false;
 
-async function loadActive() {
-  try {
-    const r = await fetch('/api/v0/sources');
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const sources = await r.json();
-    const s = sources[0];
-    $('connDot').className = 'dot ok';
-    $('connText').textContent = 'live';
-    $('activeName').textContent = s ? s.name : '—';
-    $('activeUrl').textContent = (s && s.url) ? s.url : '—';
-    $('activeDiff').textContent = (s && s.difficulty != null) ? s.difficulty : '—';
-  } catch (e) {
-    $('connDot').className = 'dot bad';
-    $('connText').textContent = 'fetch failed: ' + e;
+function gh(h) {
+  if (h == null) return '—';
+  const g = h / 1e9;
+  return g >= 10 ? g.toFixed(1) + ' GH/s' : g.toFixed(2) + ' GH/s';
+}
+
+function blank() {
+  return { url: '', user: '', password: '', weight: 0, password_set: false,
+    connected: false, difficulty: null, accepted: 0, rejected: 0, hashrate_10m: 0, hashrate_1h: 0 };
+}
+
+function sumWeights() {
+  return pools.reduce((s, p) => s + (Number(p.weight) || 0), 0);
+}
+
+function paintSum() {
+  const n = sumWeights();
+  const el = $('weightSum');
+  el.textContent = 'weights ' + n + ' / 100';
+  el.className = n === 100 ? 'sum ok' : 'sum bad';
+  $('addPool').disabled = pools.length >= 4;
+}
+
+function setWeight(i, value) {
+  let v = Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
+  const others = pools.map((_, j) => j).filter(j => j !== i);
+  if (!others.length) v = 100;
+  pools[i].weight = v;
+  const rest = 100 - v;
+  const prev = others.reduce((s, j) => s + (Number(pools[j].weight) || 0), 0);
+  let assigned = 0;
+  others.forEach((j, n) => {
+    let share;
+    if (n + 1 === others.length) share = rest - assigned;
+    else if (prev === 0) share = Math.floor(rest / others.length);
+    else share = Math.floor((pools[j].weight / prev) * rest);
+    share = Math.max(0, share);
+    pools[j].weight = share;
+    assigned += share;
+  });
+  render();
+}
+
+function render() {
+  const root = $('poolList');
+  root.innerHTML = '';
+  pools.forEach((p, i) => {
+    const card = document.createElement('div');
+    card.className = 'card pool';
+    const live = p.connected ? 'on' : 'off';
+    const state = p.connected ? 'connected' : 'down';
+    card.innerHTML =
+      '<h3>Pool ' + (i + 1) + ' <span class="dot ' + live + '"></span> ' + state + '</h3>' +
+      '<div class="row"><label>Pool URL</label><input type="text" data-k="url" value="' + esc(p.url) + '" placeholder="stratum+tcp://pool.example.com:3333" autocomplete="off"></div>' +
+      '<div class="row"><label>Worker</label><input type="text" data-k="user" value="' + esc(p.user) + '" autocomplete="off"></div>' +
+      '<div class="row"><label>Password <small>(blank keeps the stored one)</small></label><input type="password" data-k="password" placeholder="' + (p.password_set ? 'unchanged (set)' : 'none set') + '" autocomplete="new-password"></div>' +
+      '<div class="row"><label>Weight</label><div class="weight"><input type="range" min="0" max="100" step="1" value="' + p.weight + '"><output>' + p.weight + '%</output></div></div>' +
+      '<div class="live">' +
+        '<div><span>Difficulty</span>' + (p.difficulty == null ? '—' : p.difficulty) + '</div>' +
+        '<div><span>Accepted</span>' + (p.accepted || 0) + '</div>' +
+        '<div><span>Rejected</span>' + (p.rejected || 0) + '</div>' +
+        '<div><span>10 min</span>' + gh(p.hashrate_10m) + '</div>' +
+        '<div><span>1 hour</span>' + gh(p.hashrate_1h) + '</div>' +
+      '</div>' +
+      '<div class="actions"><button class="btn danger" type="button" data-rm="1">Remove</button></div>';
+    card.querySelector('[data-k="url"]').addEventListener('input', e => { editing = true; pools[i].url = e.target.value; });
+    card.querySelector('[data-k="user"]').addEventListener('input', e => { editing = true; pools[i].user = e.target.value; });
+    card.querySelector('[data-k="password"]').addEventListener('input', e => { editing = true; pools[i].password = e.target.value; });
+    card.querySelector('input[type=range]').addEventListener('input', e => { editing = true; setWeight(i, e.target.value); });
+    card.querySelector('[data-rm]').addEventListener('click', () => {
+      editing = true;
+      pools.splice(i, 1);
+      if (pools.length === 1) pools[0].weight = 100;
+      else if (pools.length) {
+        const s = sumWeights() || 1;
+        let assigned = 0;
+        pools.forEach((q, n) => {
+          if (n + 1 === pools.length) q.weight = 100 - assigned;
+          else { q.weight = Math.round(q.weight * 100 / s); assigned += q.weight; }
+        });
+      }
+      render();
+    });
+    root.appendChild(card);
+  });
+  paintSum();
+}
+
+function esc(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+function mergeLive(fresh) {
+  fresh.forEach((f, i) => {
+    if (!pools[i]) return;
+    pools[i].connected = f.connected;
+    pools[i].difficulty = f.difficulty;
+    pools[i].accepted = f.accepted;
+    pools[i].rejected = f.rejected;
+    pools[i].hashrate_10m = f.hashrate_10m;
+    pools[i].hashrate_1h = f.hashrate_1h;
+    pools[i].password_set = f.password_set;
+  });
+  if (!editing) render();
+  else {
+    document.querySelectorAll('#poolList .pool').forEach((card, i) => {
+      const p = pools[i];
+      if (!p) return;
+      const h = card.querySelector('h3');
+      if (h) h.innerHTML = 'Pool ' + (i + 1) + ' <span class="dot ' + (p.connected ? 'on' : 'off') + '"></span> ' + (p.connected ? 'connected' : 'down');
+      const cells = card.querySelectorAll('.live div');
+      if (cells.length === 5) {
+        cells[0].innerHTML = '<span>Difficulty</span>' + (p.difficulty == null ? '—' : p.difficulty);
+        cells[1].innerHTML = '<span>Accepted</span>' + (p.accepted || 0);
+        cells[2].innerHTML = '<span>Rejected</span>' + (p.rejected || 0);
+        cells[3].innerHTML = '<span>10 min</span>' + gh(p.hashrate_10m);
+        cells[4].innerHTML = '<span>1 hour</span>' + gh(p.hashrate_1h);
+      }
+    });
   }
 }
 
-async function loadPool() {
+async function loadPools(first) {
   try {
-    const r = await fetch('/api/v0/pool');
+    const r = await fetch('/api/v0/pools');
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
-    $('poolUrl').value = d.url || '';
-    $('poolUser').value = d.user || '';
-    $('poolPass').placeholder = d.password_set ? 'unchanged (set)' : 'unchanged (none set)';
+    $('connDot').className = 'dot ok';
+    $('connText').textContent = 'live';
+    const fresh = (d.pools || []).map(p => Object.assign(blank(), p, { password: '' }));
+    if (first || !editing) {
+      pools = fresh.length ? fresh : [Object.assign(blank(), { weight: 100 })];
+      render();
+    } else {
+      mergeLive(fresh);
+    }
   } catch (e) {
-    $('poolMsg').textContent = 'failed to load current config: ' + e;
+    $('connDot').className = 'dot bad';
+    $('connText').textContent = 'fetch failed: ' + e;
+    if (first && !pools.length) {
+      pools = [Object.assign(blank(), { weight: 100 })];
+      render();
+    }
+  }
+}
+
+async function savePools() {
+  if (sumWeights() !== 100) {
+    $('poolMsg').textContent = 'weights must sum to 100';
+    $('poolMsg').className = 'msg err';
+    return;
+  }
+  const body = {
+    pools: pools.map(p => {
+      const row = { url: p.url.trim(), user: p.user.trim(), weight: Number(p.weight) || 0 };
+      if (p.password) row.password = p.password;
+      return row;
+    })
+  };
+  $('poolMsg').textContent = 'saving…';
+  $('poolMsg').className = 'msg';
+  try {
+    const r = await fetch('/api/v0/pools', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const detail = await r.text();
+    if (!r.ok) {
+      $('poolMsg').textContent = 'save failed (' + r.status + '): ' + (detail || 'rejected');
+      $('poolMsg').className = 'msg err';
+      return;
+    }
+    $('poolMsg').textContent = 'saved ✓ — applied, no reboot';
+    $('poolMsg').className = 'msg ok';
+    editing = false;
+    pools.forEach(p => { p.password = ''; });
+    loadPools(true);
+  } catch (e) {
+    $('poolMsg').textContent = 'failed: ' + e;
     $('poolMsg').className = 'msg err';
   }
 }
 
-async function savePool() {
-  const body = {};
-  const url = $('poolUrl').value.trim();
-  const user = $('poolUser').value.trim();
-  const pass = $('poolPass').value;
-  if (url) body.url = url;
-  if (user) body.user = user;
-  if (pass) body.password = pass;
-  if (!Object.keys(body).length) {
-    $('poolMsg').textContent = 'nothing to save';
-    $('poolMsg').className = 'msg';
-    return;
-  }
-  $('poolMsg').textContent = 'saving…'; $('poolMsg').className = 'msg';
-  try {
-    const r = await fetch('/api/v0/pool', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) {
-      const detail = await r.text();
-      $('poolMsg').textContent = `save failed (${r.status}): ${detail || 'rejected'}`;
-      $('poolMsg').className = 'msg err';
-      return;
-    }
-    $('poolMsg').textContent = 'saved ✓ — reboot the device to apply';
-    $('poolMsg').className = 'msg ok';
-    $('restartBadge').style.display = '';
-    $('poolPass').value = '';
-    loadPool();
-  } catch (e) { $('poolMsg').textContent = 'failed: ' + e; $('poolMsg').className = 'msg err'; }
-}
-
-async function rebootDevice() {
-  if (!confirm('Reboot the device now? Mining will stop for a couple of minutes while it comes back up.')) return;
-  $('restartMsg').textContent = 'rebooting…'; $('restartMsg').className = 'msg';
-  try {
-    const r = await fetch('/api/v0/reboot', { method: 'POST' });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    $('restartMsg').textContent = 'reboot requested ✓ — back online in a couple of minutes';
-    $('restartMsg').className = 'msg ok';
-    $('restartBadge').style.display = 'none';
-  } catch (e) {
-    $('restartMsg').textContent = 'failed: ' + e;
-    $('restartMsg').className = 'msg err';
-  }
-}
-
-$('poolSave').addEventListener('click', savePool);
-$('restartBtn').addEventListener('click', rebootDevice);
-
-loadActive();
-loadPool();
-setInterval(loadActive, 5000);
+$('addPool').addEventListener('click', () => {
+  if (pools.length >= 4) return;
+  editing = true;
+  pools.push(blank());
+  if (pools.length === 1) pools[0].weight = 100;
+  render();
+});
+$('savePools').addEventListener('click', savePools);
+loadPools(true);
+setInterval(() => loadPools(false), 5000);
 </script>
 </body>
 </html>

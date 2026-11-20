@@ -363,6 +363,45 @@ pub struct PoolConfigResponse {
     pub password_set: bool,
 }
 
+/// One pool in `PUT /api/v0/pools`. `password` is omitted to keep the
+/// password already stored for the same url and user.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PoolPut {
+    pub url: String,
+    pub user: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    pub weight: u16,
+}
+
+/// One pool in `GET /api/v0/pools`. The password is never returned.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PoolStatus {
+    pub url: String,
+    pub user: String,
+    pub password_set: bool,
+    pub weight: u16,
+    pub connected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<f64>,
+    pub accepted: u64,
+    pub rejected: u64,
+    /// Effective hashrate, hashes/s, over the last 10 minutes.
+    pub hashrate_10m: u64,
+    /// Effective hashrate, hashes/s, over the last hour.
+    pub hashrate_1h: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PoolsPutRequest {
+    pub pools: Vec<PoolPut>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PoolsResponse {
+    pub pools: Vec<PoolStatus>,
+}
+
 /// Response body for `POST /api/v0/firmware/{target}`.
 ///
 /// By the time this is returned, the binary is already swapped in and a
@@ -452,6 +491,22 @@ pub struct SourceTelemetry {
         serialize_with = "serialize_opt_f64_as_integer_when_whole"
     )]
     pub difficulty: Option<f64>,
+    /// The stratum session is up.
+    #[serde(default)]
+    pub connected: bool,
+    /// Configured percent of hash time.
+    #[serde(default)]
+    pub weight: u16,
+    #[serde(default)]
+    pub accepted: u64,
+    #[serde(default)]
+    pub rejected: u64,
+    /// Effective hashes/s over the last 10 minutes.
+    #[serde(default)]
+    pub hashrate_10m: u64,
+    /// Effective hashes/s over the last hour.
+    #[serde(default)]
+    pub hashrate_1h: u64,
 }
 
 /// Serialize an `Option<f64>` so that whole numbers appear without a

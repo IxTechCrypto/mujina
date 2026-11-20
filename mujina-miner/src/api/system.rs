@@ -91,7 +91,11 @@ pub(crate) fn build_system(i: &SystemInfo) -> Value {
             "can_reboot": i.can_reboot,
             "can_restart_miner": i.can_restart_miner,
         },
-        "pool": { "endpoint": "/api/v0/pool", "apply": i.pool_apply },
+        "pool": {
+            "endpoint": "/api/v0/pool",
+            "pools": "/api/v0/pools",
+            "apply": i.pool_apply,
+        },
         "power": {
             "shared_rail": i.shared_rail,
             "ceiling_w": i.ceiling_w,
@@ -127,7 +131,7 @@ mod tests {
             device_model: Some("Avalon Nano 3S".into()),
             can_reboot: true,
             can_restart_miner: false,
-            pool_apply: "reboot",
+            pool_apply: "live",
             shared_rail: true,
             ceiling_w: Some(112.0),
             psu_contract_w: Some(140.0),
@@ -153,7 +157,7 @@ mod tests {
         assert_eq!(v["device"]["model"], "Avalon Nano 3S");
         assert_eq!(v["device"]["can_reboot"], true);
         assert_eq!(v["device"]["can_restart_miner"], false);
-        assert_eq!(v["pool"], json!({ "endpoint": "/api/v0/pool", "apply": "reboot" }));
+        assert_eq!(v["pool"], json!({ "endpoint": "/api/v0/pool", "pools": "/api/v0/pools", "apply": "live" }));
         assert_eq!(v["power"], json!({ "shared_rail": true, "ceiling_w": 112.0, "psu_contract_w": 140.0 }));
         let b = &v["boards"][0];
         assert_eq!(b["name"], "nano3s-0");

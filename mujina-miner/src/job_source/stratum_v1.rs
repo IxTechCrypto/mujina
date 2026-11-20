@@ -331,6 +331,9 @@ impl StratumV1Source {
 
             ClientEvent::ShareAccepted { job_id, nonce } => {
                 SHARES_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+                let _ = self
+                    .event_tx
+                    .try_send(SourceEvent::ShareResult { accepted: true });
                 if !self.first_share_logged {
                     self.first_share_logged = true;
                     info!(
@@ -353,6 +356,9 @@ impl StratumV1Source {
 
             ClientEvent::ShareRejected { job_id, reason } => {
                 SHARES_REJECTED.fetch_add(1, Ordering::Relaxed);
+                let _ = self
+                    .event_tx
+                    .try_send(SourceEvent::ShareResult { accepted: false });
                 warn!(job_id = %job_id, reason = %reason, "Share rejected by pool");
             }
 

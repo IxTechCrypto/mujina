@@ -27,7 +27,8 @@ use crate::api_client::types::{
     BoardChipClocksRequest, BoardLedState, BoardPauseRequest, BoardPowerTargetRequest, BoardTelemetry,
     BoardTempTargetRequest, BoardTuningRequest, FanCurvePoint, FanCurveRequest, FanCurveResponse,
     FirmwareBundleResponse, FirmwareUploadResponse, MinerPatchRequest, MinerTelemetry,
-    PoolConfigRequest, PoolConfigResponse, PsuOverrideRequest, PsuStatusResponse, SoundActionResponse,
+    PoolConfigRequest, PoolConfigResponse, PoolStatus, PoolsPutRequest, PoolsResponse,
+    PsuOverrideRequest, PsuStatusResponse, SoundActionResponse,
     SoundPlayRequest, SoundState, SourceTelemetry,
 };
 
@@ -70,6 +71,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(post_sound_mute))
         .routes(routes!(post_reboot))
         .routes(routes!(get_pool, patch_pool))
+        .routes(routes!(get_pools, put_pools))
         .routes(routes!(post_firmware_upload))
         .routes(routes!(post_firmware_bundle))
         .routes(routes!(get_sources))
@@ -825,7 +827,7 @@ async fn get_system(State(state): State<SharedState>) -> Json<serde_json::Value>
             device_model: Some("Avalon Nano 3S".into()),
             can_reboot: true,
             can_restart_miner: false,
-            pool_apply: "reboot",
+            pool_apply: "live",
             shared_rail: true,
             ceiling_w: ceiling,
             psu_contract_w: contract_w,
@@ -850,7 +852,7 @@ async fn get_system(State(state): State<SharedState>) -> Json<serde_json::Value>
         device_model: None,
         can_reboot: false,
         can_restart_miner: false,
-        pool_apply: "restart",
+        pool_apply: "live",
         shared_rail: false,
         ceiling_w: None,
         psu_contract_w: None,
@@ -1923,66 +1925,171 @@ where
     }))
 }
 
-/// Return the currently persisted pool configuration.
+/// Pool 1, for clients that predate `GET /api/v0/pools`.
 ///
-/// This is what will apply on the miner's *next* restart, not necessarily
-/// what the running process connected with at its own last startup -- see
-/// `GET /api/v0/sources` for the live connection's actual URL.
+/// The password is never returned.
 #[utoipa::path(
     get,
     path = "/pool",
     tag = "miner",
     responses(
-        (status = OK, description = "Currently persisted pool config", body = PoolConfigResponse),
+        (status = OK, description = "Pool 1", body = PoolConfigResponse),
     ),
 )]
 async fn get_pool() -> Json<PoolConfigResponse> {
-    let cfg = crate::pool_config::load();
-    Json(PoolConfigResponse {
-        url: cfg.url,
-        user: cfg.user,
-        password_set: cfg.pass.is_some(),
-    })
+    Json(pool1_response())
 }
 
-/// Update the persisted pool configuration.
-///
-/// Saved to `/data/userconfig/pool.conf` immediately; takes effect on the
-/// miner's next startup since the stratum client has no hot-reload path.
-/// Applying it requires a full device reboot (`POST /api/v0/reboot`), not
-/// just restarting the `mujina-minerd` process -- killing and relaunching
-/// the process in place leaves the RT-Smart core's IPC handle stale
-/// (hashrate stuck at 0 even though the API looks healthy), so this API
-/// deliberately does not offer a lighter process-only restart.
+/// Update pool 1 and apply it immediately. Other pools and their weights
+/// are left as they are. A process restart is not used: it would leave
+/// the Core 1 IPC handle stale.
 #[utoipa::path(
     patch,
     path = "/pool",
     tag = "miner",
     request_body = PoolConfigRequest,
     responses(
-        (status = OK, description = "Pool config saved", body = PoolConfigResponse),
+        (status = OK, description = "Pool 1 saved and applied", body = PoolConfigResponse),
         (status = BAD_REQUEST, description = "No fields set, or url isn't a stratum+tcp://\
             or stratum+ssl:// URL"),
         (status = INTERNAL_SERVER_ERROR, description = "Failed to write the config file"),
     ),
 )]
-async fn patch_pool(Json(req): Json<PoolConfigRequest>) -> Result<Json<PoolConfigResponse>, StatusCode> {
+async fn patch_pool(
+    State(state): State<SharedState>,
+    Json(req): Json<PoolConfigRequest>,
+) -> Result<Json<PoolConfigResponse>, StatusCode> {
     if req.url.is_none() && req.user.is_none() && req.password.is_none() {
         return Err(StatusCode::BAD_REQUEST);
     }
     if let Some(url) = &req.url
-        && !(url.starts_with("stratum+tcp://") || url.starts_with("stratum+ssl://"))
+        && !crate::pool_config::stratum_url(url)
     {
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let cfg = crate::pool_config::save_merged(req.url.as_deref(), req.user.as_deref(), req.password.as_deref())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(PoolConfigResponse {
+    let mut pools = crate::pool_config::load_pools();
+    if pools.is_empty() {
+        let url = req.url.clone().ok_or(StatusCode::BAD_REQUEST)?;
+        pools.push(crate::pool_config::PoolEntry {
+            url,
+            user: req.user.unwrap_or_default(),
+            pass: req.password.unwrap_or_default(),
+            weight: 100,
+        });
+    } else {
+        if let Some(url) = req.url {
+            pools[0].url = url;
+        }
+        if let Some(user) = req.user {
+            pools[0].user = user;
+        }
+        if let Some(pass) = req.password {
+            pools[0].pass = pass;
+        }
+    }
+    crate::pool_config::save_pools(&pools).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let _ = state.pool_reload_tx.send(pools).await;
+    Ok(Json(pool1_response()))
+}
+
+fn pool1_response() -> PoolConfigResponse {
+    let pools = crate::pool_config::load_pools();
+    if let Some(pool) = pools.first() {
+        return PoolConfigResponse {
+            url: Some(pool.url.clone()),
+            user: Some(pool.user.clone()),
+            password_set: !pool.pass.is_empty(),
+        };
+    }
+    let cfg = crate::pool_config::load();
+    PoolConfigResponse {
         url: cfg.url,
         user: cfg.user,
         password_set: cfg.pass.is_some(),
-    }))
+    }
+}
+
+/// Every configured pool, plus live status. Passwords are never returned;
+/// `password_set` says whether one is stored.
+#[utoipa::path(
+    get,
+    path = "/pools",
+    tag = "miner",
+    responses(
+        (status = OK, description = "Configured pools and live status", body = PoolsResponse),
+    ),
+)]
+async fn get_pools(State(state): State<SharedState>) -> Json<PoolsResponse> {
+    let telemetry = state.miner_telemetry();
+    let pools = crate::pool_config::load_pools()
+        .into_iter()
+        .map(|pool| {
+            let live = telemetry.sources.iter().find(|s| s.url.as_deref() == Some(pool.url.as_str()));
+            PoolStatus {
+                url: pool.url,
+                user: pool.user,
+                password_set: !pool.pass.is_empty(),
+                weight: pool.weight,
+                connected: live.map(|s| s.connected).unwrap_or(false),
+                difficulty: live.and_then(|s| s.difficulty),
+                accepted: live.map(|s| s.accepted).unwrap_or(0),
+                rejected: live.map(|s| s.rejected).unwrap_or(0),
+                hashrate_10m: live.map(|s| s.hashrate_10m).unwrap_or(0),
+                hashrate_1h: live.map(|s| s.hashrate_1h).unwrap_or(0),
+            }
+        })
+        .collect();
+    Json(PoolsResponse { pools })
+}
+
+/// Replace the pool set and apply it immediately, in this process.
+///
+/// At most 4 pools. Weights are percents and must sum to 100. A weight of
+/// 0 keeps the pool as a failover backup. URLs must be `stratum+tcp://` or
+/// `stratum+ssl://`. Omitting `password` keeps the stored password when
+/// the url and user are unchanged.
+#[utoipa::path(
+    put,
+    path = "/pools",
+    tag = "miner",
+    request_body = PoolsPutRequest,
+    responses(
+        (status = OK, description = "Pools saved and applied", body = PoolsResponse),
+        (status = BAD_REQUEST, description = "More than 4 pools, weights do not sum to 100, \
+            or a URL is not stratum+tcp:// or stratum+ssl://"),
+        (status = INTERNAL_SERVER_ERROR, description = "Failed to write the config file"),
+    ),
+)]
+async fn put_pools(
+    State(state): State<SharedState>,
+    Json(req): Json<PoolsPutRequest>,
+) -> Result<Json<PoolsResponse>, (StatusCode, String)> {
+    let existing = crate::pool_config::load_pools();
+    let mut pools = Vec::with_capacity(req.pools.len());
+    for put in &req.pools {
+        let pass = match &put.password {
+            Some(password) => password.clone(),
+            None => existing
+                .iter()
+                .find(|e| e.url == put.url && e.user == put.user)
+                .map(|e| e.pass.clone())
+                .unwrap_or_default(),
+        };
+        pools.push(crate::pool_config::PoolEntry {
+            url: put.url.clone(),
+            user: put.user.clone(),
+            pass,
+            weight: put.weight,
+        });
+    }
+    if let Err(reason) = crate::pool_config::validate(&pools) {
+        return Err((StatusCode::BAD_REQUEST, reason.to_string()));
+    }
+    crate::pool_config::save_pools(&pools)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let _ = state.pool_reload_tx.send(pools).await;
+    Ok(get_pools(State(state)).await)
 }
 
 /// Return the current LCD visual theme and page state.
@@ -2640,5 +2747,121 @@ mod tests {
                 Err(StatusCode::BAD_REQUEST)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn pools_api_rejects_a_bad_set_and_hides_the_password() {
+        use http_body_util::BodyExt;
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = LOCK.lock().await;
+        let dir = std::env::temp_dir().join(format!(
+            "mujina-pools-api-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The config path is process-global. The mutex above keeps this
+        // test from overlapping itself; nothing else reads MUJINA_USERCONFIG.
+        unsafe { std::env::set_var("MUJINA_USERCONFIG", &dir) };
+
+        let (miner_tx, miner_rx) = tokio::sync::watch::channel(MinerTelemetry::default());
+        let _miner_tx = miner_tx;
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel(4);
+        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(4);
+        let app = super::super::server::build_router(
+            miner_rx,
+            std::sync::Arc::new(std::sync::Mutex::new(super::super::registry::BoardRegistry::new())),
+            cmd_tx,
+            None,
+            reload_tx,
+        );
+
+        let bad = serde_json::json!({
+            "pools": [
+                {"url": "http://nope", "user": "a.worker", "password": "secret", "weight": 100}
+            ]
+        });
+        let resp = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri("/api/v0/pools")
+                .header("content-type", "application/json")
+                .body(Body::from(bad.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let five: Vec<_> = (0..5)
+            .map(|i| {
+                serde_json::json!({
+                    "url": format!("stratum+tcp://p{i}.example:3333"),
+                    "user": "a.worker",
+                    "weight": 20
+                })
+            })
+            .collect();
+        let resp = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri("/api/v0/pools")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"pools": five}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let ok = serde_json::json!({
+            "pools": [
+                {"url": "stratum+tcp://a.example:3333", "user": "a.worker", "password": "secret", "weight": 60},
+                {"url": "stratum+ssl://b.example:3333", "user": "b.worker", "password": "other", "weight": 40}
+            ]
+        });
+        let resp = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri("/api/v0/pools")
+                .header("content-type", "application/json")
+                .body(Body::from(ok.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["pools"][0].get("password").is_none());
+        assert_eq!(json["pools"][0]["password_set"], true);
+        assert_eq!(json["pools"][0]["weight"], 60);
+        assert_eq!(json["pools"][1]["weight"], 40);
+        let applied = reload_rx.recv().await.expect("director notified");
+        assert_eq!(applied.len(), 2);
+        assert_eq!(applied[0].pass, "secret");
+
+        let legacy = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::builder()
+                .uri("/api/v0/pool")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(legacy.status(), StatusCode::OK);
+        let body = legacy.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["url"], "stratum+tcp://a.example:3333");
+        assert!(json.get("password").is_none());
+        assert_eq!(json["password_set"], true);
+
+        unsafe { std::env::remove_var("MUJINA_USERCONFIG") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -11,7 +11,7 @@ use std::collections::{HashMap, VecDeque};
 use axum::{
     Json,
     http::StatusCode,
-    response::{Html, IntoResponse, Redirect},
+    response::{Html, IntoResponse},
     routing, Router,
 };
 use serde_json::{json, Value};
@@ -31,6 +31,7 @@ const LED_HTML: &str = include_str!("../../assets/led.html");
 /// `/dashboard` for the same reason `/led` is -- a standing config surface
 /// rather than a telemetry view.
 const TUNING_HTML: &str = include_str!("../../assets/tuning.html");
+const POOL_HTML: &str = include_str!("../../assets/pool.html");
 /// Network firmware updater (upload mujina-minerd or the harness binary,
 /// applied immediately with a reboot) -- separate from `/dashboard` for
 /// the same reason `/led`/`/pool` are.
@@ -160,9 +161,8 @@ async fn serve_led_page() -> impl IntoResponse {
     Html(LED_HTML)
 }
 
-/// Pool settings now live on the dashboard; keep old bookmarks working.
 async fn serve_pool_page() -> impl IntoResponse {
-    Redirect::temporary("/dashboard#pool")
+    Html(POOL_HTML)
 }
 
 async fn serve_tuning_page() -> impl IntoResponse {
