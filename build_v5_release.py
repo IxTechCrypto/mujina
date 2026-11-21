@@ -2,8 +2,9 @@ import os
 import shutil
 import subprocess
 import struct
-import zlib
 import hashlib
+
+from rtos_core.tools.pack_nano3s_release import pack_release_image
 
 def run_cmd(cmd, cwd=None):
     print(f"Running: {cmd}")
@@ -283,32 +284,16 @@ bundle_size = os.path.getsize(bundle_bin)
 bundle_sha256 = hashlib.sha256(bundle_data).hexdigest()
 print(f"  Built OTA bundle: {bundle_bin} ({bundle_size} bytes, SHA-256: {bundle_sha256})")
 
-print("[5] Repacking nano-mujina-v5-release.kdimg with updated app_ubi and data...")
+print("[5] Repacking nano-mujina-v5-release.kdimg with the U-Boot splash, app_ubi, and data...")
 src_kdimg = "/home/grant/udisk_build/nano-mujina-v4.kdimg"
 out_kdimg = "/home/grant/udisk_build/nano-mujina-v5-release.kdimg"
 pack_py = "/mnt/d/github/torii/tools/nano3s-image/pack_kdimg.py"
-run_cmd(f"python3 {pack_py} {src_kdimg} {out_kdimg} app_ubi={v5_app_img} data={v5_data_img}")
+pack_release_image(pack_py, src_kdimg, out_kdimg, v5_app_img, v5_data_img)
+print(f"Verified kdimg partition ranges and checksums ({os.path.getsize(out_kdimg)} bytes)")
 
-kdimg_size = os.path.getsize(out_kdimg)
-print(f"Generated kdimg size: {kdimg_size} bytes (expected 129,232,128)")
-assert kdimg_size == 129232128, f"kdimg size mismatch: {kdimg_size} != 129232128"
-
-print("[6] Verifying partition table and CRC32...")
-raw = open(out_kdimg, "rb").read()
-magic, header_crc, _, version, count, tbl_crc = struct.unpack_from("<6I", raw, 0)
-assert magic == 0x27cb8f93, f"Bad magic: {magic:#x}"
-tbl = raw[512:512 + count * 256]
-calc_tbl_crc = zlib.crc32(tbl) & 0xFFFFFFFF
-assert tbl_crc == calc_tbl_crc, f"Table CRC mismatch: {tbl_crc:#x} != {calc_tbl_crc:#x}"
-
-zeroed_header = bytearray(raw[:512])
-struct.pack_into("<I", zeroed_header, 4, 0)
-calc_hdr_crc = zlib.crc32(zeroed_header) & 0xFFFFFFFF
-assert header_crc == calc_hdr_crc, f"Header CRC mismatch: {header_crc:#x} != {calc_hdr_crc:#x}"
-print(f"CRC checks passed: header_crc={header_crc:#x}, tbl_crc={tbl_crc:#x}")
-
-print("[7] Copying release artifacts to Windows Downloads...")
-kdimg_sha256 = hashlib.sha256(raw).hexdigest()
+print("[6] Copying release artifacts to Windows Downloads...")
+with open(out_kdimg, "rb") as image:
+    kdimg_sha256 = hashlib.sha256(image.read()).hexdigest()
 app_sha256 = hashlib.sha256(full_app).hexdigest()
 data_sha256 = hashlib.sha256(full_data).hexdigest()
 print(f"kdimg SHA-256: {kdimg_sha256}")

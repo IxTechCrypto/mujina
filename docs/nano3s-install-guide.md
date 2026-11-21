@@ -140,6 +140,10 @@ curl -X POST --data-binary @nano-mujina-v5-bundle.bin \
 
 ## Part 3: First Boot, Wi-Fi Onboarding & Mining Setup
 
+The full USB release image installs the Mujina power-on splash in both U-Boot
+slots. Miners updated through the dashboard continue to use their installed
+U-Boot splash.
+
 ### 1. Initial Power-Up
 1. Ensure the **Wi-Fi USB dongle** is plugged into the Nano 3S.
 2. Plug in the 28V DC power supply.
@@ -172,3 +176,14 @@ curl -X POST --data-binary @nano-mujina-v5-bundle.bin \
      * **Max Hash**: Climbs to full continuous safety envelope (~5.0+ TH/s @ 105–112W).
 4. **Customize WS2812 LEDs:**
    * Open `http://<MINER_IP>/led` to select dynamic Stratum Share effects (`SharePulse`, `ShareWave`, `Cylon Scanner`, `Halloween`, `Christmas`). Settings persist non-volatilely to `/data/userconfig/led.conf`.
+
+## Building the USB release
+
+Install Pillow in the Python environment that runs `build_v5_release.py`.
+The release packer converts the [splash PNG](../rtos_core/tools/assets/nano3s-boot-splash.png)
+to the LCD's RGB565 format and verifies the base U-Boot payload before patching
+it. A different U-Boot build requires rechecking the bitmap location and payload
+hash.
+
+The splash uses the [Mujina badger mark](https://github.com/rkuester/mujina-logo-set)
+and a wordmark rendered with [Bridge OFFicer by Iconian Fonts](https://www.iconian.com/commercial.html).
