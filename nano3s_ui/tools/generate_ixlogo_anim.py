@@ -10,36 +10,53 @@ def generate():
     scratch_dir = r"C:\Users\grant\.gemini\antigravity\brain\fa08a51d-7d2a-471f-accf-2797da253ec2\scratch\frames_240_full"
     os.makedirs(scratch_dir, exist_ok=True)
 
-    # 1. Extract 150 frames (15 FPS for 10.0s), center cropped 640x640 from 720p and scaled to 240x240
-    print("Extracting 150 frames at 15 fps (640x640 center zoom scaled to 240x240)...")
-    cmd = [
-        "ffmpeg", "-y", "-i", mp4_path,
-        "-vf", "crop=640:640:320:40,scale=240:240",
-        "-r", "15",
-        os.path.join(scratch_dir, "f_%04d.png")
-    ]
-    subprocess.run(cmd, check=True, capture_output=True)
+    # 1. Extract 150 frames (15 FPS for 10.0s) from raw 720p MP4
+    raw_dir = r"C:\Users\grant\.gemini\antigravity\brain\fa08a51d-7d2a-471f-accf-2797da253ec2\scratch\all_raw_15fps"
+    os.makedirs(raw_dir, exist_ok=True)
+    raw_files = sorted(glob.glob(os.path.join(raw_dir, "raw_*.png")))[:150]
+    if len(raw_files) != 150:
+        print("Extracting 150 raw frames at 15 fps...")
+        cmd = [
+            "ffmpeg", "-y", "-i", mp4_path,
+            "-r", "15",
+            os.path.join(raw_dir, "raw_%04d.png")
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        raw_files = sorted(glob.glob(os.path.join(raw_dir, "raw_*.png")))[:150]
 
-    files = sorted(glob.glob(os.path.join(scratch_dir, "f_*.png")))[:150]
-    num_frames = len(files)
+    num_frames = len(raw_files)
     if num_frames != 150:
         raise ValueError(f"Expected 150 frames, found {num_frames}")
-    print(f"Loaded {num_frames} frames")
+    print(f"Loaded {num_frames} raw frames")
+
+    # Scale and center so all text, logo, and animation stay 100% inside R <= 108.2 px
+    # Composition center in 1280x720 is (637.0, 361.0).
+    # S = 0.255 maps the composition width (609px) to ~155px, and height (603px) to ~154px.
+    # Max radius to furthest text corners is exactly 108.19 px (well inside R=114 bezel).
+    S = 0.255
+    scaled_w = int(round(1280 * S))
+    scaled_h = int(round(720 * S))
+    paste_x = int(round(120.0 - 637.0 * S))
+    paste_y = int(round(120.0 - 361.0 * S))
 
     # 2. Process frames: circular vignette mask + black noise gate + subtle electric rim
     cy, cx = 120.0, 120.0
     Y, X = np.ogrid[:240, :240]
     dist = np.sqrt((X - cx)**2 + (Y - cy)**2)
 
-    # Circular mask: full brightness up to r=114, smooth cosine/linear roll-off to 0 at r=117.5
+    # Circular mask: full brightness up to r=114, smooth roll-off to 0 at r=117.5
     mask = np.clip((117.5 - dist) / 3.5, 0.0, 1.0)[:, :, np.newaxis]
     # Subtle electric rim: Gaussian profile around r=117.0 (matching IxTech electric violet-cyan glow)
     rim_profile = np.exp(-0.5 * ((dist - 117.0) / 0.75)**2)[:, :, np.newaxis]
     rim_color = np.array([160.0, 100.0, 240.0], dtype=np.float32)
 
     processed = []
-    for f in files:
-        arr = np.array(Image.open(f), dtype=np.float32)
+    for f in raw_files:
+        im = Image.open(f).resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", (240, 240), (0, 0, 0))
+        canvas.paste(im, (paste_x, paste_y))
+        arr = np.array(canvas, dtype=np.float32)
+
         # Noise gate: crush background video compression artifacts to pure black
         max_c = np.max(arr, axis=2, keepdims=True)
         noise_gate = np.clip((max_c - 6.0) / 10.0, 0.0, 1.0)
