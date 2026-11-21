@@ -1,10 +1,30 @@
-//! NerdQX (ESP32-S3R8) portable firmware logic. `no_std` unless testing.
-#![cfg_attr(not(test), no_std)]
+//! NerdQX (ESP32-S3R8) portable firmware logic. `no_std` unless testing or targeting ESP-IDF.
+#![cfg_attr(not(any(test, feature = "esp32s3")), no_std)]
 
+pub mod bm1370;
+#[cfg(any(test, feature = "esp32s3"))]
+pub mod captive_dns;
 pub mod chip_tuner;
+#[cfg(feature = "esp32s3")]
+pub mod hud_render;
+#[cfg(any(test, feature = "esp32s3"))]
+pub mod hud_data;
 pub mod hw_pins;
+#[cfg(feature = "esp32s3")]
+pub mod i2c_bus;
+#[cfg(feature = "esp32s3")]
+pub mod lcd_driver;
 pub mod lcd_hud;
+#[cfg(any(test, feature = "esp32s3"))]
+pub mod market;
+#[cfg(any(test, feature = "esp32s3"))]
+pub mod net_web;
 pub mod power_cooling;
+pub mod qr_code;
+#[cfg(feature = "esp32s3")]
+pub mod ui_assets;
+#[cfg(feature = "esp32s3")]
+pub mod ui_fonts;
 
 #[cfg(test)]
 mod tests {
@@ -63,6 +83,13 @@ mod tests {
             "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y", "CONFIG_ESPTOOLPY_FLASHMODE_DIO=y", "CONFIG_ESPTOOLPY_FLASHFREQ_80M=y"] {
             assert!(s.lines().any(|l| l == k), "missing {k}");
         }
+    }
+
+    #[test]
+    fn cargo_config_wires_sdkconfig_and_partition_table() {
+        let cfg = include_str!("../.cargo/config.toml");
+        assert!(cfg.contains("sdkconfig.defaults.nerdqx"));
+        assert!(cfg.contains("--partition-table partitions.csv"));
     }
 
     #[test]
@@ -125,6 +152,37 @@ mod tests {
         let n = ramp_len(495.0); // non-multiple: last step clamps to target
         assert_eq!(ramp_freq(n - 1, 495.0), 495.0);
         assert_eq!(ramp_freq(n + 5, 495.0), 495.0);
+    }
+
+    #[test]
+    fn vcore_follows_clock_and_hits_factory_point() {
+        assert_eq!(vcore_for_freq_mv(400.0), 1150);
+        assert_eq!(vcore_for_freq_mv(500.0), 1150);
+        assert_eq!(vcore_for_freq_mv(START_FREQ_MHZ as f32), START_MV);
+        assert_eq!(boot_point_for_profile("max_hash"), (777, 1250));
+        for p in ["efficient", "balanced", "quiet", "anything"] {
+            assert_eq!(boot_point_for_profile(p), (450, 1120));
+        }
+        assert_eq!(vcore_for_freq_mv(MAX_BASE_FREQ_MHZ), 1265);
+        assert_eq!(vcore_for_freq_mv(2000.0), MAX_VCORE_MV);
+        assert_eq!(vcore_for_freq_mv(f32::NAN), 1150);
+        let mut prev = 0;
+        for f in (400..=825).step_by(5) {
+            let mv = vcore_for_freq_mv(f as f32);
+            assert!(mv >= prev && mv % 5 == 0 && mv <= MAX_VCORE_MV);
+            prev = mv;
+        }
+    }
+
+    #[test]
+    fn vr_fan_never_below_40_and_fails_safe() {
+        assert_eq!(vr_fan_duty_pct(Some(20.0)), 40);
+        assert_eq!(vr_fan_duty_pct(Some(35.0)), 40);
+        assert_eq!(vr_fan_duty_pct(Some(40.0)), 70);
+        assert_eq!(vr_fan_duty_pct(Some(45.0)), 100);
+        assert_eq!(vr_fan_duty_pct(Some(70.0)), 100);
+        assert_eq!(vr_fan_duty_pct(None), 100);
+        assert_eq!(vr_fan_duty_pct(Some(f32::NAN)), 100);
     }
 
     #[test]
@@ -308,10 +366,10 @@ mod tests {
                 }
                 ScreenLayout::PoolShares { summary_bar, rows } => {
                     assert!(summary_bar.fits_in(PAGE_BOUNDS));
-                    for i in 0..3 {
+                    for i in 0..2 {
                         assert!(rows[i].fits_in(PAGE_BOUNDS));
                         assert!(!summary_bar.overlaps(rows[i]));
-                        for j in (i + 1)..3 {
+                        for j in (i + 1)..2 {
                             assert!(!rows[i].overlaps(rows[j]));
                         }
                     }
@@ -394,6 +452,68 @@ mod tests {
         assert_eq!(h.on_button(Button::Btn1, Edge::Release, 100), None);
         assert_eq!(h.on_button(Button::Btn2, Edge::Release, 120), None);
         assert_eq!(h.screen, Screen::MainHud);
+    }
+
+    #[test]
+    fn tps53647_vid_and_linear11_helpers() {
+        assert_eq!(mv_to_vr12_vid(1150), Some(181));
+        assert_eq!(mv_to_vr12_vid(1200), Some(191));
+        assert_eq!(mv_to_vr12_vid(1000), Some(0x96)); // factory-default 0x97 avoided
+        assert_eq!(mv_to_vr12_vid(750), None);
+        assert_eq!(mv_to_vr12_vid(1450), None);
+        assert!((vr12_vid_to_volts(181) - 1.15).abs() < 1e-4);
+        assert_eq!(vr12_vid_to_volts(0), 0.0);
+
+        // Q7.9 MFR_VOUT_MEASURED decode (589 / 512 = 1.1504 V), plus 0xFFFF fallback
+        let v = decode_tps53647_vout_measured(589, 181);
+        assert!((v - 1.15039).abs() < 1e-3);
+        let fb = decode_tps53647_vout_measured(0xFFFF, 181);
+        assert!((fb - 1.15).abs() < 1e-4);
+
+        for target in [95.0f32, 125.0, 142.0, 12.66] {
+            let decoded = decode_linear11(encode_linear11(target));
+            assert!((decoded - target).abs() < 0.05, "target {target} decoded {decoded}");
+        }
+    }
+
+    #[test]
+    fn tmp451_and_fail_closed_safety_cutoff() {
+        assert_eq!(decode_tmp451_remote_c(0x80, 0x3C, 0x00), None); // BUSY
+        assert_eq!(decode_tmp451_remote_c(0x04, 0x3C, 0x00), None); // REMOTE_OPEN
+        let cal = decode_tmp451_remote_c(0x00, 0x3C, 0x00).expect("60 C raw diode");
+        assert!((cal - 35.9).abs() < 1e-3);
+
+        let good_temps = [Some(55.0), Some(56.0), Some(57.0), Some(58.0)];
+        assert_eq!(evaluate_safety_cutoff(true, 12.5, 90.0, 144.0, Some(52.0), &good_temps, 0), None);
+        assert_eq!(
+            evaluate_safety_cutoff(true, 12.5, 145.0, 144.0, Some(52.0), &good_temps, 0),
+            Some("power_or_vin_fault")
+        );
+        assert_eq!(
+            evaluate_safety_cutoff(true, 12.5, 90.0, 144.0, Some(95.0), &good_temps, 0),
+            Some("vr_overtemp_or_invalid")
+        );
+        assert_eq!(
+            evaluate_safety_cutoff(true, 12.5, 90.0, 144.0, Some(52.0), &[Some(55.0), Some(85.0), None, None], 0),
+            Some("asic_overtemp")
+        );
+        assert_eq!(
+            evaluate_safety_cutoff(true, 12.5, 90.0, 144.0, Some(52.0), &[None; 4], 0),
+            Some("all_temp_sensors_missing")
+        );
+        assert_eq!(
+            evaluate_safety_cutoff(true, 12.5, 90.0, 144.0, Some(52.0), &good_temps, 3),
+            Some("tps53647_i2c_lost")
+        );
+
+        assert_eq!(compute_fan_duty_pct(Some(45.0), Some(40.0), false), 25);
+        assert_eq!(compute_fan_duty_pct(Some(58.0), Some(40.0), false), 25);
+        assert_eq!(compute_fan_duty_pct(Some(59.5), Some(40.0), false), 35);
+        assert_eq!(compute_fan_duty_pct(Some(61.0), Some(40.0), false), 45);
+        assert_eq!(compute_fan_duty_pct(Some(72.0), Some(40.0), false), 100);
+        assert_eq!(compute_fan_duty_pct(None, Some(40.0), false), 100);
+        assert_eq!(compute_fan_duty_pct(Some(60.0), Some(80.0), false), 100);
+        assert_eq!(compute_fan_duty_pct(Some(50.0), Some(40.0), true), 100);
     }
 }
 

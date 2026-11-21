@@ -8,8 +8,10 @@ pub const RAMP_START_MHZ: f32 = 56.25;
 pub const SAFE_FREQ_MHZ: f32 = 495.0;
 pub const SAFE_MV: u32 = 1150;
 
-/// BM1370 die sweet spot / limits (deg C).
-pub const TEMP_TARGET_C: f32 = 61.0;
+/// BM1370 die sweet spot (`58..=61` deg C, nominal `60` C) and thermal limits (deg C).
+pub const TEMP_TARGET_MIN_C: f32 = 58.0;
+pub const TEMP_TARGET_NOMINAL_C: f32 = 60.0;
+pub const TEMP_TARGET_C: f32 = 63.0;
 pub const TEMP_HOT_C: f32 = 65.0;
 pub const TEMP_CRIT_C: f32 = 75.0;
 pub const VR_TEMP_LIMIT_C: f32 = 100.0;
@@ -44,6 +46,80 @@ pub fn ramp_freq(idx: usize, target_mhz: f32) -> f32 {
         target_mhz
     } else {
         f
+    }
+}
+
+/// Factory NerdQX operating point and tuner clock/voltage envelope.
+pub const START_FREQ_MHZ: u16 = 777;
+pub const START_MV: u16 = 1250;
+/// Highest base clock the tuner/manual API may request (per-chip offsets add up to +50 on top).
+pub const MAX_BASE_FREQ_MHZ: f32 = 825.0;
+pub const MIN_BASE_FREQ_MHZ: f32 = 100.0;
+pub const MIN_VCORE_MV: u16 = 950;
+pub const MAX_VCORE_MV: u16 = 1280;
+/// Lowest duty for the VR (VRM) fan header, and for the ASIC fan header.
+pub const VR_FAN_MIN_PCT: u8 = 40;
+pub const ASIC_FAN_MIN_PCT: u8 = 25;
+
+/// Core voltage the tuner pairs with a base clock: 1150 mV up to 500 MHz, rising linearly
+/// to the factory 1250 mV at 777 MHz and on to the 1280 mV rail limit. 5 mV VID steps.
+pub fn vcore_for_freq_mv(freq_mhz: f32) -> u16 {
+    let f = if freq_mhz.is_finite() { freq_mhz } else { 500.0 };
+    let mv = 1150.0 + (f - 500.0) * (100.0 / 277.0);
+    let stepped = ((mv / 5.0).round() * 5.0) as i32;
+    stepped.clamp(SAFE_MV as i32, MAX_VCORE_MV as i32) as u16
+}
+
+/// VRM temperature the VR fan works to hold (deg C).
+pub const VR_TARGET_C: f32 = 35.0;
+/// VR fan reaches 100% this many degrees above the target.
+pub const VR_FAN_FULL_ABOVE_C: f32 = 10.0;
+
+/// VR fan duty from VRM temperature: `VR_FAN_MIN_PCT` at or below `VR_TARGET_C`, rising
+/// linearly to 100% at `VR_TARGET_C + 10`, 100% when the reading is missing. Keeps the
+/// regulators as cool as the fan allows.
+pub fn vr_fan_duty_pct(vr_temp_c: Option<f32>) -> u8 {
+    let Some(t) = vr_temp_c.filter(|t| t.is_finite()) else {
+        return 100;
+    };
+    if t <= VR_TARGET_C {
+        return VR_FAN_MIN_PCT;
+    }
+    if t >= VR_TARGET_C + VR_FAN_FULL_ABOVE_C {
+        return 100;
+    }
+    let span = (100 - VR_FAN_MIN_PCT) as f32;
+    (VR_FAN_MIN_PCT as f32 + (t - VR_TARGET_C) / VR_FAN_FULL_ABOVE_C * span).round() as u8
+}
+
+/// NerdQX (BM1370) tuner profiles as `(id, label, hint)`. The dashboard builds its profile
+/// list from these, so NerdQX never shows Nano 3S wording or targets.
+pub const NERDQX_PROFILES: [(&str, &str, &str); 5] = [
+    ("quiet", "Quiet", "400 MHz @ 1150 mV, 90 W cap, lowest fan noise"),
+    ("efficient", "Efficient", "450 MHz @ 1120 mV, 110 W cap, best J/TH"),
+    ("balanced", "Balanced", "512 MHz @ 1150 mV, capped by the PSU tier"),
+    ("max_hash", "Max hash", "Climbs toward 825 MHz while dies stay under 58-61 C and under the PSU tier"),
+    ("target", "Target (power / hashrate)", "Holds a power (W) or hashrate (TH/s) setpoint"),
+];
+
+/// Operating point the board starts mining at, by tuner profile: max-hash starts at the factory
+/// 777 MHz / 1250 mV, every other profile at the efficient point (450 MHz / 1120 mV).
+pub fn boot_point_for_profile(profile: &str) -> (u16, u16) {
+    if profile == "max_hash" {
+        (START_FREQ_MHZ, START_MV)
+    } else {
+        let (f, mv, _) = nerdqx_profile_goal("efficient", 0.0);
+        (f as u16, mv)
+    }
+}
+
+/// Goal `(base MHz, core mV, power cap W)` for a NerdQX tuner profile.
+pub fn nerdqx_profile_goal(profile: &str, eff_ceiling_w: f32) -> (f32, u16, f32) {
+    match profile {
+        "quiet" => (400.0, 1100, 90.0),
+        "efficient" => (450.0, 1120, 110.0),
+        "max_hash" => (MAX_BASE_FREQ_MHZ, vcore_for_freq_mv(MAX_BASE_FREQ_MHZ), eff_ceiling_w),
+        _ => (512.5, 1150, eff_ceiling_w),
     }
 }
 

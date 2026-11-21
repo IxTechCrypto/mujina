@@ -1270,7 +1270,7 @@
       <h2>Fan Curve</h2>
   <div id="curveSection" style="display:none">
   <!-- Fan Curve -->
-  <div class="sec">Fan Curve<span class="sec-sub">Outlet-temp → duty% baseline, used in Auto mode — saved immediately, applied within ~1s</span></div>
+  <div class="sec">Fan Curve<span class="sec-sub" id="curveNote">ASIC die temp (58–63 °C BM1370 target) → duty% baseline, used in Auto mode — saved immediately</span></div>
   <div class="card" style="max-width:560px">
     <svg id="curvePreview" viewBox="0 0 300 120" style="width:100%;height:120px;display:block;margin-bottom:10px;background:var(--panel2);border:1px solid var(--line);border-radius:6px">
       <g id="curveGrid" stroke="var(--line)" stroke-width="1"></g>
@@ -1857,7 +1857,37 @@ function capsOf(name) {
 }
 function activeCaps() { return capsOf(activeName()); }
 function boardUrl(kind, name) { return '/api/v0/boards/' + enc(name) + '/' + kind; }
-function hasCeiling() { return !!(SYS && SYS.power && SYS.power.ceiling_w != null); }
+// Device family comes from the board itself ("nerdqx", "nano3s"); older firmware without it
+// falls back to the Nano-only power-ceiling marker.
+function boardFamily(name) {
+  const b = SYS && SYS.boards ? SYS.boards.find(x => x.name === (name || activeName())) : null;
+  if (b && b.family) return b.family;
+  return (SYS && SYS.power && SYS.power.ceiling_w != null) ? 'nano3s' : 'generic';
+}
+function boardInfo(name) {
+  return SYS && SYS.boards ? (SYS.boards.find(x => x.name === (name || activeName())) || null) : null;
+}
+function hasCeiling() { return boardFamily() === 'nano3s'; }
+const STATIC_PROFILES = [['off','Off'],['quiet','Quiet'],['efficient','Efficient'],['balanced','Balanced'],['max_hash','Max hash'],['target','Target (power / hashrate)']];
+// Profile list per device: the board declares its own (NerdQX); others keep the static Nano/host list.
+function syncProfileOptions() {
+  const sel = $('ownProfile');
+  if (!sel) return;
+  const info = boardInfo();
+  const list = [['off','Off']].concat(info && info.profiles && info.profiles.length
+    ? info.profiles.map(p => [p.id, p.label, p.hint]) : STATIC_PROFILES.slice(1));
+  const key = list.map(p => p[0] + ':' + p[1]).join(',');
+  if (sel.dataset.profileKey === key) return;
+  const cur = sel.value;
+  sel.dataset.profileKey = key;
+  sel.innerHTML = '';
+  for (const [v, label, hint] of list) {
+    const o = document.createElement('option');
+    o.value = v; o.textContent = label; if (hint) o.title = hint;
+    sel.appendChild(o);
+  }
+  if (list.some(p => p[0] === cur)) sel.value = cur;
+}
 
 async function loadSystem() {
   try {
@@ -1957,14 +1987,23 @@ function applyBoardCaps() {
   show('manualSection', manual);
   show('tuningNone', !!SYS && !tuner && !manual);
   const nano = hasCeiling();
-  show('tunePresetRow', nano); show('tunePowerRow', nano); $('tuneFreq').min = nano ? 100 : 50; $('tuneFreq').max = nano ? 520 : 1200;
-  $('tuneVolt').min = nano ? 3300 : 500; $('tuneVolt').max = nano ? 3912 : 1600;
+  show('tunePresetRow', nano); show('tunePowerRow', nano); const lim = (boardInfo(name) || {}).limits || null;
+  const fr = lim && lim.freq_mhz ? lim.freq_mhz : (nano ? [100, 520] : [50, 1200]);
+  const mv = lim && lim.core_mv ? lim.core_mv : (nano ? [3300, 3912] : [500, 1600]);
+  $('tuneFreq').min = fr[0]; $('tuneFreq').max = fr[1];
+  $('tuneVolt').min = mv[0]; $('tuneVolt').max = mv[1];
+  syncProfileOptions();
   const fan = caps ? caps.fan : 'none';
   show('fanSection', !!SYS && fan && fan !== 'none');
   $('fanNote').textContent = fan === 'harness'
     ? 'Controlled by the device harness: Auto follows the fan curve (and escalates to 100% if a chip runs too hot); Manual holds a fixed duty.'
     : 'Board fan: Auto lets the board regulate temperature; Manual holds a fixed duty.';
   show('curveSection', !!(caps && caps.fan_curve));
+  if ($('curveNote')) {
+    $('curveNote').textContent = nano
+      ? 'Outlet-temp → duty% baseline, used in Auto mode — saved immediately, applied within ~1s'
+      : 'ASIC die temp (58–63 °C BM1370 target) → duty% baseline, used in Auto mode — saved immediately';
+  }
   if (caps && caps.fan_curve && CURVE_FOR !== name) { CURVE_FOR = name; loadCurve(); }
   if (b && nano === false && TUNE_FOR !== name) {
     TUNE_FOR = name;
@@ -2071,8 +2110,8 @@ function renderChips(chips, perChip) {
   card.style.display = '';
   const b = activeBoard();
   const caps = activeCaps();
-  const isNano3sTuner = !!(caps && caps.tuner && b && b.model && b.model.indexOf('Nano3s') >= 0);
-  const activeOffsets = isNano3sTuner ? CHIP_OFFSETS : [];
+  const showOffsets = !!(caps && caps.tuner);
+  const activeOffsets = showOffsets ? CHIP_OFFSETS : [];
   const peak = Math.max(...chips.map(c => c.ghs || 0)) || 1;
   let list = chips;
   if (CHIP_FILTER === 'lazy') list = chips.filter(c => (c.ghs || 0) < peak * 0.75);
@@ -2089,7 +2128,7 @@ function renderChips(chips, perChip) {
     const nameRow = mk('div', 'ctname');
     nameRow.appendChild(mk('span', null, 'ASIC ' + idx));
 
-    const rawOff = (activeOffsets && Number.isFinite(idx)) ? activeOffsets[idx] : 0;
+    const rawOff = (c.offset_mhz != null) ? c.offset_mhz : ((activeOffsets && Number.isFinite(idx)) ? activeOffsets[idx] : 0);
     const off = Number.isFinite(+rawOff) ? Math.round(+rawOff) : 0;
     if (off !== 0) {
       const badge = mk('span', 'ctoffset', (off > 0 ? '+' : '') + off + ' MHz');
@@ -2355,7 +2394,7 @@ function renderBoard(b) {
   $('boardhrlabel').textContent = online ? ('Hashrate — ' + (b.board_name || 'board')) : 'Hashrate';
   if (!online) { $('hr').innerHTML = '<span class="na">offline</span>'; renderChips(null, false); renderChipTemps(null, false); return; }
   const caps = activeCaps();
-  const perChip = caps ? caps.chip_grid === 'per_chip' : !!(b.chips && b.chips.length);
+  const perChip = (caps && caps.chip_grid === 'per_chip') || !!(b.chips && b.chips.length);
   $('hr').innerHTML = (b.hashrate_ghs == null) ? '<span class="na">n/a</span>'
     : ((b.hashrate_ghs >= 1000) ? (+b.hashrate_ths).toFixed(2) + ' <small>TH/s</small>' : (+b.hashrate_ghs).toFixed(2) + ' <small>GH/s</small>');
   $('freq').innerHTML = (b.freq_mhz != null) ? (+b.freq_mhz).toFixed(0) + ' <small>MHz</small>' : '<span class="na">n/a</span>';
@@ -2519,7 +2558,7 @@ function renderCurveRows() {
       c.append(l, inp);
       return [c, inp];
     };
-    const [c1, tIn] = cell('Outlet °C', 'curveTemp', 0, 150, 0.5, p.temp_c);
+    const [c1, tIn] = cell(hasCeiling() ? 'Outlet °C' : 'ASIC °C', 'curveTemp', 0, 150, 0.5, p.temp_c);
     const [c2, dIn] = cell('Duty %', 'curveDuty', 0, 100, 1, p.duty_pct);
     tIn.addEventListener('input', () => { CURVE_POINTS[i].temp_c = +tIn.value; drawCurvePreview(); });
     dIn.addEventListener('input', () => { CURVE_POINTS[i].duty_pct = +dIn.value; drawCurvePreview(); });
@@ -2611,6 +2650,29 @@ const restartMiner = () => powerAction('/api/v0/restart', 'restartBtn', 'powerMs
   'Restart the miner process now? Hashing pauses briefly.', 'restarting miner…');
 
 // ---- PSU Overclock & Power Delivery ----
+const NERDQX_PSU_PRESETS = [
+  ['1A', '144 W · 15 A stock fuse (Stock Air — safe default)'],
+  ['2A', '180 W · 15 A stock fuse max'],
+  ['1B', '192 W · 20 A upgraded fuse (Upgraded Air)'],
+  ['4A', '240 W · 20 A upgraded fuse (AiO Liquid)'],
+];
+
+const NANO3S_PSU_PRESETS = [
+  ['stock', 'Standard USB-PD (112W Safe · 80% duty)'],
+  ['aggressive', 'Aggressive PD (130W · Canaan High Match)'],
+  ['custom', 'Mean Well / Custom DC (Overclock Bypass)'],
+];
+
+let PSU_IS_NERDQX = false;
+
+function setPsuSelectOptions(presets) {
+  const sel = $('psuModeSelect');
+  const key = presets.map(p => p[0]).join(',');
+  if (sel.dataset.presetKey === key) return;
+  sel.dataset.presetKey = key;
+  sel.innerHTML = presets.map(([v, label]) => `<option value="${v}">${label}</option>`).join('');
+}
+
 async function loadPsuConfig() {
   const name = activeName();
   if (!name) return;
@@ -2624,6 +2686,21 @@ async function loadPsuConfig() {
     const d = await r.json();
     show('psuDeliverySec', true);
     show('psuDeliveryCard', true);
+
+    if (d.preset !== undefined) {
+      PSU_IS_NERDQX = true;
+      setPsuSelectOptions(NERDQX_PSU_PRESETS);
+      const vin = d.vin_v != null ? d.vin_v.toFixed(2) + ' V' : 'unknown';
+      PSU_CEILING_W = typeof d.power_budget_w === 'number' ? d.power_budget_w : null;
+      $('psuCurStatus').innerHTML = 'Rail: <strong>' + vin + '</strong> · Active Preset: <strong>' + d.preset + '</strong> · Budget: <strong>' + d.power_budget_w + ' W</strong> (' + d.fuse_max_a + ' A max)';
+      $('psuModeSelect').value = d.preset;
+      show('psuCustomRow', false);
+      show('psuOverclockWarning', d.preset === '1B' || d.preset === '4A');
+      return;
+    }
+
+    PSU_IS_NERDQX = false;
+    setPsuSelectOptions(NANO3S_PSU_PRESETS);
 
     const bus = d.bus_v != null ? d.bus_v.toFixed(1) + ' V' : 'unknown';
     const detected = d.detected_ceiling_w != null ? d.detected_ceiling_w + ' W' : 'none';
@@ -2655,6 +2732,11 @@ async function loadPsuConfig() {
 
 function syncPsuMode() {
   const mode = $('psuModeSelect').value;
+  if (PSU_IS_NERDQX) {
+    show('psuCustomRow', false);
+    show('psuOverclockWarning', mode === '1B' || mode === '4A');
+    return;
+  }
   if (mode === 'stock') {
     show('psuCustomRow', false);
     show('psuOverclockWarning', false);
@@ -2671,6 +2753,24 @@ async function applyPsuProfile() {
   const name = activeName();
   if (!name || writeBusy('psuMsg')) return;
   const mode = $('psuModeSelect').value;
+  if (PSU_IS_NERDQX) {
+    const body = { preset: mode };
+    if (mode === '1B' || mode === '4A') {
+      if (!confirm('Enable ' + mode + ' high-power preset? Requires a 20 A upgraded fuse and upgraded cooling.')) return;
+      body.confirm = true;
+    }
+    setMsg('psuMsg', 'Applying PSU preset…');
+    lockWrites();
+    try {
+      await sendJson('PATCH', '/api/v0/boards/' + encodeURIComponent(name) + '/psu', body);
+      setMsg('psuMsg', 'Applied preset ' + mode + ' — active immediately.', true);
+      await loadPsuConfig();
+      setTimeout(() => setMsg('psuMsg', ''), 3000);
+    } catch (e) {
+      setMsg('psuMsg', 'Failed: ' + e.message);
+    }
+    return;
+  }
   let target = null;
   if (mode === 'stock') {
     target = null;
@@ -2771,7 +2871,7 @@ function setTargetAxis(axis) {
   // Same ranges the daemon accepts (TARGET_POWER_RANGE_W / TARGET_HASHRATE_RANGE_THS).
   inp.step = hash ? '0.01' : '1';
   inp.min = hash ? '0.5' : '20';
-  inp.max = hash ? '12' : '140';
+  inp.max = hash ? '12' : (PSU_IS_NERDQX ? '240' : '140');
   inp.placeholder = hash ? 'e.g. 6.0' : 'e.g. 115';
   $('ownTargetNote').textContent = hash
     ? 'Reaches the hashrate, then trims core voltage for the best J/TH while holding it.'
@@ -3013,6 +3113,7 @@ function openMenu(key) {
   if (b) b.classList.add('on');
   if (key === 'power') loadPsuConfig();
   if (key === 'tuning') {
+    if (PSU_CEILING_W === undefined) loadPsuConfig();
     renderModalBoardTabs('tuneBoardTabs');
     applyBoardCaps();
     pollOwnerTune();

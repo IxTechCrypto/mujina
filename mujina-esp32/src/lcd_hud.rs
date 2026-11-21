@@ -20,6 +20,38 @@ pub enum DisplayShape {
     Circular,
 }
 
+/// Active LCD HUD visual theme (Nano 3S Direction A 3-theme parity).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum UiTheme {
+    #[default]
+    Cyberpunk,
+    Minimal,
+    Parasite,
+}
+
+impl UiTheme {
+    /// Parse a theme name (case-insensitive). Defaults to [`UiTheme::Cyberpunk`].
+    pub fn parse(s: &str) -> Self {
+        let trimmed = s.trim();
+        if trimmed.eq_ignore_ascii_case("minimal") || trimmed.eq_ignore_ascii_case("apple") {
+            Self::Minimal
+        } else if trimmed.eq_ignore_ascii_case("parasite") {
+            Self::Parasite
+        } else {
+            Self::Cyberpunk
+        }
+    }
+
+    /// Canonical lowercase identifier for API/NVS persistence.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cyberpunk => "cyberpunk",
+            Self::Minimal => "minimal",
+            Self::Parasite => "parasite",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DisplayGeometry {
     pub width: u16,
@@ -100,11 +132,11 @@ pub struct CutoffDial {
 
 impl CutoffDial {
     pub const MAIN_HUD: Self = Self {
-        cx: 64,
-        cy: 126,
-        r_outer: 86,
-        r_mid: 74,
-        r_inner: 62,
+        cx: 58,
+        cy: 134,
+        r_outer: 100,
+        r_mid: 84,
+        r_inner: 73,
         ring_width: 9,
     };
 
@@ -148,7 +180,7 @@ pub enum ScreenLayout {
     },
     PoolShares {
         summary_bar: Rect,
-        rows: [Rect; 3],
+        rows: [Rect; 2],
     },
     ClockBtc {
         clock_box: Rect,
@@ -178,38 +210,34 @@ impl Screen {
                 ],
             },
             Screen::ChipDieGrid => ScreenLayout::ChipDieGrid {
-                // 4 equal rectangular cards across 320 px (4 + 4*75 + 3*4 + 4 = 320).
+                // 2x2 cards so each die gets a large temperature readout.
                 cards: [
-                    Rect::new(4, PAGE_Y + 4, 75, 132),
-                    Rect::new(83, PAGE_Y + 4, 75, 132),
-                    Rect::new(162, PAGE_Y + 4, 75, 132),
-                    Rect::new(241, PAGE_Y + 4, 75, 132),
+                    Rect::new(4, PAGE_Y + 4, 154, 65),
+                    Rect::new(162, PAGE_Y + 4, 154, 65),
+                    Rect::new(4, PAGE_Y + 74, 154, 65),
+                    Rect::new(162, PAGE_Y + 74, 154, 65),
                 ],
                 load_bars: [
-                    Rect::new(11, PAGE_Y + 124, 61, 4),
-                    Rect::new(90, PAGE_Y + 124, 61, 4),
-                    Rect::new(169, PAGE_Y + 124, 61, 4),
-                    Rect::new(248, PAGE_Y + 124, 61, 4),
+                    Rect::new(12, PAGE_Y + 60, 138, 5),
+                    Rect::new(170, PAGE_Y + 60, 138, 5),
+                    Rect::new(12, PAGE_Y + 130, 138, 5),
+                    Rect::new(170, PAGE_Y + 130, 138, 5),
                 ],
             },
             Screen::TunerPsu => ScreenLayout::TunerPsu {
-                psu_card: Rect::new(4, PAGE_Y + 4, 154, 132),
-                power_bar: Rect::new(12, PAGE_Y + 86, 138, 6),
-                tuner_card: Rect::new(162, PAGE_Y + 4, 154, 132),
+                psu_card: Rect::new(4, PAGE_Y + 4, 154, 134),
+                power_bar: Rect::new(12, PAGE_Y + 104, 138, 8),
+                tuner_card: Rect::new(162, PAGE_Y + 4, 154, 134),
             },
             Screen::PoolShares => ScreenLayout::PoolShares {
-                summary_bar: Rect::new(4, PAGE_Y + 4, 312, 26),
-                rows: [
-                    Rect::new(4, PAGE_Y + 34, 312, 31),
-                    Rect::new(4, PAGE_Y + 69, 312, 31),
-                    Rect::new(4, PAGE_Y + 104, 312, 31),
-                ],
+                summary_bar: Rect::new(4, PAGE_Y + 4, 312, 56),
+                rows: [Rect::new(4, PAGE_Y + 64, 312, 36), Rect::new(4, PAGE_Y + 103, 312, 36)],
             },
             Screen::ClockBtc => ScreenLayout::ClockBtc {
-                clock_box: Rect::new(4, PAGE_Y + 4, 312, 72),
-                sec_bar: Rect::new(4, PAGE_Y + 80, 312, 4),
-                left_card: Rect::new(4, PAGE_Y + 88, 154, 48),
-                right_card: Rect::new(162, PAGE_Y + 88, 154, 48),
+                clock_box: Rect::new(4, PAGE_Y + 4, 312, 62),
+                sec_bar: Rect::new(4, PAGE_Y + 68, 312, 3),
+                left_card: Rect::new(4, PAGE_Y + 75, 154, 64),
+                right_card: Rect::new(162, PAGE_Y + 75, 154, 64),
             },
             Screen::SystemQr => ScreenLayout::SystemQr {
                 // Square QR code (124x124) fits cleanly inside 140 px vertical page height.
@@ -250,6 +278,9 @@ impl Screen {
         Self::ALL[(self.index() + 5) % 6]
     }
 }
+
+/// Footer button hint shown on the system/QR screen.
+pub const BUTTON_HINT: &str = "BTN1:NEXT  BTN2:PREV";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
@@ -369,5 +400,39 @@ impl Hud {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screens_cycle_both_ways_through_all_six() {
+        let mut s = Screen::MainHud;
+        let mut seen = vec![s];
+        for _ in 0..5 {
+            s = s.next();
+            seen.push(s);
+        }
+        assert_eq!(seen, Screen::ALL.to_vec());
+        assert_eq!(s.next(), Screen::MainHud);
+        assert_eq!(Screen::MainHud.prev(), Screen::SystemQr);
+    }
+
+    #[test]
+    fn ui_theme_parse_and_as_str() {
+        assert_eq!(UiTheme::default(), UiTheme::Cyberpunk);
+        assert_eq!(UiTheme::parse("cyberpunk"), UiTheme::Cyberpunk);
+        assert_eq!(UiTheme::parse("minimal"), UiTheme::Minimal);
+        assert_eq!(UiTheme::parse("apple"), UiTheme::Minimal);
+        assert_eq!(UiTheme::parse("  APPLE "), UiTheme::Minimal);
+        assert_eq!(UiTheme::parse("parasite"), UiTheme::Parasite);
+        assert_eq!(UiTheme::parse("PARASITE"), UiTheme::Parasite);
+        assert_eq!(UiTheme::parse("unknown"), UiTheme::Cyberpunk);
+        assert_eq!(UiTheme::parse(""), UiTheme::Cyberpunk);
+        assert_eq!(UiTheme::Cyberpunk.as_str(), "cyberpunk");
+        assert_eq!(UiTheme::Minimal.as_str(), "minimal");
+        assert_eq!(UiTheme::Parasite.as_str(), "parasite");
     }
 }

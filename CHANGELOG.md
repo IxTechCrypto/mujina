@@ -1,5 +1,22 @@
 # Changelog
 
+## v5.2.0 (Unreleased)
+- **NerdQX Standalone Embedded Firmware (`mujina-esp32`)**:
+  - Embedded firmware crate for NerdQX (ESP32-S3R8 + 4x BM1370, `192.168.4.40`).
+  - Implemented 16 MB partition table with 8 MB Octal PSRAM configuration and USB-Serial-JTAG console.
+  - Implemented SoftAP Wi-Fi onboarding with captive portal DNS/HTTP, serving embedded gzipped dashboard.
+  - BM1370 core initialization and Stratum hashing with 1s ntime rolling, 120s sliding-window hashrate tracking, and live TPS53647 / TMP451 thermal regulation (58–61 °C sweet spot).
+  - 6-screen 320x170 LCD HUD with 20 FPS display loop, live mempool.space BTC height/price over TLS, SNTP clock, and screenshot API (`PATCH /api/v0/display/screen`, `GET /api/v0/display/screenshot`).
+  - Integrated 4-tier PSU presets (1A/2A/1B/4A) with fuse interlocks up to 240 W.
+- **Hardware Buzzer & Sound Themes Engine (`peripheral::buzzer`, `api/v0.rs`, `dashboard.html`)**:
+  - Implemented non-blocking background sound engine driving Kendryte K230 PWM piezo beeper over `/dev/input/event1` (`EV_SND`/`SND_TONE`) on Canaan Avalon Nano 3S.
+  - 11 built-in melodies across 3 categories:
+    - *Mining Celebrations:* `high_diff` (ascending 8-bit jackpot arpeggio C5->G6), `block_found` (Bitcoin block victory fanfare).
+    - *Theme/Holiday Chimes & Anthems:* `jingle_bells` (Christmas LED), `star_spangled` (Independence Day), `marines_hymn` (United States Marine Corps anthem "From the Halls of Montezuma", authentic military march tempo 135 BPM in Eb Major), `halloween` (Bach Toccata & Fugue opening + chromatic descent), `knight_rider` (KITT synth arpeggio).
+    - *Retro Video Games & Sci-Fi:* `mario` (Super Mario Bros Overworld theme), `sonic` (SEGA chant + Title Screen fanfare), `street_fighter` (Theme of World Warriors / Main Title Theme), `star_trek` (Alexander Courage Fanfare & Jerry Goldsmith TNG March Theme).
+  - REST API Endpoints: `GET /api/v0/sound` (status & tune list), `POST /api/v0/sound/play` (`{"tune": "..."}` or custom `notes`), `POST /api/v0/sound/stop`, `POST /api/v0/sound/mute`.
+  - Interactive "Sounds" menu modal sheet in `dashboard.html` with real-time "Now Playing" status and playback controls.
+
 ## v5.1.0 (2026-11-17)
 - **Core 1 Freeze Recovery, Silence Escalation & Stall Resilience (`nano3s.rs`, `nano3s_tuner_core.rs`, `nano3s_ipc_shim`)**:
   - Implemented Core 1 status age and absence monitoring (`nano3s_ipc_has_received_status`, `nano3s_ipc_status_age_ms`). When Core 1 stops sending telemetry (>60s) or has never sent status (>180s), Core 0 immediately forces fan to 100% and skips AutoTune iterations.
