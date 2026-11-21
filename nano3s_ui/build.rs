@@ -12,6 +12,9 @@ fn main() {
     println!("cargo:rerun-if-changed={}", c_driver.join("btc_mask.h").display());
     println!("cargo:rerun-if-changed={}", c_driver.join("ui_assets.h").display());
     println!("cargo:rerun-if-changed={}", c_driver.join("ui_fonts.h").display());
+    println!("cargo:rerun-if-changed={}", c_driver.join("ixlogo_anim.h").display());
+    println!("cargo:rerun-if-changed={}", c_driver.join("tinf.h").display());
+    println!("cargo:rerun-if-changed={}", c_driver.join("tinflate.c").display());
 
     let mut build = cc::Build::new();
     build.flag("-march=rv64gc");
@@ -19,6 +22,7 @@ fn main() {
     add_c_files(&mut build, &lvgl_src);
     build
         .file(c_driver.join("driver.c"))
+        .file(c_driver.join("tinflate.c"))
         .define("LV_CONF_INCLUDE_SIMPLE", Some("1"))
         .include(&lvgl_src)
         .include(&lvgl_root)

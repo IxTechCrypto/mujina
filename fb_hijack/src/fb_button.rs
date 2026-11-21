@@ -83,8 +83,9 @@ fn toggle_page() {
         "mujina-logo" => "nano3s",
         "nano3s" => "nano3s-tuner",
         "nano3s-tuner" => "ip",
-        "ip" => if theme == "parasite" { "parasite-logo" } else { "plasma" },
-        "parasite-logo" => "plasma",
+        "ip" => if theme == "parasite" { "parasite-logo" } else { "ixlogo" },
+        "parasite-logo" => "ixlogo",
+        "ixlogo" => "plasma",
         "plasma" => "mujina-logo",
         _ => "mujina-logo",
     };

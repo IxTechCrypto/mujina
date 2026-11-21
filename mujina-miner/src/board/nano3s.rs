@@ -2477,7 +2477,7 @@ static UI_THEME: std::sync::LazyLock<std::sync::Mutex<UiTheme>> =
 fn is_valid_page(p: &str) -> bool {
     matches!(
         p.trim(),
-        "mujina-logo" | "nano3s" | "nano3s-tuner" | "ip" | "parasite-logo" | "plasma" | "pizza" | "wifi-setup" | "doom"
+        "mujina-logo" | "nano3s" | "nano3s-tuner" | "ip" | "parasite-logo" | "ixlogo" | "plasma" | "pizza" | "wifi-setup" | "doom"
     )
 }
 

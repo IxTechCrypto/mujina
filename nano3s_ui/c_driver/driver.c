@@ -3,6 +3,8 @@
 #include "btc_mask.h"
 #include "ui_assets.h"
 #include "ui_fonts.h"
+#include "ixlogo_anim.h"
+#include "tinf.h"
 
 #include <ctype.h>
 #include <fcntl.h>
@@ -1438,6 +1440,50 @@ static void refresh_pizza(void) {
     blit_ui_fb((const uint16_t *)pizza_buf);
 }
 
+/* ── IxTech Animated Logo (15 FPS, 10.0s Loop) ────────────────────────── */
+static uint8_t *ixlogo_frames = NULL;
+static int ixlogo_inited = 0;
+
+static void refresh_ixlogo(uint32_t ms) {
+    if (!ixlogo_inited) {
+        tinf_init();
+        ixlogo_frames = (uint8_t *)malloc(IXLOGO_TOTAL_BYTES);
+        if (ixlogo_frames) {
+            unsigned int out_sz = IXLOGO_TOTAL_BYTES;
+            int res = tinf_uncompress(ixlogo_frames, &out_sz, ixlogo_deflate, sizeof(ixlogo_deflate));
+            if (res != TINF_OK || out_sz != IXLOGO_TOTAL_BYTES) {
+                free(ixlogo_frames);
+                ixlogo_frames = NULL;
+            }
+        }
+        ixlogo_inited = 1;
+    }
+
+    if (!ixlogo_frames) {
+        memset(ui_fb, 0, sizeof(ui_fb));
+        blit_ui_fb(ui_fb);
+        return;
+    }
+
+    uint32_t frame_idx = (ms / IXLOGO_FRAME_MS) % IXLOGO_NUM_FRAMES;
+    const uint8_t *src = &ixlogo_frames[frame_idx * IXLOGO_FRAME_BYTES];
+
+    memset(ui_fb, 0, sizeof(ui_fb));
+
+    const int start_x = (HOR_RES - IXLOGO_FRAME_W) / 2;
+    const int start_y = (VER_RES - IXLOGO_FRAME_H) / 2;
+
+    for (int y = 0; y < IXLOGO_FRAME_H; y++) {
+        uint16_t *dst_row = &ui_fb[(start_y + y) * HOR_RES + start_x];
+        const uint8_t *src_row = &src[y * IXLOGO_FRAME_W];
+        for (int x = 0; x < IXLOGO_FRAME_W; x++) {
+            dst_row[x] = ixlogo_palette[src_row[x]];
+        }
+    }
+
+    blit_ui_fb(ui_fb);
+}
+
 /* ── Procedural Plasma Disk Animation with Black Bitcoin B ──────────────── */
 #define PLASMA_NUM_STREAMERS 14
 
@@ -1785,6 +1831,7 @@ typedef enum {
     PG_IP,
     PG_PARASITE,
     PG_PIZZA,
+    PG_IXLOGO,
     PG_PLASMA,
     PG_DOOM,
     PG_WIFI_SETUP
@@ -1797,6 +1844,7 @@ static page_t parse_page(const char *s) {
     if (strcmp(s, "ip") == 0) return PG_IP;
     if (strcmp(s, "parasite-logo") == 0) return PG_PARASITE;
     if (strcmp(s, "pizza") == 0) return PG_PIZZA;
+    if (strcmp(s, "ixlogo") == 0) return PG_IXLOGO;
     if (strcmp(s, "plasma") == 0) return PG_PLASMA;
     if (strcmp(s, "wifi-setup") == 0) return PG_WIFI_SETUP;
     if (strcmp(s, "doom") == 0) return PG_DOOM;
@@ -1844,6 +1892,15 @@ static void run_event_loop(void) {
             last_theme = theme;
             was_lvgl = 0;
             usleep(POLL_INTERVAL_MS * 1000);
+            continue;
+        }
+
+        if (pg == PG_IXLOGO) {
+            refresh_ixlogo(now);
+            strcpy(last_page, page);
+            last_theme = theme;
+            was_lvgl = 0;
+            usleep(IXLOGO_FRAME_MS * 1000); /* 15 FPS: 66ms */
             continue;
         }
 

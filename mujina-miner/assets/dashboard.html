@@ -1899,7 +1899,7 @@ async function loadSystem() {
 }
 
 function applySystem() {
-  const on = { dashboard: true, power: false, tuning: false, fan: false, curve: false, pool: false, led: true, firmware: false, display: true, sound: true, info: true };
+  const on = { dashboard: true, power: false, tuning: false, fan: false, curve: false, pool: false, led: true, firmware: false, display: true, sound: false, info: true };
   if (SYS) {
     const boards = SYS.boards || [], dev = SYS.device || {};
     const any = f => boards.some(b => b.caps && f(b.caps));
@@ -1911,7 +1911,7 @@ function applySystem() {
     on.led = true;
     on.firmware = !!(SYS.firmware && SYS.firmware.update === 'bundle');
     on.display = true;
-    on.sound = true;
+    on.sound = boardFamily() === 'nano3s';
   }
   document.querySelectorAll('.menubtn').forEach(b => {
     if (b.dataset.menu) {
@@ -3122,14 +3122,14 @@ function openMenu(key) {
     renderModalBoardTabs('fanBoardTabs');
     applyBoardCaps();
   }
-  if (key === 'sound') {
+  if (key === 'sound' && boardFamily() === 'nano3s') {
     pollSoundStatus();
     if (!soundPollTimer) soundPollTimer = setInterval(pollSoundStatus, 1000);
   }
 }
 function openFromHash() {
   const h = location.hash.replace(/^#/, '');
-  if (['power', 'tuning', 'fan', 'curve', 'pool', 'display', 'sound'].includes(h)) {
+  if (['power', 'tuning', 'fan', 'curve', 'pool', 'display'].includes(h) || (h === 'sound' && boardFamily() === 'nano3s')) {
     openMenu(h);
     try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
   }
