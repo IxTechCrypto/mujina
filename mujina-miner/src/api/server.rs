@@ -207,7 +207,7 @@ mod tests {
     use super::*;
     use crate::api::commands::SchedulerCommand;
     use crate::api::registry::BoardRegistration;
-    use crate::api_client::types::{BoardTelemetry, PsuStatusResponse, SourceTelemetry};
+    use crate::api_client::types::{BoardTelemetry, SourceTelemetry};
 
     /// Test fixtures returned by the router builder.
     struct TestFixtures {
@@ -304,119 +304,6 @@ mod tests {
         let status = resp.status();
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8(body.to_vec()).unwrap())
-    }
-
-    async fn patch(app: Router, uri: &str, body: &str) -> (http::StatusCode, String) {
-        let req = Request::builder()
-            .method("PATCH")
-            .uri(uri)
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(body.to_owned()))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        let status = resp.status();
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        (status, String::from_utf8(body.to_vec()).unwrap())
-    }
-
-    fn psu_board(vin: Option<f32>) -> BoardTelemetry {
-        BoardTelemetry {
-            name: "nerdqx-1".into(),
-            model: "NerdQX".into(),
-            psu_limited: true,
-            powers: vec![crate::api_client::types::PowerMeasurement {
-                name: "input".into(),
-                voltage_v: vin,
-                current_a: None,
-                power_w: Some(100.0),
-            }],
-            ..Default::default()
-        }
-    }
-
-    const PSU: &str = "/api/v0/boards/nerdqx-1/psu";
-
-    #[tokio::test]
-    async fn psu_defaults_to_the_stock_air_preset() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![psu_board(Some(12.0))]);
-        let (status, body) = get(fixtures.router.clone(), PSU).await;
-        assert_eq!(status, 200);
-        let r: PsuStatusResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(r.preset, "1A");
-        assert_eq!(r.config.fuse_rating_a, 15);
-        assert!(!r.config.fuse_upgrade_confirmed);
-        assert_eq!(r.default_ceiling_w, 144.0);
-        assert_eq!(r.effective_ceiling_w, 144.0);
-        assert_eq!((r.min_ceiling_w, r.max_ceiling_w), (60.0, 180.0));
-        assert_eq!(r.input_power_w, Some(100.0));
-    }
-
-    #[tokio::test]
-    async fn psu_clamps_to_fuse_times_input_voltage() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![psu_board(Some(11.0))]);
-        let (status, body) = patch(fixtures.router.clone(), PSU, r#"{"power_ceiling_w":180}"#).await;
-        assert_eq!(status, 200);
-        let r: PsuStatusResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(r.effective_ceiling_w, 165.0);
-    }
-
-    #[tokio::test]
-    async fn psu_rejects_unconfirmed_upgrades_and_keeps_the_old_settings() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![psu_board(Some(12.0))]);
-        for body in [
-            r#"{"fuse_rating_a":20}"#,
-            r#"{"power_ceiling_w":181}"#,
-            r#"{"cooling_mode":"aio"}"#,
-            r#"{"cooling_mode":"aio","fuse_upgrade_confirmed":false,"fuse_rating_a":25}"#,
-        ] {
-            let (status, _) = patch(fixtures.router.clone(), PSU, body).await;
-            assert_eq!(status, 400, "{body}");
-        }
-        let (_, body) = get(fixtures.router.clone(), PSU).await;
-        let r: PsuStatusResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(r.preset, "1A");
-        assert_eq!(r.config.power_ceiling_w, None);
-    }
-
-    #[tokio::test]
-    async fn psu_accepts_confirmed_upgrades() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![psu_board(Some(12.0))]);
-        let (status, body) = patch(
-            fixtures.router.clone(),
-            PSU,
-            r#"{"fuse_rating_a":20,"fuse_upgrade_confirmed":true}"#,
-        )
-        .await;
-        assert_eq!(status, 200);
-        let r: PsuStatusResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!((r.preset.as_str(), r.default_ceiling_w), ("1B", 192.0));
-
-        let (status, body) = patch(
-            fixtures.router.clone(),
-            PSU,
-            r#"{"cooling_mode":"aio","derate_pct":100}"#,
-        )
-        .await;
-        assert_eq!(status, 200);
-        let r: PsuStatusResponse = serde_json::from_str(&body).unwrap();
-        // 20 A at 12 V is 240 W, less the 15 W un-metered pump.
-        assert_eq!((r.preset.as_str(), r.effective_ceiling_w), ("2", 225.0));
-        assert_eq!((r.default_ceiling_w, r.max_ceiling_w), (240.0, 240.0));
-    }
-
-    #[tokio::test]
-    async fn psu_unknown_or_unmanaged_board_is_404() {
-        let plain = BoardTelemetry {
-            psu_limited: false,
-            ..psu_board(Some(12.0))
-        };
-        for boards in [vec![], vec![plain]] {
-            let fixtures = build_test_router(MinerTelemetry::default(), boards);
-            let (status, _) = get(fixtures.router.clone(), PSU).await;
-            assert_eq!(status, 404);
-            let (status, _) = patch(fixtures.router.clone(), PSU, "{}").await;
-            assert_eq!(status, 404);
-        }
     }
 
     #[tokio::test]

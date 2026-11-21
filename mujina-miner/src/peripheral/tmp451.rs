@@ -12,14 +12,6 @@ use crate::hw_trait::{HwError, i2c::I2c};
 /// Expected manufacturer ID (register 0xFE).
 pub const MANUFACTURER_ID: u8 = 0x55;
 
-/// Status register BUSY bit: an ADC conversion is in progress.
-pub const STATUS_BUSY: u8 = 0x80;
-
-/// Remote-diode gain correction measured on the NerdQX BM1370 thermal diodes.
-pub const NERDQX_SCALE: f32 = 1.09;
-/// Remote-diode offset correction for the NerdQX, in Celsius.
-pub const NERDQX_OFFSET: f32 = -29.5;
-
 /// TMP451 register addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -32,8 +24,6 @@ pub enum Register {
     Status = 0x02,
     /// Configuration
     Config = 0x03,
-    /// One-shot trigger (write-only; any data starts a conversion)
-    OneShot = 0x0F,
     /// Remote temperature, low byte (fractional, read-only)
     RemoteTempLow = 0x10,
     /// Remote temperature offset, high byte (1 C/LSB, read/write)
@@ -134,22 +124,6 @@ impl<I: I2c> Tmp451<I> {
         Ok(Reading::from_high_low(high, low))
     }
 
-    /// Read the remote temperature as `reading * scale + offset`, in Celsius.
-    pub async fn read_remote_calibrated(&mut self, scale: f32, offset: f32) -> Result<f32> {
-        Ok(self.read_remote().await?.as_degrees_c() * scale + offset)
-    }
-
-    /// Start a single conversion (effective in standby mode, ignored while
-    /// the sensor free-runs).
-    pub async fn trigger_one_shot(&mut self) -> Result<()> {
-        self.write_byte(Register::OneShot, 0).await
-    }
-
-    /// Whether a conversion is in progress ([STATUS_BUSY]).
-    pub async fn is_busy(&mut self) -> Result<bool> {
-        Ok(self.read_byte(Register::Status).await? & STATUS_BUSY != 0)
-    }
-
     /// Set the remote temperature offset (high byte, 1 C/LSB).
     ///
     /// The offset is added to every remote ADC conversion result.
@@ -201,77 +175,5 @@ mod tests {
         let a = Reading::from_high_low(0x19, 0x80);
         let b = Reading::from_high_low(0x19, 0x8F);
         assert_eq!(a, b);
-    }
-
-    #[test]
-    fn nerdqx_calibration_constants() {
-        assert_eq!(Register::OneShot as u8, 0x0F);
-        assert_eq!(STATUS_BUSY, 0x80);
-        // Raw 60 C diode reading maps to ~35.9 C, a plausible die temperature.
-        let t = 60.0 * NERDQX_SCALE + NERDQX_OFFSET;
-        assert!((t - 35.9).abs() < 1e-3);
-    }
-
-    /// Register-file I2C mock that records writes.
-    struct Mock {
-        regs: [u8; 256],
-        writes: Vec<Vec<u8>>,
-    }
-
-    #[async_trait::async_trait]
-    impl I2c for Mock {
-        async fn write(&mut self, _addr: u8, data: &[u8]) -> crate::hw_trait::Result<()> {
-            self.writes.push(data.to_vec());
-            Ok(())
-        }
-        async fn read(&mut self, _addr: u8, _buf: &mut [u8]) -> crate::hw_trait::Result<()> {
-            Err(HwError::NotSupported("plain read".into()))
-        }
-        async fn write_read(
-            &mut self,
-            _addr: u8,
-            write: &[u8],
-            read: &mut [u8],
-        ) -> crate::hw_trait::Result<()> {
-            read[0] = self.regs[write[0] as usize];
-            Ok(())
-        }
-        async fn set_frequency(&mut self, _hz: u32) -> crate::hw_trait::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn mock() -> Tmp451<Mock> {
-        Tmp451::new(
-            Mock {
-                regs: [0; 256],
-                writes: Vec::new(),
-            },
-            0x4C,
-        )
-    }
-
-    #[tokio::test]
-    async fn one_shot_writes_the_trigger_register() {
-        let mut t = mock();
-        t.trigger_one_shot().await.unwrap();
-        assert_eq!(t.i2c.writes, vec![vec![0x0F, 0x00]]);
-    }
-
-    #[tokio::test]
-    async fn calibrated_remote_applies_scale_then_offset() {
-        let mut t = mock();
-        t.i2c.regs[0x01] = 60; // 60.0 C
-        t.i2c.regs[0x10] = 0x80; // + 0.5 C
-        let c = t.read_remote_calibrated(NERDQX_SCALE, NERDQX_OFFSET).await;
-        assert!((c.unwrap() - (60.5 * 1.09 - 29.5)).abs() < 1e-3);
-    }
-
-    #[tokio::test]
-    async fn busy_flag_follows_status_bit() {
-        let mut t = mock();
-        assert!(!t.is_busy().await.unwrap());
-        t.i2c.regs[0x02] = STATUS_BUSY;
-        assert!(t.is_busy().await.unwrap());
     }
 }

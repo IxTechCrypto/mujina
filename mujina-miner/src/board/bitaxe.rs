@@ -419,7 +419,6 @@ impl Bitaxe {
                 },
             ],
             threads: Vec::new(), // TODO: populate from hash thread telemetry
-            ..Default::default()
         });
 
         // Periodic log
