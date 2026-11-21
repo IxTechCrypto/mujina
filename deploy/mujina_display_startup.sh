@@ -13,8 +13,12 @@ APP=/mntapp/release/linux/app
 # Logging to /tmp prevents high-frequency wear on SPI NAND flash (/mntapp UBIFS).
 mkdir -p /tmp
 
-if [ "$(cat $APP/fb_page 2>/dev/null)" = "wifi-setup" ]; then
-    echo "mujina-logo" > $APP/fb_page
+# Clean up legacy flash file on /mntapp to prevent UBIFS ENOSPC exhaustion
+rm -f $APP/fb_page 2>/dev/null || true
+
+# Ephemeral UI display page lives in RAM (tmpfs) to eliminate flash wear and avoid flash ENOSPC
+if [ ! -f /tmp/fb_page ] || [ "$(cat /tmp/fb_page 2>/dev/null)" = "wifi-setup" ]; then
+    echo "mujina-logo" > /tmp/fb_page
 fi
 
 # [1] Start UI & Front Panel buttons IMMEDIATELY so the display illuminates
@@ -61,8 +65,8 @@ fi
     while true; do
         ip=$(ifconfig wlan0 2>/dev/null | grep 'inet addr:' | cut -d: -f2 | cut -d' ' -f1)
         if [ -n "$ip" ]; then
-            if [ "$(cat $APP/fb_page 2>/dev/null)" = "wifi-setup" ]; then
-                echo "nano3s" > $APP/fb_page
+            if [ "$(cat /tmp/fb_page 2>/dev/null)" = "wifi-setup" ]; then
+                echo "nano3s" > /tmp/fb_page
             fi
             break
         fi

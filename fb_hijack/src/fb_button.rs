@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 const BUTTON_DEV: &str = "/dev/input/event2";
 const BEEPER_DEV: &str = "/dev/input/event1";
-const PAGE_FILE: &str = "/mntapp/release/linux/app/fb_page";
+const PAGE_FILE: &str = "/tmp/fb_page";
 const EV_KEY: u16 = 0x01;
 const EV_SND: u16 = 0x12;
 const EV_SYN: u16 = 0x00;
@@ -89,7 +89,9 @@ fn toggle_page() {
         "plasma" => "mujina-logo",
         _ => "mujina-logo",
     };
-    let _ = fs::write(PAGE_FILE, format!("{next}\n"));
+    if let Err(e) = fs::write(PAGE_FILE, format!("{next}\n")) {
+        eprintln!("fb_button: write {PAGE_FILE} failed: {e}");
+    }
 }
 
 fn main() {

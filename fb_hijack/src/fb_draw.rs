@@ -27,7 +27,7 @@ const H: usize = 240;
 const FB_BYTES: usize = W * H * 2;
 const FB_DEV: &str = "/dev/fb0";
 const CGMINER_API: &str = "127.0.0.1:4028";
-const PAGE_FILE: &str = "/mntapp/release/linux/app/fb_page";
+const PAGE_FILE: &str = "/tmp/fb_page";
 const PIZZA_FILE: &str = "/mntapp/release/linux/app/pizza.rgb565";
 /// Written by rtos_core/tools/mujina.c (our own custom mining stack --
 /// see its LIVE_STATUS_FILE comment). Plain key=value lines, no JSON

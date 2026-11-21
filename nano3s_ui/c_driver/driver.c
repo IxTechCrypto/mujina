@@ -21,7 +21,7 @@
 #define FB_DEV "/dev/fb0"
 #define FB_BYTES (HOR_RES * VER_RES * 2)
 
-#define PAGE_FILE "/mntapp/release/linux/app/fb_page"
+#define PAGE_FILE "/tmp/fb_page"
 #define PIZZA_FILE "/mntapp/release/linux/app/pizza.rgb565"
 #define NANO3S_LIVE_FILE "/tmp/nano3s_live.txt"
 #define BLE_WIFI_STATUS_FILE "/tmp/ble_wifi_status.txt"

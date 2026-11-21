@@ -50,7 +50,7 @@ is used by the real build. Cosmetic cleanup, not worth the churn risk.
 
 ## Pages
 
-Polled from `PAGE_FILE` (`/mntapp/release/linux/app/fb_page`) every 100ms,
+Polled from `PAGE_FILE` (`/tmp/fb_page`, tmpfs) every 100ms,
 matching `fb_button.rs`'s write side exactly -- that file is the only
 coupling between the two processes, no IPC. `fb_button.rs` itself was never
 touched; it still just grabs `/dev/input/event2` and cycles the page name

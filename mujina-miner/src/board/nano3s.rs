@@ -2393,7 +2393,7 @@ pub(crate) fn get_led_state() -> crate::api_client::types::BoardLedState {
 /// Non-volatile configuration path for LCD display visual theme.
 const THEME_CONF_PATH: &str = "/data/userconfig/theme.conf";
 const UI_THEME_TMP_PATH: &str = "/tmp/ui_theme";
-const FB_PAGE_PATH: &str = "/mntapp/release/linux/app/fb_page";
+const FB_PAGE_PATH: &str = "/tmp/fb_page";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UiTheme {

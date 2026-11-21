@@ -30,7 +30,7 @@ const HCI_DEV_ID: u16 = 0; // hci0
 // source of truth for setup progress instead.
 // ---------------------------------------------------------------------------
 
-const PAGE_FILE: &str = "/mntapp/release/linux/app/fb_page";
+const PAGE_FILE: &str = "/tmp/fb_page";
 const BLE_WIFI_STATUS_FILE: &str = "/tmp/ble_wifi_status.txt";
 
 fn atomic_write_str(path: &str, content: &str) -> std::io::Result<()> {

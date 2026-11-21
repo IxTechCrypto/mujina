@@ -292,7 +292,7 @@ def launch_doom():
     """
     cmd = (
         "killall nano3s_doom 2>/dev/null; sleep 1; "
-        "echo doom > /mntapp/release/linux/app/fb_page; "
+        "echo doom > /tmp/fb_page; "
         "cd /data && nohup ./nano3s_doom -iwad /data/doom1.wad -gfxmode rgb565 "
         "> /data/nano3s_doom.log 2>&1 &"
     )

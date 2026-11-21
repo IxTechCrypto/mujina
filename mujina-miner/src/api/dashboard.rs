@@ -139,7 +139,7 @@ async fn serve_logo_svg() -> impl IntoResponse {
 /// `pkill -f`, because this device's busybox has no pkill.
 async fn launch_doom() -> Json<Value> {
     let cmd = "killall nano3s_doom 2>/dev/null; sleep 1; \
-               echo doom > /mntapp/release/linux/app/fb_page; \
+               echo doom > /tmp/fb_page; \
                cd /data && nohup ./nano3s_doom -iwad /data/doom1.wad -gfxmode rgb565 \
                > /data/nano3s_doom.log 2>&1 &";
     match tokio::process::Command::new("sh").arg("-c").arg(cmd).output().await {

@@ -42,7 +42,7 @@ extern void buzzer_music_set_muted(int muted);
 // nano3s_doom exiting on its own doesn't touch it. Without writing this
 // back on quit, the panel would be left showing DOOM's last frame forever
 // until someone manually cycles the physical button.
-#define DISPLAY_PAGE_FILE "/mntapp/release/linux/app/fb_page"
+#define DISPLAY_PAGE_FILE "/tmp/fb_page"
 
 #define QUEUE_CAP 64
 
