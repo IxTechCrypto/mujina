@@ -50,35 +50,38 @@ is used by the real build. Cosmetic cleanup, not worth the churn risk.
 
 ## Pages
 
-Polled from `PAGE_FILE` (`/tmp/fb_page`, tmpfs) every 100ms,
-matching `fb_button.rs`'s write side exactly -- that file is the only
-coupling between the two processes, no IPC. `fb_button.rs` itself was never
-touched; it still just grabs `/dev/input/event2` and cycles the page name
-through `nano3s -> nano3s-diag -> ip -> pizza -> nano3s` on release.
+Polled from `PAGE_FILE` (`/tmp/fb_page`, tmpfs in RAM) every 25ms,
+matching `fb_button.rs`'s write side -- that file is the only coupling
+between the two processes, no IPC. `fb_button.rs` listens to `/dev/input/event2`
+and cycles the page immediately on key-down (`value == 1`, 150ms debounce
+window with a synchronous 25ms click confirmation beep) through:
+`nano3s -> nano3s-tuner -> ip -> [parasite-logo] -> ixlogo -> plasma -> mujina-logo`.
 
 - **`nano3s`** (live telemetry, default): a speedometer-style radial gauge
   cluster -- three concentric rings (hashrate/power/temp, temp dynamically
   colored by the same thermal thresholds as everywhere else in this
   project), center readout for the precise numbers. Reads
   `NANO3S_LIVE_FILE` (`/tmp/nano3s_live.txt`).
-- **`nano3s-diag`**: chips-online radial gauge + PLL/voltage/err_crc text.
-- **`ip`**: wlan0 IP via `ifconfig wlan0` scrape (same parsing as the
-  original).
-- **`pizza`**: raw 115200-byte RGB565 file written directly to `/dev/fb0`,
-  bypassing LVGL entirely (it's already framebuffer-native). LVGL's
-  `lv_timer_handler()` is skipped while this page is active so it can't
-  paint over the static image.
+- **`nano3s-tuner`**: 12-chip thermal corona and tuner diagnostics.
+- **`ip`**: wlan0 IP via `ifconfig wlan0` scrape and Wi-Fi RSSI signal strength.
+- **`parasite-logo`**: Parasite.space theme logo with 25 FPS animated perimeter
+  ring (active only when `theme == "parasite"`).
+- **`ixlogo`**: 240x240 circular IxTech animated logo -- 150 frames (10.0-second
+  seamless loop) scaled ($S=0.255$) to strictly respect the $R \le 114\text{ px}$
+  circular bezel boundary (with $\ge 6.5\text{ px}$ safe margin, 0 clipped pixels),
+  subtle electric violet-cyan rim at $R=117\text{ px}$, and 32-color palette.
+  Compressed with DEFLATE (743 KB payload) and pre-decompressed at startup into
+  static memory (8.64 MB) for zero frame-drop or transition stutter (<1% CPU).
+- **`plasma`**: electric Bitcoin Plasma lightning disk with hierarchical
+  filament branches and corona ionization sparks.
+- **`mujina-logo`**: default boot splash screen with 25 FPS rotating perimeter
+  ticks.
 - **`doom`**: fully yields `/dev/fb0` -- see nano3s_doom's own README.
   No refresh, no `lv_timer_handler()` at all while this page is selected,
   so nano3s_ui can never race nano3s_doom for framebuffer writes. Also
   silences the hardware buzzer (`silence_buzzer()`) on any transition
   *away* from this page, regardless of how nano3s_doom stopped -- see the
   "stateful hardware" gotcha in nano3s_doom's README.
-
-"6 pages" from an earlier planning pass was wrong -- `render_live_stats`/
-`render_chip_temps` in the original `fb_draw.rs` are dead code from the
-retired stock-cgminer stack; the real device only ever invokes
-`fb_draw live-nano3s 2`, which never reaches those code paths.
 
 ## Gauges (`lv_meter` widgets)
 

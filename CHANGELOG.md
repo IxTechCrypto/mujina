@@ -16,6 +16,20 @@
     - *Retro Video Games & Sci-Fi:* `mario` (Super Mario Bros Overworld theme), `sonic` (SEGA chant + Title Screen fanfare), `street_fighter` (Theme of World Warriors / Main Title Theme), `star_trek` (Alexander Courage Fanfare & Jerry Goldsmith TNG March Theme).
   - REST API Endpoints: `GET /api/v0/sound` (status & tune list), `POST /api/v0/sound/play` (`{"tune": "..."}` or custom `notes`), `POST /api/v0/sound/stop`, `POST /api/v0/sound/mute`.
   - Interactive "Sounds" menu modal sheet in `dashboard.html` with real-time "Now Playing" status and playback controls.
+- **UBIFS Flash Protection & tmpfs Migration (`fb_page`, `fb_button`, `fb_draw`, `nano3s_ui`, `ble_setup`, `nano3s.rs`, `deploy/mujina_display_startup.sh`)**:
+  - Moved ephemeral display page selection file from flash (`/mntapp/release/linux/app/fb_page`) to RAM tmpfs (`/tmp/fb_page`), permanently eliminating UBIFS `ENOSPC` errors and flash wear on the 8 MB root volume.
+  - Startup script unlinks legacy `/mntapp/.../fb_page` to reclaim space/inodes and seeds `/tmp/fb_page` with `"mujina-logo"`.
+  - Added explicit write-failure logging in `fb_button` instead of silently dropping errors.
+  - *Behavioral Note:* Since `/tmp` resides in RAM tmpfs, the active page does not persist across cold reboots and safely resets to the boot splash screen (`mujina-logo`).
+- **Circular IxTech Animated Logo Screen (`nano3s_ui`, `fb_button`, `nano3s.rs`)**:
+  - Added new circular animation screen `ixlogo` placed directly before `plasma` in the button cycle (`ip -> [parasite-logo] -> ixlogo -> plasma -> mujina-logo`).
+  - 150-frame, 15 FPS 10.0-second seamless loop scaled ($S=0.255$) and centered at $(120, 120)$ so that 100% of the IxTech crest and lettering stays strictly inside $R \le 108.2\text{ px}$, maintaining a $\ge 6.5\text{ px}$ buffer from the physical circular bezel ($R = 114\text{ px}$) with 0 clipped pixels.
+  - Features a subtle electric violet-cyan corona rim at $R=117\text{ px}$ and 0 lit pixels outside $R=118\text{ px}$.
+  - Stored as a 743.7 KB DEFLATE compressed payload (`ixlogo_anim.h`) decompressed with tiny ANSI C `tinflate` into static buffer at boot, running at <1% CPU.
+- **Button Responsiveness & Zero Transition Lag (`fb_button.rs`, `driver.c`)**:
+  - Changed `fb_button` page switching to fire immediately on **key-down** (`value == 1`) with 150ms debounce and synchronous 25ms buzzer confirmation click, eliminating finger-dwell delay.
+  - Pre-decompresses `ixlogo` frames during boot splash (`init_ixlogo()`) to eliminate the 400ms decompression hitch on first page entry.
+  - Tightened `PAGE_FILE` polling loop in `nano3s_ui` from 100ms to 25ms (40 Hz) and cached theme parsing to once per second.
 
 ## v5.1.0 (2026-11-17)
 - **Core 1 Freeze Recovery, Silence Escalation & Stall Resilience (`nano3s.rs`, `nano3s_tuner_core.rs`, `nano3s_ipc_shim`)**:
