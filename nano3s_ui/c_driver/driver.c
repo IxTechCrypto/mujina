@@ -29,7 +29,7 @@
 #define UI_THEME_CONF_FILE "/data/userconfig/theme.conf"
 
 #define REFRESH_INTERVAL_MS 2000
-#define POLL_INTERVAL_MS 100
+#define POLL_INTERVAL_MS 25
 #define ANIM_INTERVAL_MS 40
 
 #define RGB565(r, g, b) ((uint16_t)((((r) >> 3) << 11) | (((g) >> 2) << 5) | ((b) >> 3)))
@@ -1444,7 +1444,7 @@ static void refresh_pizza(void) {
 static uint8_t *ixlogo_frames = NULL;
 static int ixlogo_inited = 0;
 
-static void refresh_ixlogo(uint32_t ms) {
+static void init_ixlogo(void) {
     if (!ixlogo_inited) {
         tinf_init();
         ixlogo_frames = (uint8_t *)malloc(IXLOGO_TOTAL_BYTES);
@@ -1457,6 +1457,12 @@ static void refresh_ixlogo(uint32_t ms) {
             }
         }
         ixlogo_inited = 1;
+    }
+}
+
+static void refresh_ixlogo(uint32_t ms) {
+    if (!ixlogo_inited) {
+        init_ixlogo();
     }
 
     if (!ixlogo_frames) {
@@ -1865,7 +1871,13 @@ static void run_event_loop(void) {
             fclose(pf);
         }
 
-        ui_theme_t theme = read_ui_theme();
+        static uint32_t last_theme_check = 0;
+        static ui_theme_t cached_theme = THEME_CYBERPUNK;
+        if (now - last_theme_check >= 1000 || last_theme == (ui_theme_t)(-1)) {
+            cached_theme = read_ui_theme();
+            last_theme_check = now;
+        }
+        ui_theme_t theme = cached_theme;
         page_t pg = parse_page(page);
         if (pg == PG_PARASITE && theme != THEME_PARASITE) {
             pg = PG_SPLASH;
@@ -1976,6 +1988,7 @@ static void clear_framebuffer(void) {
 int nano3s_ui_run(void) {
     clear_framebuffer();
     init_ring_lut();
+    init_ixlogo();
     lv_init();
 
     static lv_disp_draw_buf_t draw_buf;

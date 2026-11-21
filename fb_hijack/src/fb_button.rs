@@ -103,28 +103,12 @@ fn main() {
         .unwrap_or_else(|e| panic!("open {BEEPER_DEV}: {e}"));
     eprintln!("fb_button: exclusively controlling {BUTTON_DEV}; event0 reset remains unchanged");
 
-    let mut down: Option<Instant> = None;
+    let mut last_press: Option<Instant> = None;
     let mut event = [0u8; 24];
     loop {
-        // REMOVED (2026-08-06, real user complaint: ">1s delay between
-        // button press and page change, sometimes needs multiple
-        // presses"): every single click used to wait out the full
-        // DOUBLE_CLICK_WINDOW (450ms) before toggle_page() fired, to
-        // disambiguate it from a double-click (which called next_mode(),
-        // a cgminer-API-based workmode cycler). Confirmed live on the
-        // real device that this feature has been dead for a long time --
-        // `netstat` shows nothing listening on CGMINER_API's port 4028,
-        // no cgminer/mm_miner process exists at all (this project
-        // replaced that whole stack with rtos_core.elf/mujina-minerd
-        // months ago). So every click was paying a real ~450ms
-        // unresponsiveness tax for a feature that could never succeed --
-        // and if a frustrated user clicked again inside that window
-        // (a natural reaction to apparent unresponsiveness), the SECOND
-        // click got misread as a double-click, firing next_mode()
-        // (always failing) instead of a second page toggle -- directly
-        // explaining "sometimes I need to click multiple times" too.
-        // Blocking poll with no timeout now -- toggle_page() fires the
-        // instant a real key-up is seen, with zero artificial delay.
+        // Immediate response on key-down: toggle_page() fires instantly on
+        // initial button press (with 150ms debounce) alongside the audible
+        // feedback beep, eliminating the artificial release-lag and debounce tax.
         let mut fds = PollFd { fd: button.as_raw_fd(), events: 1, revents: 0 };
         let ready = unsafe { poll(&mut fds, 1, -1) };
         if ready < 0 || button.read_exact(&mut event).is_err() { continue; }
@@ -132,13 +116,11 @@ fn main() {
         let value = i32::from_ne_bytes([event[20], event[21], event[22], event[23]]);
         if typ != EV_KEY { continue; }
         if value == 1 {
-            down = Some(Instant::now());
-            beep(&mut beeper, 25);
-        }
-        if value == 0 {
-            let held = down.take().map(|t| t.elapsed()).unwrap_or_default();
-            if held >= Duration::from_millis(5) {
+            let now = Instant::now();
+            if last_press.map(|t| now.duration_since(t) > Duration::from_millis(150)).unwrap_or(true) {
+                last_press = Some(now);
                 toggle_page();
+                beep(&mut beeper, 25);
             }
         }
     }
