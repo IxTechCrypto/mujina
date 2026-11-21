@@ -1,49 +1,78 @@
 import os
 import glob
 import zlib
+import subprocess
 from PIL import Image
 import numpy as np
 
 def generate():
-    frames_dir = r"C:\Users\grant\.gemini\antigravity\brain\fa08a51d-7d2a-471f-accf-2797da253ec2\scratch\frames_all"
-    files = sorted(glob.glob(os.path.join(frames_dir, "frame_*.png")))
-    if len(files) < 300:
-        raise ValueError(f"Expected 300 frames, found {len(files)}")
-    
-    # 15 fps: sample every 2 frames -> 150 frames
-    sample_files = files[::2]
-    num_frames = len(sample_files)
-    print(f"Sampling {num_frames} frames (15 fps, 10s)")
+    mp4_path = r"C:\Users\grant\.gemini\antigravity\brain\fa08a51d-7d2a-471f-accf-2797da253ec2\.user_uploaded\media_1795230270857_3f37042e.mp4"
+    scratch_dir = r"C:\Users\grant\.gemini\antigravity\brain\fa08a51d-7d2a-471f-accf-2797da253ec2\scratch\frames_240_full"
+    os.makedirs(scratch_dir, exist_ok=True)
 
-    # Crop to 114x114 centered at (62, 63) to (176, 177)
-    crops = []
-    for f in sample_files:
-        im = Image.open(f).crop((62, 63, 176, 177))
-        crops.append(np.array(im, dtype=np.float32))
+    # 1. Extract 150 frames (15 FPS for 10.0s), center cropped 640x640 from 720p and scaled to 240x240
+    print("Extracting 150 frames at 15 fps (640x640 center zoom scaled to 240x240)...")
+    cmd = [
+        "ffmpeg", "-y", "-i", mp4_path,
+        "-vf", "crop=640:640:320:40,scale=240:240",
+        "-r", "15",
+        os.path.join(scratch_dir, "f_%04d.png")
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
 
-    # Apply seamless cross-fade on last 10 frames towards frame 0
-    f0 = crops[0]
+    files = sorted(glob.glob(os.path.join(scratch_dir, "f_*.png")))[:150]
+    num_frames = len(files)
+    if num_frames != 150:
+        raise ValueError(f"Expected 150 frames, found {num_frames}")
+    print(f"Loaded {num_frames} frames")
+
+    # 2. Process frames: circular vignette mask + black noise gate + subtle electric rim
+    cy, cx = 120.0, 120.0
+    Y, X = np.ogrid[:240, :240]
+    dist = np.sqrt((X - cx)**2 + (Y - cy)**2)
+
+    # Circular mask: full brightness up to r=114, smooth cosine/linear roll-off to 0 at r=117.5
+    mask = np.clip((117.5 - dist) / 3.5, 0.0, 1.0)[:, :, np.newaxis]
+    # Subtle electric rim: Gaussian profile around r=117.0 (matching IxTech electric violet-cyan glow)
+    rim_profile = np.exp(-0.5 * ((dist - 117.0) / 0.75)**2)[:, :, np.newaxis]
+    rim_color = np.array([160.0, 100.0, 240.0], dtype=np.float32)
+
+    processed = []
+    for f in files:
+        arr = np.array(Image.open(f), dtype=np.float32)
+        # Noise gate: crush background video compression artifacts to pure black
+        max_c = np.max(arr, axis=2, keepdims=True)
+        noise_gate = np.clip((max_c - 6.0) / 10.0, 0.0, 1.0)
+        arr_clean = arr * noise_gate * mask
+        # Add subtle electric rim
+        arr_rim = arr_clean + rim_profile * rim_color * 0.85
+        # Strict zeroing outside circle screen radius (r > 118.0)
+        arr_rim[dist > 118.0] = 0.0
+        processed.append(arr_rim)
+
+    # 3. Seamless loop cross-fade on last 10 frames towards frame 0
     fade_len = 10
+    f0 = processed[0]
     for idx in range(fade_len):
         frame_idx = num_frames - fade_len + idx
         alpha = (idx + 1) / (fade_len + 1)
-        crops[frame_idx] = (1.0 - alpha) * crops[frame_idx] + alpha * f0
+        processed[frame_idx] = (1.0 - alpha) * processed[frame_idx] + alpha * f0
 
-    # Build composite image for global quantization
-    # 15 columns x 10 rows
-    comp_w = 114 * 15
-    comp_h = 114 * 10
+    # 4. Global 32-color quantization across all frames
+    comp_w = 240 * 15
+    comp_h = 240 * 10
     comp = Image.new("RGB", (comp_w, comp_h))
-    for i, arr in enumerate(crops):
+    for i, arr in enumerate(processed):
         im = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
-        x = (i % 15) * 114
-        y = (i // 15) * 114
-        comp.paste(im, (x, y))
+        comp.paste(im, ((i % 15) * 240, (i // 15) * 240))
 
-    # Quantize to 32 colors
     num_colors = 32
     pal_img = comp.quantize(colors=num_colors, method=Image.Quantize.FASTOCTREE)
-    raw_pal = pal_img.getpalette()[:num_colors * 3]
+    raw_pal = bytearray(pal_img.getpalette()[:num_colors * 3])
+
+    # Ensure index 0 is strictly (0, 0, 0) for pure black
+    raw_pal[0:3] = b"\x00\x00\x00"
+    pal_img.putpalette(raw_pal)
 
     # Convert palette to RGB565 uint16
     palette_rgb565 = []
@@ -56,43 +85,46 @@ def generate():
         b5 = (b >> 3) & 0x1F
         u16 = (r5 << 11) | (g6 << 5) | b5
         palette_rgb565.append(u16)
+    palette_rgb565[0] = 0x0000
 
-    # Ensure index of pure black or darkest color
-    print(f"Palette generated with {num_colors} colors")
-
-    # Quantize each frame
+    print("Quantizing all frames to 32 colors with strict circular zeroing...")
     raw_payload = bytearray()
-    for arr in crops:
+    for arr in processed:
         im = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
-        q = im.quantize(palette=pal_img)
-        raw_payload.extend(q.tobytes())
+        q = im.quantize(palette=pal_img, dither=Image.Dither.NONE)
+        q_arr = np.array(q, dtype=np.uint8)
+        # Strict zeroing: guarantee every pixel outside circular screen is index 0 (black 0x0000)
+        q_arr[dist > 118.0] = 0
+        raw_payload.extend(q_arr.tobytes())
 
     uncompressed_len = len(raw_payload)
-    print(f"Uncompressed payload: {uncompressed_len:,} bytes ({uncompressed_len/1024:.1f} KB)")
+    print(f"Uncompressed payload: {uncompressed_len:,} bytes ({uncompressed_len / (1024 * 1024):.2f} MB)")
 
-    # Raw DEFLATE compression (wbits = -15 for raw DEFLATE without zlib header/trailer)
+    # 5. Raw DEFLATE compression (wbits = -15)
+    print("Compressing payload with raw DEFLATE level 9...")
     comp_obj = zlib.compressobj(level=9, method=zlib.DEFLATED, wbits=-15)
     deflate_bytes = comp_obj.compress(bytes(raw_payload)) + comp_obj.flush()
-    print(f"Raw DEFLATE compressed size: {len(deflate_bytes):,} bytes ({len(deflate_bytes)/1024:.1f} KB)")
+    print(f"Raw DEFLATE compressed size: {len(deflate_bytes):,} bytes ({len(deflate_bytes) / 1024:.1f} KB)")
 
-    # Verify decompression with zlib
+    # 6. Verify decompression with zlib
     decomp = zlib.decompress(deflate_bytes, -15)
     assert decomp == bytes(raw_payload), "Decompression self-check failed!"
     print("Self-check passed: DEFLATE decompress matches raw payload exactly!")
 
-    # Write C header
+    # 7. Write C header ixlogo_anim.h
     out_h = r"D:\github\mujina-v5.2-staging\nano3s_ui\c_driver\ixlogo_anim.h"
+    print(f"Writing {out_h}...")
     with open(out_h, "w", encoding="utf-8") as f:
-        f.write("/* Auto-generated IxTech animated logo assets (15 fps, 10.0s, 32 colors) */\n")
+        f.write("/* Auto-generated IxTech animated logo assets (240x240 circular, 15 fps, 10.0s, 32 colors) */\n")
         f.write("#ifndef IXLOGO_ANIM_H\n")
         f.write("#define IXLOGO_ANIM_H\n\n")
         f.write("#include <stdint.h>\n\n")
-        f.write(f"#define IXLOGO_FRAME_W       114\n")
-        f.write(f"#define IXLOGO_FRAME_H       114\n")
+        f.write("#define IXLOGO_FRAME_W       240\n")
+        f.write("#define IXLOGO_FRAME_H       240\n")
         f.write(f"#define IXLOGO_NUM_FRAMES    {num_frames}\n")
-        f.write(f"#define IXLOGO_FRAME_BYTES   (IXLOGO_FRAME_W * IXLOGO_FRAME_H)\n")
+        f.write("#define IXLOGO_FRAME_BYTES   (IXLOGO_FRAME_W * IXLOGO_FRAME_H)\n")
         f.write(f"#define IXLOGO_TOTAL_BYTES   {uncompressed_len}\n")
-        f.write(f"#define IXLOGO_FRAME_MS      66 /* 15 FPS */\n\n")
+        f.write("#define IXLOGO_FRAME_MS      66 /* 15 FPS */\n\n")
 
         # Palette
         f.write(f"static const uint16_t ixlogo_palette[{num_colors}] = {{\n    ")

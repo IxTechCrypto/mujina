@@ -1440,7 +1440,7 @@ static void refresh_pizza(void) {
     blit_ui_fb((const uint16_t *)pizza_buf);
 }
 
-/* ── IxTech Animated Logo (15 FPS, 10.0s Loop) ────────────────────────── */
+/* ── IxTech Animated Logo (240x240 Circular, 15 FPS, 10.0s Loop) ──────── */
 static uint8_t *ixlogo_frames = NULL;
 static int ixlogo_inited = 0;
 
@@ -1468,17 +1468,8 @@ static void refresh_ixlogo(uint32_t ms) {
     uint32_t frame_idx = (ms / IXLOGO_FRAME_MS) % IXLOGO_NUM_FRAMES;
     const uint8_t *src = &ixlogo_frames[frame_idx * IXLOGO_FRAME_BYTES];
 
-    memset(ui_fb, 0, sizeof(ui_fb));
-
-    const int start_x = (HOR_RES - IXLOGO_FRAME_W) / 2;
-    const int start_y = (VER_RES - IXLOGO_FRAME_H) / 2;
-
-    for (int y = 0; y < IXLOGO_FRAME_H; y++) {
-        uint16_t *dst_row = &ui_fb[(start_y + y) * HOR_RES + start_x];
-        const uint8_t *src_row = &src[y * IXLOGO_FRAME_W];
-        for (int x = 0; x < IXLOGO_FRAME_W; x++) {
-            dst_row[x] = ixlogo_palette[src_row[x]];
-        }
+    for (int i = 0; i < HOR_RES * VER_RES; i++) {
+        ui_fb[i] = ixlogo_palette[src[i]];
     }
 
     blit_ui_fb(ui_fb);
