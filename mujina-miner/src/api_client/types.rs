@@ -408,6 +408,37 @@ pub struct DisplayPatchRequest {
     pub page: Option<String>,
 }
 
+/// Note representation with frequency and duration.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct SoundNote {
+    pub freq_hz: u32,
+    pub duration_ms: u32,
+}
+
+/// Current sound / buzzer state (`GET /api/v0/sound`).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct SoundState {
+    pub playing: Option<String>,
+    pub available_tunes: Vec<String>,
+    pub muted: bool,
+}
+
+/// Request body for `POST /api/v0/sound/play`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct SoundPlayRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tune: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<Vec<SoundNote>>,
+}
+
+/// Response body for sound actions.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct SoundActionResponse {
+    pub ok: bool,
+    pub message: String,
+}
+
 /// Job source telemetry.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct SourceTelemetry {

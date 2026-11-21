@@ -1081,6 +1081,7 @@
     <a class="menubtn" data-menu="led" href="/led">LED</a>
     <a class="menubtn" data-menu="firmware" href="/firmware" style="display:none">Firmware</a>
     <button type="button" class="menubtn" data-menu="display">Display</button>
+    <button type="button" class="menubtn" data-menu="sound">Sounds</button>
     <a class="menubtn" data-menu="info" href="/info">Info</a>
   </div>
   <div class="sysnotice" id="sysNotice" style="display:none"></div>
@@ -1329,6 +1330,121 @@
             <option value="minimal">Minimal</option>
             <option value="parasite">Parasite Retro B&amp;W</option>
           </select>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal menusheet" id="menu-sound">
+    <div class="sheet">
+      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
+      <h2>Buzzer & Sound Themes</h2>
+      <div class="subhead">Hardware PWM speaker test & celebration anthems</div>
+
+      <!-- Live sound status -->
+      <div class="sec" style="margin-top:14px">Sound Status<span class="sec-sub">device hardware /dev/input/event1</span></div>
+      <div class="card" style="max-width:560px">
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+          <div>
+            <div style="font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim)">Now Playing</div>
+            <div id="soundNowPlaying" style="font-family:'Orbitron',sans-serif;font-size:16px;font-weight:700;color:var(--cyan);margin-top:2px">Idle (Silent)</div>
+          </div>
+          <div style="display:flex;gap:8px">
+            <button class="btn" id="soundStopBtn" style="border-color:var(--mag);color:var(--mag);padding:7px 12px;font-size:11px">⏹ Stop Sound</button>
+          </div>
+        </div>
+        <div class="msg" id="soundMsg" style="margin-top:8px"></div>
+      </div>
+
+      <!-- Mining Celebrations -->
+      <div class="sec" style="margin-top:16px">Mining Celebrations<span class="sec-sub">sound effects on pool events</span></div>
+      <div class="card" style="max-width:560px">
+        <div style="display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:6px 0;border-bottom:1px solid var(--line)">
+          <div>
+            <div style="font-weight:700;font-size:13px;color:var(--ink)">New High Difficulty Share</div>
+            <small style="color:var(--dim)">Ascending 8-bit jackpot arpeggio (C5 -> G6)</small>
+          </div>
+          <button class="btn pri sound-play-btn" data-tune="high_diff" style="padding:6px 14px;font-size:11px">▶ Play</button>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:10px 0 4px">
+          <div>
+            <div style="font-weight:700;font-size:13px;color:var(--gold,#ffcc00)">Block Found Victory</div>
+            <small style="color:var(--dim)">Triumphant victory fanfare (Bitcoin block solve)</small>
+          </div>
+          <button class="btn pri sound-play-btn" data-tune="block_found" style="padding:6px 14px;font-size:11px;border-color:var(--gold,#ffcc00);color:var(--gold,#ffcc00)">▶ Play</button>
+        </div>
+      </div>
+
+      <!-- Theme & Holiday Chimes -->
+      <div class="sec" style="margin-top:16px">Theme & Holiday Chimes<span class="sec-sub">matched to LED animations</span></div>
+      <div class="card" style="max-width:560px">
+        <div style="display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:6px 0;border-bottom:1px solid var(--line)">
+          <div>
+            <div style="font-weight:700;font-size:13px;color:var(--ink)">Jingle Bells</div>
+            <small style="color:var(--dim)">Christmas LED holiday chorus</small>
+          </div>
+          <button class="btn pri sound-play-btn" data-tune="jingle_bells" style="padding:6px 14px;font-size:11px">▶ Play</button>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)">
+          <div>
+            <div style="font-weight:700;font-size:13px;color:var(--ink)">Star-Spangled Banner</div>
+            <small style="color:var(--dim)">Independence Day patriotic anthem</small>
+          </div>
+          <button class="btn pri sound-play-btn" data-tune="star_spangled" style="padding:6px 14px;font-size:11px">▶ Play</button>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)">
+          <div>
+            <div style="font-weight:700;font-size:13px;color:var(--ink)">The Marines' Hymn</div>
+            <small style="color:var(--dim)">United States Marine Corps anthem (From the Halls of Montezuma)</small>
+          </div>
+          <button class="btn pri sound-play-btn" data-tune="marines_hymn" style="padding:6px 14px;font-size:11px">▶ Play</button>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)">
+          <div>
+            <div style="font-weight:700;font-size:13px;color:var(--ink)">Halloween Spooky Sounds</div>
+            <small style="color:var(--dim)">Bach Toccata & Fugue opening + chromatic descent</small>
+          </div>
+          <button class="btn pri sound-play-btn" data-tune="halloween" style="padding:6px 14px;font-size:11px">▶ Play</button>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:8px 0 4px">
+          <div>
+            <div style="font-weight:700;font-size:13px;color:var(--ink)">Knight Rider Theme</div>
+            <small style="color:var(--dim)">KITT scanner synth hook (D minor arpeggios)</small>
+          </div>
+          <button class="btn pri sound-play-btn" data-tune="knight_rider" style="padding:6px 14px;font-size:11px">▶ Play</button>
+        </div>
+      </div>
+
+      <!-- Retro Video Games -->
+      <div class="sec" style="margin-top:16px">Retro Video Games<span class="sec-sub">classic 8-bit chip melodies</span></div>
+      <div class="card" style="max-width:560px">
+        <div style="display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:6px 0;border-bottom:1px solid var(--line)">
+          <div>
+            <div style="font-weight:700;font-size:13px;color:var(--ink)">Super Mario Bros</div>
+            <small style="color:var(--dim)">Overworld theme opening & verse</small>
+          </div>
+          <button class="btn pri sound-play-btn" data-tune="mario" style="padding:6px 14px;font-size:11px">▶ Play</button>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)">
+          <div>
+            <div style="font-weight:700;font-size:13px;color:var(--ink)">Sonic the Hedgehog</div>
+            <small style="color:var(--dim)">SEGA chant + Title Screen fanfare (Masato Nakamura)</small>
+          </div>
+          <button class="btn pri sound-play-btn" data-tune="sonic" style="padding:6px 14px;font-size:11px">▶ Play</button>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)">
+          <div>
+            <div style="font-weight:700;font-size:13px;color:var(--ink)">Street Fighter II (Theme of World Warriors)</div>
+            <small style="color:var(--dim)">Official Main Title Theme (Yoko Shimomura)</small>
+          </div>
+          <button class="btn pri sound-play-btn" data-tune="street_fighter" style="padding:6px 14px;font-size:11px">▶ Play</button>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:8px 0 4px">
+          <div>
+            <div style="font-weight:700;font-size:13px;color:var(--ink)">Star Trek: The Next Generation</div>
+            <small style="color:var(--dim)">Courage Fanfare &amp; Goldsmith March Theme</small>
+          </div>
+          <button class="btn pri sound-play-btn" data-tune="star_trek" style="padding:6px 14px;font-size:11px">▶ Play</button>
         </div>
       </div>
     </div>
@@ -1753,7 +1869,7 @@ async function loadSystem() {
 }
 
 function applySystem() {
-  const on = { dashboard: true, power: false, tuning: false, fan: false, curve: false, pool: false, led: true, firmware: false, display: true, info: true };
+  const on = { dashboard: true, power: false, tuning: false, fan: false, curve: false, pool: false, led: true, firmware: false, display: true, sound: true, info: true };
   if (SYS) {
     const boards = SYS.boards || [], dev = SYS.device || {};
     const any = f => boards.some(b => b.caps && f(b.caps));
@@ -1765,6 +1881,7 @@ function applySystem() {
     on.led = true;
     on.firmware = !!(SYS.firmware && SYS.firmware.update === 'bundle');
     on.display = true;
+    on.sound = true;
   }
   document.querySelectorAll('.menubtn').forEach(b => {
     if (b.dataset.menu) {
@@ -2872,6 +2989,7 @@ function syncContinuousUI() {
   st.classList.toggle('on', on);
 }
 function closeMenus() {
+  if (soundPollTimer) { clearInterval(soundPollTimer); soundPollTimer = null; }
   document.querySelectorAll('.menusheet.show').forEach(m => m.classList.remove('show'));
   document.querySelectorAll('.menubtn.on').forEach(b => b.classList.remove('on'));
   const dashBtn = document.querySelector('.menubtn[data-menu="dashboard"]');
@@ -2903,10 +3021,14 @@ function openMenu(key) {
     renderModalBoardTabs('fanBoardTabs');
     applyBoardCaps();
   }
+  if (key === 'sound') {
+    pollSoundStatus();
+    if (!soundPollTimer) soundPollTimer = setInterval(pollSoundStatus, 1000);
+  }
 }
 function openFromHash() {
   const h = location.hash.replace(/^#/, '');
-  if (['power', 'tuning', 'fan', 'curve', 'pool', 'display'].includes(h)) {
+  if (['power', 'tuning', 'fan', 'curve', 'pool', 'display', 'sound'].includes(h)) {
     openMenu(h);
     try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
   }
@@ -3000,6 +3122,68 @@ async function loadDisplayTheme() {
 }
 loadDisplayTheme();
 setInterval(loadDisplayTheme, 8000);
+
+// ---- Sound & Chimes ----
+let soundPollTimer = null;
+async function pollSoundStatus() {
+  try {
+    const r = await fetch('/api/v0/sound');
+    if (r.ok) {
+      const d = await r.json();
+      const el = $('soundNowPlaying');
+      if (el) {
+        if (d.playing) {
+          el.textContent = 'Playing: ' + d.playing.toUpperCase();
+          el.style.color = 'var(--mag)';
+        } else {
+          el.textContent = 'Idle (Silent)';
+          el.style.color = 'var(--cyan)';
+        }
+      }
+    }
+  } catch (e) {}
+}
+
+async function playSoundTune(tune) {
+  setMsg('soundMsg', 'Playing ' + tune + '…', true);
+  try {
+    const r = await fetch('/api/v0/sound/play', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tune: tune })
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      throw new Error(err || ('HTTP ' + r.status));
+    }
+    const d = await r.json();
+    setMsg('soundMsg', d.message || ('Playing ' + tune), true);
+    pollSoundStatus();
+  } catch (e) {
+    setMsg('soundMsg', 'Playback failed: ' + e.message);
+  }
+}
+
+async function stopSound() {
+  try {
+    const r = await fetch('/api/v0/sound/stop', { method: 'POST' });
+    if (r.ok) {
+      setMsg('soundMsg', 'Sound stopped ✓', true);
+      pollSoundStatus();
+    }
+  } catch (e) {
+    setMsg('soundMsg', 'Stop failed: ' + e.message);
+  }
+}
+
+const sStop = $('soundStopBtn');
+if (sStop) sStop.addEventListener('click', stopSound);
+document.querySelectorAll('.sound-play-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const tune = btn.dataset.tune;
+    if (tune) playSoundTune(tune);
+  });
+});
 
 loadPool();
 applySystem();
