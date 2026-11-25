@@ -154,8 +154,8 @@ impl ForcedRateSource {
                             SourceEvent::ReplaceJob(self.modify_job(job))
                         }
                         SourceEvent::ClearJobs => SourceEvent::ClearJobs,
-                        SourceEvent::ShareResult { accepted } => {
-                            SourceEvent::ShareResult { accepted }
+                        SourceEvent::ShareResult { accepted, reason } => {
+                            SourceEvent::ShareResult { accepted, reason }
                         }
                     };
                     self.outer_event_tx.send(modified).await?;

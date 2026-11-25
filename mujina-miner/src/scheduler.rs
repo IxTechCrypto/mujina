@@ -157,6 +157,8 @@ struct SourceEntry {
 
     accepted: u64,
     rejected: u64,
+    /// Pool reject text and how many times it was returned. Capped.
+    reject_reasons: Vec<(String, u64)>,
 
     /// Measured chain hashrate while this pool held the chain, else 0.
     /// One sample per 10 s telemetry tick, oldest first. 360 samples is 1 h.
@@ -367,6 +369,14 @@ impl Scheduler {
                     weight: s.weight,
                     accepted: s.accepted,
                     rejected: s.rejected,
+                    reject_reasons: s
+                        .reject_reasons
+                        .iter()
+                        .map(|(reason, count)| crate::api_client::types::RejectReason {
+                            reason: reason.clone(),
+                            count: *count,
+                        })
+                        .collect(),
                     hashrate_10m: average_recent(&s.samples, 60),
                     hashrate_1h: average_recent(&s.samples, 360),
                 })
@@ -445,6 +455,7 @@ impl Scheduler {
             credit: 0,
             accepted: 0,
             rejected: 0,
+            reject_reasons: Vec::new(),
             samples: VecDeque::new(),
         });
         source_events.insert(source_id, ReceiverStream::new(registration.event_rx));
@@ -1097,12 +1108,13 @@ impl Scheduler {
                             }
                         }
 
-                        SourceEvent::ShareResult { accepted } => {
+                        SourceEvent::ShareResult { accepted, reason } => {
                             if let Some(source) = self.sources.get_mut(source_id) {
                                 if accepted {
                                     source.accepted += 1;
                                 } else {
                                     source.rejected += 1;
+                                    note_reject(&mut source.reject_reasons, reason.as_deref());
                                 }
                             }
                         }
@@ -1213,6 +1225,33 @@ impl Scheduler {
 ///
 /// Takes pre-collected (sender, hashrate) pairs to avoid capturing Scheduler
 /// across await points (it contains Box<dyn HashThread> which isn't Sync).
+/// Remember a pool's reject text. At most eight distinct strings; the
+/// rest fold into `other`. The text is the pool's own message, trimmed.
+fn note_reject(reasons: &mut Vec<(String, u64)>, reason: Option<&str>) {
+    let raw = reason.unwrap_or("").trim();
+    let raw = if raw.is_empty() { "unknown" } else { raw };
+    let end = raw
+        .char_indices()
+        .nth(80)
+        .map(|(i, _)| i)
+        .unwrap_or(raw.len());
+    let reason = &raw[..end];
+    if let Some((_, count)) = reasons.iter_mut().find(|(r, _)| r == reason) {
+        *count += 1;
+        return;
+    }
+    let named = reasons.iter().filter(|(r, _)| r != "other").count();
+    if named < 7 {
+        reasons.push((reason.to_string(), 1));
+        return;
+    }
+    if let Some((_, count)) = reasons.iter_mut().find(|(r, _)| r == "other") {
+        *count += 1;
+    } else {
+        reasons.push(("other".into(), 1));
+    }
+}
+
 fn average_recent(samples: &VecDeque<u64>, n: usize) -> u64 {
     let take = n.min(samples.len());
     if take == 0 {
@@ -1527,5 +1566,22 @@ mod tests {
         gate.record_enumeration_complete();
         gate.record_timeout();
         assert!(!gate.is_holding());
+    }
+
+    #[test]
+    fn reject_reasons_count_the_pool_text_and_cap_the_list() {
+        let mut reasons = Vec::new();
+        super::note_reject(&mut reasons, Some("Job not found"));
+        super::note_reject(&mut reasons, Some("Job not found"));
+        super::note_reject(&mut reasons, Some("  "));
+        assert_eq!(
+            reasons,
+            vec![("Job not found".into(), 2), ("unknown".into(), 1)]
+        );
+        for i in 0..10 {
+            super::note_reject(&mut reasons, Some(&format!("reason-{i}")));
+        }
+        assert!(reasons.len() <= 8);
+        assert!(reasons.iter().any(|(r, n)| r == "other" && *n >= 1));
     }
 }

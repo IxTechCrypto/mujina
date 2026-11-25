@@ -374,6 +374,13 @@ pub struct PoolPut {
     pub weight: u16,
 }
 
+/// One pool reject string and how many times the pool returned it.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+pub struct RejectReason {
+    pub reason: String,
+    pub count: u64,
+}
+
 /// One pool in `GET /api/v0/pools`. The password is never returned.
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct PoolStatus {
@@ -386,6 +393,9 @@ pub struct PoolStatus {
     pub difficulty: Option<f64>,
     pub accepted: u64,
     pub rejected: u64,
+    /// Pool error text, most recent distinct strings, and their counts.
+    #[serde(default)]
+    pub reject_reasons: Vec<RejectReason>,
     /// Effective hashrate, hashes/s, over the last 10 minutes.
     pub hashrate_10m: u64,
     /// Effective hashrate, hashes/s, over the last hour.
@@ -501,6 +511,9 @@ pub struct SourceTelemetry {
     pub accepted: u64,
     #[serde(default)]
     pub rejected: u64,
+    /// Pool error text and how many times it was returned.
+    #[serde(default)]
+    pub reject_reasons: Vec<crate::api_client::types::RejectReason>,
     /// Effective hashes/s over the last 10 minutes.
     #[serde(default)]
     pub hashrate_10m: u64,

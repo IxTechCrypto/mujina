@@ -90,6 +90,16 @@ mod tests {
     }
 
     #[test]
+    fn one_pool_at_100_percent_gets_every_slot() {
+        let shares = time_shares(&views(&[100], &[true]));
+        assert_eq!(shares, vec![100]);
+        let mut credit = vec![0i64; 1];
+        for _ in 0..5 {
+            assert_eq!(pick_slot(&mut credit, &shares), Some(0));
+        }
+    }
+
+    #[test]
     fn rotation_matches_weights_over_ten_slots() {
         let shares = time_shares(&views(&[50, 30, 20], &[true, true, true]));
         assert_eq!(shares, vec![50, 30, 20]);

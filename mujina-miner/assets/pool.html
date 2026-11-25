@@ -349,7 +349,7 @@ function gh(h) {
 
 function blank() {
   return { url: '', user: '', password: '', weight: 0, password_set: false,
-    connected: false, difficulty: null, accepted: 0, rejected: 0, hashrate_10m: 0, hashrate_1h: 0 };
+    connected: false, difficulty: null, accepted: 0, rejected: 0, hashrate_10m: 0, hashrate_1h: 0, reject_reasons: [] };
 }
 
 function sumWeights() {
@@ -405,6 +405,7 @@ function render() {
         '<div><span>10 min</span>' + gh(p.hashrate_10m) + '</div>' +
         '<div><span>1 hour</span>' + gh(p.hashrate_1h) + '</div>' +
       '</div>' +
+      '<div class="note reasons">' + reasonText(p.reject_reasons) + '</div>' +
       '<div class="actions"><button class="btn danger" type="button" data-rm="1">Remove</button></div>';
     card.querySelector('[data-k="url"]').addEventListener('input', e => { editing = true; pools[i].url = e.target.value; });
     card.querySelector('[data-k="user"]').addEventListener('input', e => { editing = true; pools[i].user = e.target.value; });
@@ -429,6 +430,10 @@ function render() {
   paintSum();
 }
 
+function reasonText(list) {
+  if (!list || !list.length) return '';
+  return 'rejects: ' + list.map(r => r.count + ' × ' + r.reason).join(' · ');
+}
 function esc(s) {
   return String(s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
 }
@@ -442,6 +447,7 @@ function mergeLive(fresh) {
     pools[i].rejected = f.rejected;
     pools[i].hashrate_10m = f.hashrate_10m;
     pools[i].hashrate_1h = f.hashrate_1h;
+    pools[i].reject_reasons = f.reject_reasons || [];
     pools[i].password_set = f.password_set;
   });
   if (!editing) render();
@@ -458,6 +464,8 @@ function mergeLive(fresh) {
         cells[2].innerHTML = '<span>Rejected</span>' + (p.rejected || 0);
         cells[3].innerHTML = '<span>10 min</span>' + gh(p.hashrate_10m);
         cells[4].innerHTML = '<span>1 hour</span>' + gh(p.hashrate_1h);
+      const reasons = card.querySelector('.reasons');
+      if (reasons) reasons.textContent = reasonText(p.reject_reasons);
       }
     });
   }

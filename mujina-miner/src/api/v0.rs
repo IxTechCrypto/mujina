@@ -2037,6 +2037,7 @@ async fn get_pools(State(state): State<SharedState>) -> Json<PoolsResponse> {
                 rejected: live.map(|s| s.rejected).unwrap_or(0),
                 hashrate_10m: live.map(|s| s.hashrate_10m).unwrap_or(0),
                 hashrate_1h: live.map(|s| s.hashrate_1h).unwrap_or(0),
+                reject_reasons: live.map(|s| s.reject_reasons.clone()).unwrap_or_default(),
             }
         })
         .collect();

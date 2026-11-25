@@ -141,7 +141,11 @@ pub enum SourceEvent {
     ClearJobs,
 
     /// The pool accepted or rejected a share this source submitted.
-    ShareResult { accepted: bool },
+    /// `reason` is the pool's error text when `accepted` is false.
+    ShareResult {
+        accepted: bool,
+        reason: Option<String>,
+    },
 }
 
 /// Commands to sources (pull, coordinator-initiated).
