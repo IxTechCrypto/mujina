@@ -10,9 +10,12 @@ use async_trait::async_trait;
 use super::error::{StratumError, StratumResult};
 use super::messages::JsonRpcMessage;
 use crate::tracing::prelude::*;
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpStream, lookup_host};
+use tokio::time::timeout;
 
 /// Message-level I/O for Stratum protocol.
 ///
@@ -63,23 +66,71 @@ impl Connection {
     /// Parses the URL, establishes TCP connection, and wraps it in a buffered
     /// connection. Supports both `stratum+tcp://` and plain `tcp://` schemes.
     pub async fn connect(url: &str) -> StratumResult<Self> {
-        // Parse URL
-        let url = url
+        let hostport = url
             .strip_prefix("stratum+tcp://")
+            .or_else(|| url.strip_prefix("stratum+ssl://"))
             .or_else(|| url.strip_prefix("tcp://"))
             .unwrap_or(url);
+        let (host, port) = split_host_port(hostport)
+            .ok_or_else(|| StratumError::ConnectionFailed(format!("dns: bad pool url {url}")))?;
 
         debug!(url = %url, "Connecting to pool");
 
-        // Connect
-        let stream = TcpStream::connect(url)
-            .await
-            .map_err(|e| StratumError::ConnectionFailed(e.to_string()))?;
+        let addrs = if host.parse::<IpAddr>().is_ok() {
+            vec![SocketAddr::new(host.parse().unwrap(), port)]
+        } else {
+            let looked = lookup_host((host.as_str(), port))
+                .await
+                .map_err(|e| StratumError::ConnectionFailed(format!("dns: {e}")))?;
+            prefer_ipv4(looked.collect())
+        };
+        if addrs.is_empty() {
+            return Err(StratumError::ConnectionFailed(format!(
+                "dns: {host} has no addresses"
+            )));
+        }
 
-        debug!("Connected to pool");
-
-        Ok(Self::new(stream))
+        let mut last = format!("dns: {host} has no addresses");
+        for addr in addrs {
+            match timeout(Duration::from_secs(8), TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => {
+                    debug!(%addr, "Connected to pool");
+                    return Ok(Self::new(stream));
+                }
+                Ok(Err(e)) => last = format!("connect {addr}: {e}"),
+                Err(_) => last = format!("connect {addr}: timed out"),
+            }
+            debug!(%addr, error = %last, "Pool address failed");
+        }
+        Err(StratumError::ConnectionFailed(last))
     }
+}
+
+/// IPv4 addresses first, then IPv6, keeping each family's original order.
+pub(crate) fn prefer_ipv4(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for addr in addrs {
+        if addr.is_ipv4() {
+            v4.push(addr);
+        } else {
+            v6.push(addr);
+        }
+    }
+    v4.extend(v6);
+    v4
+}
+
+fn split_host_port(hostport: &str) -> Option<(String, u16)> {
+    if let Some(rest) = hostport.strip_prefix('[') {
+        let (host, port) = rest.split_once("]:")?;
+        return Some((host.to_string(), port.parse().ok()?));
+    }
+    let (host, port) = hostport.rsplit_once(':')?;
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), port.parse().ok()?))
 }
 
 #[async_trait]
@@ -270,7 +321,20 @@ impl Connector for MockConnector {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn hostname_pool_tries_ipv4_before_ipv6() {
+        let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(166, 117, 239, 148)), 3333);
+        let v6a = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 3333);
+        let v6b = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 3333);
+        let ordered = prefer_ipv4(vec![v6a, v4, v6b]);
+        assert!(ordered[0].is_ipv4());
+        assert_eq!(ordered.len(), 3);
+        assert!(split_host_port("solo.atlaspool.io:3333").unwrap().0 == "solo.atlaspool.io");
+        assert_eq!(split_host_port("solo.atlaspool.io:3333").unwrap().1, 3333);
+    }
 
     #[tokio::test]
     async fn test_message_roundtrip() {

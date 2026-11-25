@@ -1077,7 +1077,7 @@
     <button type="button" class="menubtn" data-menu="tuning" style="display:none">Tuning</button>
     <button type="button" class="menubtn" data-menu="fan" style="display:none">Fan</button>
     <button type="button" class="menubtn" data-menu="curve" style="display:none">Fan Curve</button>
-    <button type="button" class="menubtn" data-menu="pool" style="display:none">Pool</button>
+    <a class="menubtn" data-menu="pool" href="/pool" style="display:none">Pool</a>
     <a class="menubtn" data-menu="led" href="/led">LED</a>
     <a class="menubtn" data-menu="firmware" href="/firmware" style="display:none">Firmware</a>
     <button type="button" class="menubtn" data-menu="display">Display</button>
@@ -1293,7 +1293,7 @@
     <div class="sheet">
       <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
       <h2>Pool</h2>
-  <div class="sec" id="pool">Pool Settings<span class="sec-sub" id="poolApplyNote">saved immediately</span></div>
+  <div class="sec" id="pool">Pool 1<span class="sec-sub" id="poolApplyNote">saved immediately · <a href="/pool">all pools</a></span></div>
   <div class="card" id="poolCard" style="max-width:560px">
     <div class="prow">
       <label for="poolUrl">Pool URL</label>
@@ -3142,6 +3142,8 @@ document.querySelectorAll('.menubtn').forEach(b => b.addEventListener('click', (
     closeMenus();
     return;
   }
+  const href = b.getAttribute && b.getAttribute('href');
+  if (href && href.charAt(0) === '/' && href.indexOf('#') < 0) return;
   if (b.dataset.menu && document.getElementById('menu-' + b.dataset.menu)) {
     openMenu(b.dataset.menu);
   }

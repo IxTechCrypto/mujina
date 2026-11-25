@@ -1,6 +1,7 @@
 # Changelog
 
 ## v5.2.0 (Unreleased)
+- **Multi-pool time-slicing (`pool_config`, `pool_alloc`, `pool_director`, `scheduler`)**: up to four stratum pools, weighted 60 s slots on the single Nano 3S chain, failover in list order, and `GET`/`PUT /api/v0/pools` applied in-process. `GET`/`PATCH /api/v0/pool` remain pool 1. Passwords are not returned. An existing `pool.conf` migrates to pool 1 at 100%.
 - **NerdQX Standalone Embedded Firmware (`mujina-esp32`)**:
   - Embedded firmware crate for NerdQX (ESP32-S3R8 + 4x BM1370, `192.168.4.40`).
   - Implemented 16 MB partition table with 8 MB Octal PSRAM configuration and USB-Serial-JTAG console.

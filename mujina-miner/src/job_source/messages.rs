@@ -139,6 +139,20 @@ pub enum SourceEvent {
     /// Scheduler should cancel all work from this source and wait for new job.
     /// Used during pool disconnection or when awaiting new block.
     ClearJobs,
+
+    /// The pool accepted or rejected a share this source submitted.
+    /// `reason` is the pool's error text when `accepted` is false.
+    ShareResult {
+        accepted: bool,
+        reason: Option<String>,
+    },
+
+    /// `mining.set_difficulty` for this connection. Applies to the current
+    /// job and to every job after it. Shares below this are not submitted.
+    PoolDifficulty(f64),
+
+    /// Latest connect failure, or `None` once the socket is up.
+    LinkError(Option<String>),
 }
 
 /// Commands to sources (pull, coordinator-initiated).

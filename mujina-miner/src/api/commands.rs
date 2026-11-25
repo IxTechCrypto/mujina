@@ -7,12 +7,17 @@ use anyhow::Result;
 use tokio::sync::oneshot;
 
 /// Commands from the API to the scheduler.
+#[derive(Debug)]
 pub enum SchedulerCommand {
     /// Pause job distribution to all threads.
     PauseMining { reply: oneshot::Sender<Result<()>> },
 
     /// Resume job distribution after a pause.
     ResumeMining { reply: oneshot::Sender<Result<()>> },
+
+    /// Change one live source's weight without reconnecting it.
+    /// `name` is the registration name (`pool-0`, ...).
+    SetWeight { name: String, weight: u16 },
 }
 
 /// Commands from the API to board management.

@@ -15,14 +15,7 @@ use crate::{
     api::{self, ApiConfig, commands::SchedulerCommand},
     backplane::Backplane,
     cpu_miner::CpuMinerConfig,
-    job_source::{
-        SourceCommand, SourceEvent,
-        dummy::DummySource,
-        forced_rate::{ForcedRateConfig, ForcedRateSource},
-        stratum_v1::StratumV1Source,
-    },
     scheduler::{self, SourceRegistration, ThreadRegistration},
-    stratum_v1::{PoolConfig as StratumPoolConfig, TcpConnector},
     transport::{CpuDeviceInfo, TransportEvent, UsbTransport, cpu as cpu_transport},
 };
 
@@ -112,149 +105,26 @@ impl Daemon {
             }
         });
 
-        // Create job source (Stratum v1 or Dummy).
-        //
-        // Pool address/credentials come from, in order of precedence:
-        // 1. `/data/userconfig/pool.conf`, written by `PATCH /api/v0/pool`
-        //    (see `pool_config.rs`) -- lets a dashboard-saved pool change
-        //    survive across restarts even though the boot script always
-        //    passes the same hardcoded env vars below.
-        // 2. Environment variables, set by the boot script:
-        //    - MUJINA_POOL_URL: Pool address (e.g., stratum+tcp://localhost:3333)
-        //    - MUJINA_POOL_USER: Worker username (optional, defaults to "mujina-testing")
-        //    - MUJINA_POOL_PASS: Worker password (optional, defaults to "x")
-        let (source_event_tx, source_event_rx) = mpsc::channel::<SourceEvent>(100);
-        let (source_cmd_tx, source_cmd_rx) = mpsc::channel(10);
-
-        let persisted_pool = crate::pool_config::load();
-        let pool_url_opt = persisted_pool.url.clone().or_else(|| env::var("MUJINA_POOL_URL").ok());
-
-        if let Some(pool_url) = pool_url_opt {
-            // Use Stratum v1 source
-            let pool_user = persisted_pool
-                .user
-                .or_else(|| env::var("MUJINA_POOL_USER").ok())
-                .unwrap_or_else(|| "mujina-testing".to_string());
-            let pool_pass = persisted_pool
-                .pass
-                .or_else(|| env::var("MUJINA_POOL_PASS").ok())
-                .unwrap_or_else(|| "x".to_string());
-
-            let stratum_config = StratumPoolConfig {
-                url: pool_url.clone(),
-                username: pool_user,
-                password: pool_pass,
-                user_agent: "mujina-miner/0.1.0-alpha".to_string(),
-            };
-
-            // Optionally wrap with ForcedRateSource for testing
-            if let Some(forced_rate_config) = ForcedRateConfig::from_env() {
-                info!(
-                    rate = %forced_rate_config.target_rate,
-                    "Forced share rate wrapper enabled"
-                );
-
-                // Create inner channels (stratum <-> wrapper)
-                let (inner_event_tx, inner_event_rx) = mpsc::channel::<SourceEvent>(100);
-                let (inner_cmd_tx, inner_cmd_rx) = mpsc::channel::<SourceCommand>(10);
-
-                let stratum_source = StratumV1Source::new(
-                    stratum_config,
-                    inner_cmd_rx,
-                    inner_event_tx,
-                    self.shutdown.clone(),
-                    Box::new(TcpConnector::new(pool_url.clone())),
-                );
-                let stratum_name = stratum_source.name();
-
-                // Spawn stratum source
-                self.tracker.spawn(async move {
-                    if let Err(e) = stratum_source.run().await {
-                        error!("Stratum v1 source error: {}", e);
-                    }
-                });
-
-                // Create and spawn wrapper (uses outer channels from above)
-                let forced_rate = ForcedRateSource::new(
-                    forced_rate_config,
-                    inner_event_rx,
-                    source_event_tx,
-                    inner_cmd_tx,
-                    source_cmd_rx,
-                    self.shutdown.clone(),
-                );
-
-                source_reg_tx
-                    .send(SourceRegistration {
-                        name: format!("{} (forced-rate)", stratum_name),
-                        url: Some(pool_url.clone()),
-                        event_rx: source_event_rx,
-                        command_tx: source_cmd_tx,
-                    })
-                    .await?;
-
-                self.tracker.spawn(async move {
-                    if let Err(e) = forced_rate.run().await {
-                        error!("Forced rate wrapper error: {}", e);
-                    }
-                });
-            } else {
-                // Direct stratum source (no wrapper)
-                let stratum_source = StratumV1Source::new(
-                    stratum_config,
-                    source_cmd_rx,
-                    source_event_tx,
-                    self.shutdown.clone(),
-                    Box::new(TcpConnector::new(pool_url.clone())),
-                );
-
-                source_reg_tx
-                    .send(SourceRegistration {
-                        name: stratum_source.name(),
-                        url: Some(pool_url),
-                        event_rx: source_event_rx,
-                        command_tx: source_cmd_tx,
-                    })
-                    .await?;
-
-                self.tracker.spawn(async move {
-                    if let Err(e) = stratum_source.run().await {
-                        error!("Stratum v1 source error: {}", e);
-                    }
-                });
-            }
-        } else {
-            // Use DummySource
-            info!("Using dummy job source (set MUJINA_POOL_URL to use Stratum v1)");
-
-            let dummy_source = DummySource::new(
-                source_cmd_rx,
-                source_event_tx,
-                self.shutdown.clone(),
-                tokio::time::Duration::from_secs(30),
-            )?;
-
-            source_reg_tx
-                .send(SourceRegistration {
-                    name: "dummy".into(),
-                    url: None,
-                    event_rx: source_event_rx,
-                    command_tx: source_cmd_tx,
-                })
-                .await?;
-
-            self.tracker.spawn(async move {
-                if let Err(e) = dummy_source.run().await {
-                    error!("DummySource error: {}", e);
-                }
-            });
-        }
-
         // Miner state channel: scheduler publishes snapshots, API serves them.
         let (miner_telemetry_tx, miner_telemetry_rx) = watch::channel(MinerTelemetry::default());
 
         // Command channel: API sends commands, scheduler processes them.
         let (scheduler_cmd_tx, scheduler_cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
+
+        // Pool reload: PUT/PATCH write the file, then hand the new set to
+        // the director. The director adds and removes stratum sessions
+        // in this process. A process restart would leave the Core 1 IPC
+        // handle stale, so there is no restart path here.
+        let (pool_reload_tx, pool_reload_rx) = mpsc::channel(4);
+        let pools = crate::pool_config::effective_pools();
+        info!(pools = pools.len(), "Pool director starting");
+        self.tracker.spawn(crate::pool_director::run(
+            self.shutdown.clone(),
+            pool_reload_rx,
+            source_reg_tx.clone(),
+            scheduler_cmd_tx.clone(),
+            pools,
+        ));
 
         // Start the scheduler
         self.tracker.spawn(scheduler::task(
@@ -284,6 +154,7 @@ impl Daemon {
                     miner_telemetry_rx,
                     board_reg_rx,
                     scheduler_cmd_tx,
+                    pool_reload_tx,
                 )
                 .await
                 {

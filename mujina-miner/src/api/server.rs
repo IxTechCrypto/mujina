@@ -42,6 +42,9 @@ pub(crate) struct SharedState {
     pub miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     pub board_registry: Arc<Mutex<BoardRegistry>>,
     pub scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
+    /// `PUT /api/v0/pools` and `PATCH /api/v0/pool` send the new set here.
+    /// The pool director applies it without restarting the process.
+    pub pool_reload_tx: mpsc::Sender<Vec<crate::pool_config::PoolEntry>>,
     /// Rolling hashrate history behind the dashboard's fleet/board charts.
     /// See [`HashrateHistory`] for why this lives here rather than being
     /// derived per-request.
@@ -120,6 +123,7 @@ pub async fn serve(
     miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     mut board_reg_rx: mpsc::Receiver<BoardRegistration>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
+    pool_reload_tx: mpsc::Sender<Vec<crate::pool_config::PoolEntry>>,
 ) -> Result<()> {
     let board_registry = Arc::new(Mutex::new(BoardRegistry::new()));
 
@@ -138,7 +142,13 @@ pub async fn serve(
     if api_token.is_some() {
         info!("API token set: writes require Authorization: Bearer <token>.");
     }
-    let app = build_router(miner_telemetry_rx, board_registry, scheduler_cmd_tx, api_token);
+    let app = build_router(
+        miner_telemetry_rx,
+        board_registry,
+        scheduler_cmd_tx,
+        api_token,
+        pool_reload_tx,
+    );
 
     let listener = TcpListener::bind(&config.bind_addr).await?;
     let actual_addr = listener.local_addr()?;
@@ -170,12 +180,14 @@ pub(crate) fn build_router(
     board_registry: Arc<Mutex<BoardRegistry>>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
     api_token: Option<Arc<str>>,
+    pool_reload_tx: mpsc::Sender<Vec<crate::pool_config::PoolEntry>>,
 ) -> Router {
     let state = SharedState {
         miner_telemetry_rx,
         board_registry,
         scheduler_cmd_tx,
         hashrate_history: Arc::new(Mutex::new(HashrateHistory::default())),
+        pool_reload_tx,
     };
 
     let dashboard_router = super::dashboard::routes().with_state(state.clone());
@@ -234,6 +246,7 @@ mod tests {
     ) -> TestFixtures {
         let (miner_tx, miner_rx) = watch::channel(miner_state);
         let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
+        let (pool_reload_tx, _pool_reload_rx) = mpsc::channel(4);
 
         let mut registry = BoardRegistry::new();
         let mut board_senders = Vec::new();
@@ -244,7 +257,13 @@ mod tests {
         }
 
         TestFixtures {
-            router: build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx, api_token),
+            router: build_router(
+                miner_rx,
+                Arc::new(Mutex::new(registry)),
+                cmd_tx,
+                api_token,
+                pool_reload_tx,
+            ),
             _board_senders: board_senders,
             _miner_tx: miner_tx,
             _cmd_rx: cmd_rx,

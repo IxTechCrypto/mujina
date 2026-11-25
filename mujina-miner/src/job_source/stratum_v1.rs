@@ -320,6 +320,9 @@ impl StratumV1Source {
                 if let Some(state) = &mut self.state {
                     state.share_difficulty = Some(difficulty);
                 }
+                // The job already in the scheduler was built with the previous
+                // target. Tell it the new pool difficulty before the next notify.
+                let _ = self.event_tx.try_send(SourceEvent::PoolDifficulty(diff));
             }
 
             ClientEvent::VersionMaskSet(mask) => {
@@ -331,6 +334,10 @@ impl StratumV1Source {
 
             ClientEvent::ShareAccepted { job_id, nonce } => {
                 SHARES_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+                let _ = self.event_tx.try_send(SourceEvent::ShareResult {
+                    accepted: true,
+                    reason: None,
+                });
                 if !self.first_share_logged {
                     self.first_share_logged = true;
                     info!(
@@ -353,6 +360,10 @@ impl StratumV1Source {
 
             ClientEvent::ShareRejected { job_id, reason } => {
                 SHARES_REJECTED.fetch_add(1, Ordering::Relaxed);
+                let _ = self.event_tx.try_send(SourceEvent::ShareResult {
+                    accepted: false,
+                    reason: Some(reason.clone()),
+                });
                 warn!(job_id = %job_id, reason = %reason, "Share rejected by pool");
             }
 
@@ -590,6 +601,7 @@ impl StratumV1Source {
                             return ConnectOutcome::Fatal(e.into());
                         }
                         warn!(error = %e, "Failed to connect");
+                        let _ = self.event_tx.try_send(SourceEvent::LinkError(Some(e.to_string())));
                         return ConnectOutcome::Disconnected;
                     }
                 }

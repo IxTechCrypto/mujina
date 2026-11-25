@@ -363,6 +363,64 @@ pub struct PoolConfigResponse {
     pub password_set: bool,
 }
 
+/// One pool in `PUT /api/v0/pools`. `password` is omitted to keep the
+/// password already stored for the same url and user.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PoolPut {
+    pub url: String,
+    pub user: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    pub weight: u16,
+}
+
+/// One pool reject string and how many times the pool returned it.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+pub struct RejectReason {
+    pub reason: String,
+    pub count: u64,
+}
+
+/// One pool in `GET /api/v0/pools`. The password is never returned.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PoolStatus {
+    pub url: String,
+    pub user: String,
+    pub password_set: bool,
+    pub weight: u16,
+    pub connected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<f64>,
+    pub accepted: u64,
+    pub rejected: u64,
+    /// Pool error text, most recent distinct strings, and their counts.
+    #[serde(default)]
+    pub reject_reasons: Vec<RejectReason>,
+    /// Effective hashrate, hashes/s, over the last 10 minutes.
+    pub hashrate_10m: u64,
+    /// Effective hashrate, hashes/s, over the last hour.
+    pub hashrate_1h: u64,
+    /// Shares found locally that were below this pool's difficulty.
+    #[serde(default)]
+    pub shares_low_diff: u64,
+    /// `connected`, `connecting`, `standby`, or `down`.
+    #[serde(default)]
+    pub state: String,
+    /// Why the pool is not connected, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PoolsPutRequest {
+    pub pools: Vec<PoolPut>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PoolsResponse {
+    pub pools: Vec<PoolStatus>,
+}
+
 /// Response body for `POST /api/v0/firmware/{target}`.
 ///
 /// By the time this is returned, the binary is already swapped in and a
@@ -452,6 +510,31 @@ pub struct SourceTelemetry {
         serialize_with = "serialize_opt_f64_as_integer_when_whole"
     )]
     pub difficulty: Option<f64>,
+    /// The stratum session is up.
+    #[serde(default)]
+    pub connected: bool,
+    /// Configured percent of hash time.
+    #[serde(default)]
+    pub weight: u16,
+    #[serde(default)]
+    pub accepted: u64,
+    #[serde(default)]
+    pub rejected: u64,
+    /// Pool error text and how many times it was returned.
+    #[serde(default)]
+    pub reject_reasons: Vec<crate::api_client::types::RejectReason>,
+    /// Effective hashes/s over the last 10 minutes.
+    #[serde(default)]
+    pub hashrate_10m: u64,
+    /// Effective hashes/s over the last hour.
+    #[serde(default)]
+    pub hashrate_1h: u64,
+    /// Shares found locally that were below this pool's difficulty.
+    #[serde(default)]
+    pub shares_low_diff: u64,
+    /// Latest connect failure. Absent once the session is up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// Serialize an `Option<f64>` so that whole numbers appear without a

@@ -24,7 +24,7 @@
 //! statistics and monitoring, then filters again before pool submission.
 
 use slotmap::SlotMap;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -44,6 +44,13 @@ use crate::types::{
     AlarmStatus, DebouncedAlarm, Difficulty, HashRate, HashrateEstimator, ShareRate, Target,
     expected_time_to_share_from_target,
 };
+
+/// A share is submitted only when its difficulty is at least the pool's.
+///
+/// `mining.set_difficulty 94` plus a share of difficulty 10 does not submit.
+pub(crate) fn share_meets_pool_difficulty(pool: f64, share: f64) -> bool {
+    pool.is_finite() && share.is_finite() && pool > 0.0 && share + 1e-9 >= pool
+}
 
 /// Unique identifier for a job source, assigned by the scheduler.
 type SourceId = slotmap::DefaultKey;
@@ -110,6 +117,9 @@ pub struct SourceRegistration {
 
     /// Command sender for this source (SubmitShare, etc.)
     pub command_tx: mpsc::Sender<SourceCommand>,
+
+    /// Percent of hash time. 0 is a failover-only backup.
+    pub weight: u16,
 }
 
 /// Item the backplane sends to the scheduler on the thread-registration channel.
@@ -141,6 +151,35 @@ struct SourceEntry {
 
     /// Debounced alarm for high-difficulty warnings.
     difficulty_alarm: DebouncedAlarm,
+
+    /// Percent of hash time. 0 is a failover-only backup.
+    weight: u16,
+
+    /// The stratum session is up. A pool starts up so it can be told a
+    /// hashrate and connect. `ClearJobs` (disconnect) marks it down.
+    up: bool,
+
+    /// Weighted-rotation credit. See `pool_alloc`.
+    credit: i64,
+
+    accepted: u64,
+    rejected: u64,
+    /// Pool reject text and how many times it was returned. Capped.
+    reject_reasons: Vec<(String, u64)>,
+
+    /// Measured chain hashrate while this pool held the chain, else 0.
+    /// One sample per 10 s telemetry tick, oldest first. 360 samples is 1 h.
+    samples: VecDeque<u64>,
+
+    /// Latest `mining.set_difficulty` for this connection. `None` until the
+    /// pool sends one. Shares below this are counted and not submitted.
+    pool_difficulty: Option<f64>,
+
+    /// Shares the chip found that were under `pool_difficulty`.
+    low_diff: u64,
+
+    /// Last connect or handshake error. Cleared once the session is up.
+    last_error: Option<String>,
 }
 
 /// Whether to update alongside existing work or replace it.
@@ -191,6 +230,9 @@ struct Scheduler {
 
     /// Mining paused
     paused: bool,
+
+    /// Source that currently owns the chain. `None` until the first job.
+    mining: Option<SourceId>,
 }
 
 impl Scheduler {
@@ -203,6 +245,7 @@ impl Scheduler {
             last_thread_count: 0,
             startup_gate: StartupGate::new(),
             paused: false,
+            mining: None,
         }
     }
 
@@ -234,10 +277,82 @@ impl Scheduler {
             .sum()
     }
 
-    /// Expected hashrate allocated to one source. Currently returns the
-    /// full aggregate for every source.
-    fn allocated_hashrate(&self, _source_id: SourceId) -> HashRate {
-        self.expected_hashrate()
+    /// Expected hashrate this source should report to its pool.
+    ///
+    /// The chain is one piece of hardware, so a source's share is its
+    /// share of hash *time* after failover (`pool_alloc::time_shares`).
+    /// A source whose share is currently zero (a weight-0 backup, or a
+    /// pool that is down) is still told 1 H/s when the chain has a
+    /// hashrate. That is below any real difficulty and only exists so the
+    /// stratum client will connect and stay connected; it does not claim
+    /// the chain.
+    fn allocated_hashrate(&self, source_id: SourceId) -> HashRate {
+        let total = self.expected_hashrate();
+        let share = self.time_share(source_id);
+        if share == 0 {
+            if self.sources.contains_key(source_id) && !total.is_zero() {
+                return HashRate(1);
+            }
+            return HashRate(0);
+        }
+        HashRate(total.0.saturating_mul(u64::from(share)) / 100)
+    }
+
+    fn time_share(&self, source_id: SourceId) -> u16 {
+        let ids: Vec<SourceId> = self.sources.keys().collect();
+        let views: Vec<crate::pool_alloc::PoolView> = ids
+            .iter()
+            .map(|id| {
+                let source = &self.sources[*id];
+                crate::pool_alloc::PoolView {
+                    weight: source.weight,
+                    up: source.up,
+                }
+            })
+            .collect();
+        let shares = crate::pool_alloc::time_shares(&views);
+        ids.iter()
+            .position(|id| *id == source_id)
+            .and_then(|i| shares.get(i).copied())
+            .unwrap_or(0)
+    }
+
+    /// One rotation step. Returns the source that owns the next slot.
+    fn pick_slot(&mut self) -> Option<SourceId> {
+        let ids: Vec<SourceId> = self.sources.keys().collect();
+        let views: Vec<crate::pool_alloc::PoolView> = ids
+            .iter()
+            .map(|id| {
+                let source = &self.sources[*id];
+                crate::pool_alloc::PoolView {
+                    weight: source.weight,
+                    up: source.up,
+                }
+            })
+            .collect();
+        let shares = crate::pool_alloc::time_shares(&views);
+        let mut credit: Vec<i64> = ids.iter().map(|id| self.sources[*id].credit).collect();
+        let picked = crate::pool_alloc::pick_slot(&mut credit, &shares);
+        for (id, c) in ids.iter().zip(credit) {
+            if let Some(source) = self.sources.get_mut(*id) {
+                source.credit = c;
+            }
+        }
+        picked.map(|i| ids[i])
+    }
+
+    fn set_up(&mut self, source_id: SourceId, up: bool) -> bool {
+        let Some(source) = self.sources.get_mut(source_id) else {
+            return false;
+        };
+        if up {
+            source.last_error = None;
+        }
+        if source.up == up {
+            return false;
+        }
+        source.up = up;
+        true
     }
 
     /// Threads eligible for work: those that have reported an expected hashrate.
@@ -266,10 +381,28 @@ impl Scheduler {
                 .map(|s| SourceTelemetry {
                     name: s.name.clone(),
                     url: s.url.clone(),
-                    difficulty: s.last_job.as_ref().map(|j| {
-                        let d = Difficulty::from_target(j.share_target).as_f64();
-                        if d >= 10.0 { d.round() } else { d }
+                    difficulty: s.pool_difficulty.or_else(|| {
+                        s.last_job.as_ref().map(|j| {
+                            let d = Difficulty::from_target(j.share_target).as_f64();
+                            if d >= 10.0 { d.round() } else { d }
+                        })
                     }),
+                    shares_low_diff: s.low_diff,
+                    last_error: s.last_error.clone(),
+                    connected: s.up,
+                    weight: s.weight,
+                    accepted: s.accepted,
+                    rejected: s.rejected,
+                    reject_reasons: s
+                        .reject_reasons
+                        .iter()
+                        .map(|(reason, count)| crate::api_client::types::RejectReason {
+                            reason: reason.clone(),
+                            count: *count,
+                        })
+                        .collect(),
+                    hashrate_10m: average_recent(&s.samples, 60),
+                    hashrate_1h: average_recent(&s.samples, 360),
                 })
                 .collect(),
         }
@@ -341,18 +474,24 @@ impl Scheduler {
             command_tx: registration.command_tx,
             last_job: None,
             difficulty_alarm: DebouncedAlarm::new(HIGH_DIFFICULTY_DEBOUNCE),
+            weight: registration.weight,
+            up: true,
+            credit: 0,
+            accepted: 0,
+            rejected: 0,
+            reject_reasons: Vec::new(),
+            samples: VecDeque::new(),
+            pool_difficulty: None,
+            low_diff: 0,
+            last_error: None,
         });
         source_events.insert(source_id, ReceiverStream::new(registration.event_rx));
-        debug!(source_id = ?source_id, name = %registration.name, "Source registered");
-
-        // Hashrate is not yet split across sources: each is told the full
-        // aggregate.
-        if self.sources.len() > 1 {
-            warn!(
-                sources = self.sources.len(),
-                "Multiple sources active, but hashrate is not split across them"
-            );
-        }
+        debug!(
+            source_id = ?source_id,
+            name = %registration.name,
+            weight = registration.weight,
+            "Source registered"
+        );
 
         // A new source changes how the total is divided, so re-send every
         // source its allocation. While the startup gate holds, skip it; the
@@ -369,6 +508,7 @@ impl Scheduler {
         source_id: SourceId,
         job_template: JobTemplate,
         share_channels: &mut ShareStream,
+        push: bool,
     ) {
         let source_name = self
             .sources
@@ -397,14 +537,26 @@ impl Scheduler {
             source.last_job = Some(template.clone());
         }
 
+        // A pool that does not own this slot keeps the job cached. A hard
+        // replace still drops that pool's tasks (the pool said the old
+        // work is invalid) without touching the chain or the other pool's
+        // in-flight shares.
+        if !push {
+            if matches!(mode, AssignMode::Replace) {
+                self.remove_tasks_where(share_channels, |e| e.source_id == source_id);
+            }
+            debug!(source = %source_name, "Job cached; this pool does not own the current slot");
+            return;
+        }
+
         // Skip assignment if no threads registered yet
         if self.threads.is_empty() {
             debug!(source = %source_name, "No threads yet, job cached for later");
             return;
         }
 
-        // Debounced difficulty warning
-        let hashrate = self.expected_hashrate();
+        // Debounced difficulty warning, against this pool's own share.
+        let hashrate = self.allocated_hashrate(source_id);
         if let Some(source) = self.sources.get_mut(source_id) {
             let too_high = is_difficulty_too_high(&template, hashrate);
             match source.difficulty_alarm.check(too_high) {
@@ -542,6 +694,27 @@ impl Scheduler {
         // Feed share work to per-thread hashrate estimator
         if let Some(entry) = self.threads.get_mut(task_entry.thread_id) {
             entry.hashrate.record(share.expected_work);
+        }
+
+        // The job target can still be the old, easier one. The pool's latest
+        // mining.set_difficulty wins, per connection.
+        let need = self
+            .sources
+            .get(task_entry.source_id)
+            .and_then(|s| s.pool_difficulty);
+        let share_d = share_difficulty.as_f64();
+        if let Some(need) = need
+            && !share_meets_pool_difficulty(need, share_d)
+        {
+            if let Some(source) = self.sources.get_mut(task_entry.source_id) {
+                source.low_diff = source.low_diff.saturating_add(1);
+            }
+            trace!(
+                share_difficulty = share_d,
+                pool_difficulty = need,
+                "Share below pool difficulty (not submitted)"
+            );
+            return;
         }
 
         // Check if share meets source threshold
@@ -718,6 +891,9 @@ impl Scheduler {
         };
 
         for (source_id, source) in self.sources.iter() {
+            if self.mining != Some(source_id) {
+                continue;
+            }
             let Some(template) = &source.last_job else {
                 continue;
             };
@@ -817,7 +993,66 @@ impl Scheduler {
                 let _ = miner_telemetry_tx.send(self.compute_miner_telemetry());
                 let _ = reply.send(Ok(()));
             }
+            SchedulerCommand::SetWeight { name, weight } => {
+                if let Some(source) = self.sources.values_mut().find(|s| s.name == name) {
+                    source.weight = weight;
+                }
+                let _ = miner_telemetry_tx.send(self.compute_miner_telemetry());
+            }
         }
+    }
+
+    /// Give the next slot to whichever live pool the weights pick.
+    ///
+    /// The previous pool's tasks stay. Shares already found for its job
+    /// still route back to it. The thread takes the new pool's cached job
+    /// with `Replace`, which swaps the chain's work once.
+    async fn rotate_slot(&mut self, share_channels: &mut ShareStream) {
+        let next = self.pick_slot();
+        if next == self.mining {
+            return;
+        }
+        self.mining = next;
+        let Some(source_id) = next else {
+            return;
+        };
+        let Some(template) = self.sources.get(source_id).and_then(|s| s.last_job.clone()) else {
+            return;
+        };
+        self.assign_job_to_threads(
+            AssignMode::Replace,
+            source_id,
+            (*template).clone(),
+            share_channels,
+            true,
+        )
+        .await;
+    }
+
+    fn record_hashrate_samples(&mut self) {
+        let measured = u64::from(self.measured_hashrate());
+        let mining = self.mining;
+        for (id, source) in self.sources.iter_mut() {
+            let sample = if mining == Some(id) { measured } else { 0 };
+            source.samples.push_back(sample);
+            while source.samples.len() > 360 {
+                source.samples.pop_front();
+            }
+        }
+    }
+
+    /// Drop sources whose event channel closed (the director stopped them).
+    /// Returns true when the source that owned the chain went away, so the
+    /// caller can hand the chain to whoever is left without waiting out
+    /// the rest of the slot.
+    fn handle_source_disconnections(&mut self, source_events: &SourceEventStream) -> bool {
+        let active: HashSet<SourceId> = source_events.keys().copied().collect();
+        let before = self.sources.len();
+        self.sources.retain(|id, _| active.contains(&id));
+        if self.sources.len() == before {
+            return false;
+        }
+        self.mining.is_some_and(|id| !self.sources.contains_key(id))
     }
 
     /// Main scheduler loop.
@@ -843,6 +1078,12 @@ impl Scheduler {
         let mut telemetry_interval = tokio::time::interval(Duration::from_secs(10));
         telemetry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // One pool owns the chain per slot. The first tick is immediate;
+        // skip it so the first job arms the chain instead of an empty pick.
+        let mut slot_interval = tokio::time::interval(crate::pool_alloc::SLOT);
+        slot_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut slot_primed = false;
+
         // Deadline for the startup-gate fallback, set when the enumeration-
         // complete signal arrives without immediately opening the gate.
         let mut gate_deadline: Option<tokio::time::Instant> = None;
@@ -867,12 +1108,21 @@ impl Scheduler {
                                 job_id = %job_template.id,
                                 "UpdateJob received"
                             );
+                            let became_up = self.set_up(source_id, true);
+                            if self.mining.is_none() {
+                                self.mining = self.pick_slot();
+                            }
+                            let push = self.mining == Some(source_id);
                             self.assign_job_to_threads(
                                 AssignMode::Update,
                                 source_id,
                                 job_template,
                                 &mut share_channels,
+                                push,
                             ).await;
+                            if became_up && !self.startup_gate.is_holding() {
+                                self.broadcast_hashrate_change().await;
+                            }
                         }
 
                         SourceEvent::ReplaceJob(job_template) => {
@@ -881,16 +1131,69 @@ impl Scheduler {
                                 job_id = %job_template.id,
                                 "ReplaceJob received"
                             );
+                            let became_up = self.set_up(source_id, true);
+                            if self.mining.is_none() {
+                                self.mining = self.pick_slot();
+                            }
+                            let push = self.mining == Some(source_id);
                             self.assign_job_to_threads(
                                 AssignMode::Replace,
                                 source_id,
                                 job_template,
                                 &mut share_channels,
+                                push,
                             ).await;
+                            if became_up && !self.startup_gate.is_holding() {
+                                self.broadcast_hashrate_change().await;
+                            }
                         }
 
                         SourceEvent::ClearJobs => {
+                            let became_down = self.set_up(source_id, false);
                             self.handle_clear_jobs(source_id, &mut share_channels);
+                            if became_down && !self.startup_gate.is_holding() {
+                                self.broadcast_hashrate_change().await;
+                            }
+                        }
+
+                        SourceEvent::PoolDifficulty(diff) => {
+                            if let Some(source) = self.sources.get_mut(source_id) {
+                                source.pool_difficulty = Some(diff);
+                                if let Some(job) = source.last_job.clone() {
+                                    let mut updated = (*job).clone();
+                                    updated.share_target = Difficulty::from_f64(diff).to_target();
+                                    source.last_job = Some(Arc::new(updated));
+                                }
+                            }
+                            let target = Difficulty::from_f64(diff).to_target();
+                            for (_id, task) in self.tasks.iter_mut() {
+                                if task.source_id == source_id {
+                                    let mut updated = (*task.template).clone();
+                                    updated.share_target = target;
+                                    task.template = Arc::new(updated);
+                                }
+                            }
+                            debug!(difficulty = diff, "Pool difficulty applied to current jobs");
+                        }
+
+                        SourceEvent::LinkError(error) => {
+                            if let Some(source) = self.sources.get_mut(source_id) {
+                                source.last_error = error;
+                                if source.last_error.is_some() {
+                                    source.up = false;
+                                }
+                            }
+                        }
+
+                        SourceEvent::ShareResult { accepted, reason } => {
+                            if let Some(source) = self.sources.get_mut(source_id) {
+                                if accepted {
+                                    source.accepted += 1;
+                                } else {
+                                    source.rejected += 1;
+                                    note_reject(&mut source.reject_reasons, reason.as_deref());
+                                }
+                            }
                         }
                     }
                 }
@@ -949,11 +1252,25 @@ impl Scheduler {
 
                 // API commands
                 Some(cmd) = cmd_rx.recv() => {
+                    let reweight = matches!(cmd, SchedulerCommand::SetWeight { .. });
                     self.handle_api_command(cmd, &miner_telemetry_tx);
+                    if reweight && !self.startup_gate.is_holding() {
+                        self.broadcast_hashrate_change().await;
+                    }
+                }
+
+                // Hand the chain to the next pool. At most one switch per slot.
+                _ = slot_interval.tick() => {
+                    if !slot_primed {
+                        slot_primed = true;
+                    } else {
+                        self.rotate_slot(&mut share_channels).await;
+                    }
                 }
 
                 // Periodic state publishing
                 _ = telemetry_interval.tick() => {
+                    self.record_hashrate_samples();
                     let _ = miner_telemetry_tx.send(self.compute_miner_telemetry());
                 }
 
@@ -967,6 +1284,10 @@ impl Scheduler {
             // Detect thread disconnections (StreamMap silently removes ended streams)
             self.handle_thread_disconnections(&thread_events, &mut share_channels)
                 .await;
+            if self.handle_source_disconnections(&source_events) {
+                self.mining = None;
+                self.rotate_slot(&mut share_channels).await;
+            }
         }
 
         // Log final statistics
@@ -981,6 +1302,42 @@ impl Scheduler {
 ///
 /// Takes pre-collected (sender, hashrate) pairs to avoid capturing Scheduler
 /// across await points (it contains Box<dyn HashThread> which isn't Sync).
+/// Remember a pool's reject text. At most eight distinct strings; the
+/// rest fold into `other`. The text is the pool's own message, trimmed.
+fn note_reject(reasons: &mut Vec<(String, u64)>, reason: Option<&str>) {
+    let raw = reason.unwrap_or("").trim();
+    let raw = if raw.is_empty() { "unknown" } else { raw };
+    let end = raw
+        .char_indices()
+        .nth(80)
+        .map(|(i, _)| i)
+        .unwrap_or(raw.len());
+    let reason = &raw[..end];
+    if let Some((_, count)) = reasons.iter_mut().find(|(r, _)| r == reason) {
+        *count += 1;
+        return;
+    }
+    let named = reasons.iter().filter(|(r, _)| r != "other").count();
+    if named < 7 {
+        reasons.push((reason.to_string(), 1));
+        return;
+    }
+    if let Some((_, count)) = reasons.iter_mut().find(|(r, _)| r == "other") {
+        *count += 1;
+    } else {
+        reasons.push(("other".into(), 1));
+    }
+}
+
+fn average_recent(samples: &VecDeque<u64>, n: usize) -> u64 {
+    let take = n.min(samples.len());
+    if take == 0 {
+        return 0;
+    }
+    let sum: u64 = samples.iter().rev().take(take).sum();
+    sum / take as u64
+}
+
 async fn send_hashrate_updates(updates: Vec<(mpsc::Sender<SourceCommand>, HashRate)>) {
     for (sender, hashrate) in updates {
         let _ = sender.send(SourceCommand::UpdateHashRate(hashrate)).await;
@@ -1159,6 +1516,13 @@ mod tests {
     use crate::types::Difficulty;
 
     #[test]
+    fn set_difficulty_94_does_not_submit_a_diff_10_share() {
+        assert!(!share_meets_pool_difficulty(94.0, 10.0));
+        assert!(share_meets_pool_difficulty(94.0, 94.0));
+        assert!(share_meets_pool_difficulty(94.0, 200.0));
+    }
+
+    #[test]
     fn scheduler_target_zero_hashrate_passthrough() {
         let source_target = Difficulty::from(1024).to_target();
         let result = Scheduler::compute_scheduler_target(HashRate::from(0), source_target);
@@ -1286,5 +1650,22 @@ mod tests {
         gate.record_enumeration_complete();
         gate.record_timeout();
         assert!(!gate.is_holding());
+    }
+
+    #[test]
+    fn reject_reasons_count_the_pool_text_and_cap_the_list() {
+        let mut reasons = Vec::new();
+        super::note_reject(&mut reasons, Some("Job not found"));
+        super::note_reject(&mut reasons, Some("Job not found"));
+        super::note_reject(&mut reasons, Some("  "));
+        assert_eq!(
+            reasons,
+            vec![("Job not found".into(), 2), ("unknown".into(), 1)]
+        );
+        for i in 0..10 {
+            super::note_reject(&mut reasons, Some(&format!("reason-{i}")));
+        }
+        assert!(reasons.len() <= 8);
+        assert!(reasons.iter().any(|(r, n)| r == "other" && *n >= 1));
     }
 }
